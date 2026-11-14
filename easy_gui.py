@@ -17,6 +17,7 @@ import webbrowser
 import subprocess
 import subprocess
 import json
+import shutil
 import math
 from collections import deque
 from datetime import datetime
@@ -45,7 +46,8 @@ import torch
 from fireredtts3_local.audio_utils import load_audio, save_tensor_audio
 from fireredtts3_local.asr import ASRManager, WHISPER_LANGS, WHISPER_MODELS
 from fireredtts3_local.model_manager import ModelManager
-from fireredtts3_local.training import prepare_dataset, scan_dataset, stop_training, train_lora
+from fireredtts3_local.training import prepare_dataset, scan_dataset, stop_training, train_lora, TrainingOptions
+from dataclasses import asdict
 from fireredtts3_local.paths import MODEL_DIR, OUTPUTS_DIR, CPP_ROOT, CPP_BUNDLES_DIR, ensure_dirs
 from fireredtts3_local.voice_library import NONE_VOICE, delete_voice, list_voices, resolve_voice, save_voice
 from fireredtts3_local.projects import (
@@ -860,7 +862,7 @@ def dataset_scan(source):
         raise gr.Error(str(exc))
 
 
-def dataset_prepare(project, source, language, transcribe_missing, asr_model, asr_lang, asr_batch):
+def dataset_prepare(project, source, language, transcribe_missing, asr_model, asr_lang, asr_batch, speaker_id):
     try:
         p, manifest, count = prepare_dataset(
             source, project, TRAINING_PROJECTS, language,
@@ -869,6 +871,7 @@ def dataset_prepare(project, source, language, transcribe_missing, asr_model, as
             asr_language=asr_lang,
             asr_batch_size=int(asr_batch),
             transcribe_missing=bool(transcribe_missing),
+            speaker_id=speaker_id or None,
             log=log,
         )
         return str(manifest), f"Prepared {count} samples in {p}.", console_html()
@@ -989,7 +992,7 @@ def run_lora_training(
     project_name, manifest, output_name, rank, alpha, dropout, lr,
     length_mode, training_steps, training_epochs, grad_accum, seed,
     save_steps, save_epochs, resume_checkpoint,
-    eval_enable, eval_text, eval_ref, eval_ref_text, eval_language,
+    eval_enable, eval_text, eval_ref, eval_ref_text, eval_language, training_options,
     progress=gr.Progress(),
 ):
     try:
@@ -1055,7 +1058,8 @@ def run_lora_training(
             eval_text=str(eval_text or "This is a FireRedTTS3 training preview."),
             eval_reference_audio=eval_ref,
             eval_reference_transcript=str(eval_ref_text or ""),
-            eval_language=str(eval_language or "English"),
+            eval_language=str(eval_language or "Russian"),
+            options=TrainingOptions.parse(training_options),
         )
         unit = "steps" if str(length_mode) == "Steps" else "epochs"
         elapsed = max(0.0, time.monotonic() - started_at)
@@ -1063,11 +1067,11 @@ def run_lora_training(
             total = max(1, int(training_steps) if mode_label == "Steps" else int(training_epochs))
             TRAIN_UI_STATE.update(
                 running=False,
-                pct=100.0,
-                current=total,
+                pct=min(100.0, 100.0 * completed / total),
+                current=completed,
                 total=total,
                 mode=mode_label,
-                text=f"Finished · adapter saved",
+                text=f"Stopped at {completed} {unit} · adapter saved",
                 eta_seconds=0.0,
                 elapsed_seconds=elapsed,
             )
@@ -1128,7 +1132,7 @@ def save_training_project(
     length_mode, training_steps, training_epochs, grad_accum, seed,
     save_steps, save_epochs,
     eval_enable, eval_text, eval_ref, eval_ref_text, eval_language,
-    eval_asr_model, eval_asr_lang, eval_asr_batch,
+    eval_asr_model, eval_asr_lang, eval_asr_batch, training_options, folder_speaker,
 ):
     try:
         if not name or name == "None":
@@ -1147,6 +1151,8 @@ def save_training_project(
                 persistent_eval_ref = str(dst.resolve())
 
         path = save_project(TRAINING_PROJECTS, name, {
+            "training_options": asdict(TrainingOptions.parse(training_options)),
+            "folder_speaker": str(folder_speaker or ""),
             "source": source or "",
             "language": language,
             "manifest": manifest or "",
@@ -1182,7 +1188,7 @@ def save_training_project(
 def load_training_project(name):
     d = load_project(TRAINING_PROJECTS, name)
     if not d:
-        return [gr.update()] * 24
+        return [gr.update()] * 26
     eval_ref = d.get("eval_reference_audio", "")
     if eval_ref and not Path(eval_ref).is_file():
         eval_ref = ""
@@ -1195,7 +1201,7 @@ def load_training_project(name):
         gr.update(value=d.get("rank", 16)),
         gr.update(value=d.get("alpha", 32)),
         gr.update(value=d.get("dropout", 0.05)),
-        gr.update(value=d.get("lr", 4e-5)),
+        gr.update(value=d.get("lr", 1e-5)),
         gr.update(value=d.get("length_mode", "Steps")),
         gr.update(value=d.get("training_steps", 1000)),
         gr.update(value=d.get("training_epochs", 30)),
@@ -1203,7 +1209,7 @@ def load_training_project(name):
         gr.update(value=d.get("seed", 1234)),
         gr.update(value=d.get("save_steps", 100)),
         gr.update(value=d.get("save_epochs", 1)),
-        gr.update(value=d.get("eval_enable", True)),
+        gr.update(value=d.get("eval_enable", False)),
         gr.update(value=d.get("eval_text", "This is a FireRedTTS3 training preview.")),
         gr.update(value=eval_ref or None),
         gr.update(value=d.get("eval_reference_transcript", "")),
@@ -1211,6 +1217,8 @@ def load_training_project(name):
         gr.update(value=d.get("eval_asr_model", "Faster-Whisper large-v3  •  ~4.5 GB VRAM")),
         gr.update(value=d.get("eval_asr_language", "Auto-detect")),
         gr.update(value=d.get("eval_asr_batch", 8)),
+        gr.update(value=json.dumps(d.get("training_options", asdict(TrainingOptions())), indent=2)),
+        gr.update(value=d.get("folder_speaker", "")),
     ]
 
 
@@ -1602,7 +1610,8 @@ Use the optional Faster-Whisper panel to transcribe the source speech and confir
 Prepare a reusable **voice-clone LoRA project**, following the same project workflow as MOSS.
 
 1. Create or select a **Project**. Dataset and training settings are shared through the same project file.
-2. Select the source folder containing single-speaker audio clips. Matching same-stem `.txt` transcripts are reused.
+2. Select the source folder with matching `.txt` transcripts and `.json` speaker metadata.
+   A single speaker for the entire folder must be declared explicitly. Use the CLI for YO-CPT-ru import.
 3. Optionally transcribe missing sidecars with Faster-Whisper.
 4. Choose the correct FireRedTTS3 language/dialect and click **Prepare Dataset**.
 5. The prepared JSONL is stored under `training/projects/<project>/` and is picked up by LoRA Training.
@@ -1619,7 +1628,8 @@ FireRedTTS3 has not published an official fine-tuning recipe; this remains an ex
                 with gr.Row():
                     dataset_source=gr.Textbox(label="Source Audio Folder",scale=8)
                     dataset_browse_btn=gr.Button("📁 Browse",size="sm",scale=1)
-                dataset_language=gr.Dropdown(choices=[x for x in LANGUAGES if x!="Auto-detect"],value="English",label="Language / Dialect")
+                dataset_language=gr.Dropdown(choices=[x for x in LANGUAGES if x!="Auto-detect"],value="Russian",label="Language / Dialect")
+            dataset_speaker=gr.Textbox(label="Speaker ID (only if ALL source clips share one speaker)", placeholder="Otherwise supply speaker_id in per-clip .json sidecars")
             dataset_scan_btn=gr.Button("Build / Scan Dataset",variant="secondary")
             dataset_scan_status=gr.Textbox(label="Scan Status",interactive=False)
             with gr.Accordion("🛰️ Missing Transcript ASR",open=False):
@@ -1628,7 +1638,7 @@ FireRedTTS3 has not published an official fine-tuning recipe; this remains an ex
                 dataset_asr_lang=gr.Dropdown(choices=list(WHISPER_LANGS),value="Auto-detect",label="Language")
                 dataset_asr_batch=gr.Slider(1,32,value=8,step=1,label="Batch Size")
             dataset_prepare_btn=gr.Button("Prepare Dataset",variant="primary")
-            dataset_manifest=gr.Textbox(label="Prepared Manifest",interactive=False)
+            dataset_manifest=gr.Textbox(label="Prepared Manifest (or path imported with the CLI)",interactive=True)
             dataset_status=gr.Textbox(label="Project / Dataset Status",interactive=False)
 
         with gr.Tab("🚀 LoRA Training"):
@@ -1640,7 +1650,9 @@ Choose one **Training Length Mode**:
 - **Steps** → train for exactly N steps and save/evaluate every N steps.
 - **Epochs** → train for exactly N epochs and save/evaluate every N epochs.
 
-Only the controls for the selected mode are shown. Gradient accumulation and dataset-derived prompt/target audio limits are handled internally.
+Only the controls for the selected mode are shown. Audio is never silently cropped. Long clips must be aligned and segmented before training.
+Validation is mandatory; best-validation is selected by loss and still requires listening on unseen voices.
+Epochs are speaker-balanced sampling budgets, not exhaustive passes over every clip.
 """)
 
             with gr.Row(elem_classes="project-strip"):
@@ -1663,7 +1675,7 @@ Only the controls for the selected mode are shown. Gradient accumulation and dat
             with gr.Row():
                 with gr.Column(scale=1,elem_classes="form-section"):
                     gr.Markdown("#### 📦 Training Setup")
-                    train_manifest=gr.Textbox(label="Prepared Dataset",interactive=False)
+                    train_manifest=gr.Textbox(label="Training Manifest JSONL",interactive=True)
                     train_output=gr.Textbox(label="Adapter Name",value="my_voice_lora")
                     train_length_mode=gr.Dropdown(
                         ["Steps","Epochs"],value="Steps",label="Training Length Mode"
@@ -1702,7 +1714,7 @@ Only the controls for the selected mode are shown. Gradient accumulation and dat
                     train_lr=gr.Slider(
                         minimum=0.000001,
                         maximum=0.001,
-                        value=0.00004,
+                        value=0.00001,
                         step=0.000001,
                         label="Learning Rate",
                     )
@@ -1712,19 +1724,26 @@ Only the controls for the selected mode are shown. Gradient accumulation and dat
                         )
                         train_seed=gr.Number(value=1234,precision=0,label="Training Seed")
 
+            with gr.Accordion("Russian adaptation / validation recipe",open=True):
+                gr.Markdown("Choose `backbone` or `backbone_dit`. Validation holds out speakers by default. "
+                            "Use `validation_manifest` for a fixed split and `replay_manifest` for retention data. "
+                            "`preservation_weight` compares against the frozen original model. "
+                            "See docs/RUSSIAN_TRAINING.md for every option and YO-CPT-ru import.")
+                train_options=gr.Code(value=json.dumps(asdict(TrainingOptions()), indent=2), language="json", label="Training recipe", interactive=True)
+
             with gr.Accordion("🎧 Eval Audio + TensorBoard",open=False):
                 with gr.Row():
                     with gr.Column(scale=1):
                         train_eval_enable=gr.Checkbox(
-                            value=True,label="Generate Eval Audio at Checkpoints"
+                            value=False,label="Generate Eval Audio at Checkpoints"
                         )
                         train_eval_text=gr.Textbox(
-                            value="This is a FireRedTTS3 training preview.",
+                            value="Здравствуйте! Подскажите, пожалуйста, когда вам удобно встретиться?",
                             label="Eval Text",lines=3,
                         )
                         train_eval_language=gr.Dropdown(
                             choices=[x for x in LANGUAGES if x!="Auto-detect"],
-                            value="English",label="Eval Language",
+                            value="Russian",label="Eval Language",
                         )
                     with gr.Column(scale=1):
                         train_eval_ref=gr.Audio(
@@ -1843,21 +1862,21 @@ Only the controls for the selected mode are shown. Gradient accumulation and dat
     dataset_delete_project.click(delete_training_project,inputs=dataset_project,outputs=[dataset_project,train_project,dataset_status,cmd_console])
     train_delete_project.click(delete_training_project,inputs=train_project,outputs=[dataset_project,train_project,train_status,cmd_console])
 
-    project_load_outputs=[dataset_source,dataset_language,dataset_manifest,train_output,train_preset,train_rank,train_alpha,train_dropout,train_lr,train_length_mode,train_steps,train_epochs,train_grad_accum,train_seed,train_save_steps,train_save_epochs,train_eval_enable,train_eval_text,train_eval_ref,train_eval_ref_text,train_eval_language,train_eval_asr_model,train_eval_asr_lang,train_eval_asr_batch]
+    project_load_outputs=[dataset_source,dataset_language,dataset_manifest,train_output,train_preset,train_rank,train_alpha,train_dropout,train_lr,train_length_mode,train_steps,train_epochs,train_grad_accum,train_seed,train_save_steps,train_save_epochs,train_eval_enable,train_eval_text,train_eval_ref,train_eval_ref_text,train_eval_language,train_eval_asr_model,train_eval_asr_lang,train_eval_asr_batch,train_options,dataset_speaker]
     dataset_project.change(load_training_project,inputs=dataset_project,outputs=project_load_outputs)
     train_project.change(load_training_project,inputs=train_project,outputs=project_load_outputs)
 
-    project_save_inputs=[train_project,dataset_source,dataset_language,dataset_manifest,train_output,train_preset,train_rank,train_alpha,train_dropout,train_lr,train_length_mode,train_steps,train_epochs,train_grad_accum,train_seed,train_save_steps,train_save_epochs,train_eval_enable,train_eval_text,train_eval_ref,train_eval_ref_text,train_eval_language,train_eval_asr_model,train_eval_asr_lang,train_eval_asr_batch]
+    project_save_inputs=[train_project,dataset_source,dataset_language,dataset_manifest,train_output,train_preset,train_rank,train_alpha,train_dropout,train_lr,train_length_mode,train_steps,train_epochs,train_grad_accum,train_seed,train_save_steps,train_save_epochs,train_eval_enable,train_eval_text,train_eval_ref,train_eval_ref_text,train_eval_language,train_eval_asr_model,train_eval_asr_lang,train_eval_asr_batch,train_options,dataset_speaker]
     train_save_project.click(save_training_project,inputs=project_save_inputs,outputs=[train_status,cmd_console])
     dataset_save_project.click(
         save_training_project,
-        inputs=[dataset_project,dataset_source,dataset_language,dataset_manifest,train_output,train_preset,train_rank,train_alpha,train_dropout,train_lr,train_length_mode,train_steps,train_epochs,train_grad_accum,train_seed,train_save_steps,train_save_epochs,train_eval_enable,train_eval_text,train_eval_ref,train_eval_ref_text,train_eval_language,train_eval_asr_model,train_eval_asr_lang,train_eval_asr_batch],
+        inputs=[dataset_project,dataset_source,dataset_language,dataset_manifest,train_output,train_preset,train_rank,train_alpha,train_dropout,train_lr,train_length_mode,train_steps,train_epochs,train_grad_accum,train_seed,train_save_steps,train_save_epochs,train_eval_enable,train_eval_text,train_eval_ref,train_eval_ref_text,train_eval_language,train_eval_asr_model,train_eval_asr_lang,train_eval_asr_batch,train_options,dataset_speaker],
         outputs=[dataset_status,cmd_console],
     )
 
     dataset_prepare_btn.click(
         dataset_prepare,
-        inputs=[dataset_project,dataset_source,dataset_language,dataset_transcribe,dataset_asr_model,dataset_asr_lang,dataset_asr_batch],
+        inputs=[dataset_project,dataset_source,dataset_language,dataset_transcribe,dataset_asr_model,dataset_asr_lang,dataset_asr_batch,dataset_speaker],
         outputs=[dataset_manifest,dataset_status,cmd_console],
     )
     dataset_manifest.change(lambda x:x,inputs=dataset_manifest,outputs=train_manifest)
@@ -1879,7 +1898,7 @@ Only the controls for the selected mode are shown. Gradient accumulation and dat
             train_project,train_manifest,train_output,train_rank,train_alpha,train_dropout,train_lr,
             train_length_mode,train_steps,train_epochs,train_grad_accum,train_seed,
             train_save_steps,train_save_epochs,train_resume,
-            train_eval_enable,train_eval_text,train_eval_ref,train_eval_ref_text,train_eval_language
+            train_eval_enable,train_eval_text,train_eval_ref,train_eval_ref_text,train_eval_language,train_options
         ],
         outputs=[train_adapter_path,train_status,cmd_console],
     )

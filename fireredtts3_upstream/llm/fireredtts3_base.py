@@ -99,7 +99,12 @@ class FireRedTTS3BaseCore(PreTrainedModel):
     def __init__(self, config: FireRedTTS3BaseCoreConfig):
         super().__init__(config)
         # Backbone Transformer
-        self.backbone_llm_config = Qwen3Config.from_dict(Qwen3_1_7B_ConfigDict)
+        backbone_config = dict(Qwen3_1_7B_ConfigDict)
+        # A GUI session may have imported this module under a different backend.
+        # Resolve the runtime override when constructing each model.
+        if os.environ.get("FIRERED_ATTN_IMPLEMENTATION"):
+            backbone_config["attn_implementation"] = os.environ["FIRERED_ATTN_IMPLEMENTATION"]
+        self.backbone_llm_config = Qwen3Config.from_dict(backbone_config)
         self.backbone_llm = Qwen3Model(self.backbone_llm_config)
         # Speaker proj
         self.spk_proj_llm = torch.nn.Linear(config.spk_in_dim, self.backbone_llm_config.hidden_size)

@@ -28,6 +28,11 @@ dependencies = [
     "wetext==0.1.6",
 ]
 
+[project.optional-dependencies]
+data = [
+    "pyarrow==20.0.0",
+]
+
 [tool.setuptools.packages.find]
 include = ["fireredtts3_local*", "fireredtts3_upstream*"]
 

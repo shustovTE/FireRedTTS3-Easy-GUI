@@ -361,6 +361,8 @@ Prepared datasets and project metadata are kept separate from the original sourc
 
 ## 🧬 LoRA Training
 
+Russian adaptation now includes speaker-aware data preparation, held-out validation, scoped LoRA, replay, base-model preservation and full-core export. See **[the Russian training guide](docs/RUSSIAN_TRAINING.md)** and **[the example recipe](recipes/russian_backbone.json)**. Existing manifests require explicit `speaker_id`; audio is no longer silently cropped.
+
 ![tab4](assets/tab4.png)
 
 The **LoRA Training** tab provides experimental single-GPU voice-cloning training for FireRedTTS3-Base.

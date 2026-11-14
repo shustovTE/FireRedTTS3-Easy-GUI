@@ -74,6 +74,7 @@ def analyze_manifest(manifest_path: str | Path) -> dict:
         raise ValueError("Prepared manifest does not exist.")
     durations: list[float] = []
     samples = 0
+    speakers = set()
     with path.open(encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -81,6 +82,8 @@ def analyze_manifest(manifest_path: str | Path) -> dict:
                 continue
             row = json.loads(line)
             audio = Path(row.get("audio", ""))
+            if not audio.is_absolute():
+                audio = path.resolve().parent / audio
             if not audio.is_file():
                 continue
             try:
@@ -89,6 +92,8 @@ def analyze_manifest(manifest_path: str | Path) -> dict:
                 if duration > 0:
                     durations.append(duration)
                     samples += 1
+                    if row.get("speaker_id"):
+                        speakers.add(row["speaker_id"])
             except Exception:
                 pass
     if not samples:
@@ -114,6 +119,7 @@ def analyze_manifest(manifest_path: str | Path) -> dict:
 
     return {
         "sample_count": samples,
+        "speaker_count": len(speakers),
         "total_seconds": total,
         "avg_seconds": avg,
         "median_seconds": percentile(0.50),
@@ -127,7 +133,7 @@ def analyze_manifest(manifest_path: str | Path) -> dict:
 
 
 VRAM_PRESETS = {
-    # Conservative defaults for the experimental all-linear LoRA objective.
+    # Conservative starting points for scoped LoRA adaptation.
     # Gradient accumulation is primarily a stability/effective-batch control,
     # not a VRAM requirement.
     "12 GB": {"budget": 12, "rank": 4, "grad": 24, "lr": 8e-6},
@@ -191,28 +197,17 @@ def autotune(
     if spread >= 0.75:
         lr *= 0.85
 
-    # Clamp experimental all-linear LoRA to a conservative range.
+    # Clamp the pilot learning rate to a conservative range.
     profile["lr"] = max(5e-6, min(1.5e-5, lr))
 
-    # Steps are derived from effective dataset passes, not fixed buckets.
-    # Typical voice-clone datasets need more passes when small, fewer when large.
-    if minutes < 10:
-        target_passes = 55
-    elif minutes < 30:
-        target_passes = 42
-    elif minutes < 60:
-        target_passes = 34
-    elif minutes < 120:
-        target_passes = 26
-    elif minutes < 240:
-        target_passes = 20
-    else:
-        target_passes = 14
+    # AutoTune supplies a pilot budget, not an instruction to repeat a small
+    # Russian corpus dozens of times. Validation/voice benchmarks select duration.
+    target_passes = 3 if minutes < 60 else 2 if minutes < 600 else 1
 
     optimizer_steps_per_pass = max(1, math.ceil(n / max(1, profile["grad"])))
     suggested_steps = optimizer_steps_per_pass * target_passes
     suggested_steps = int(round(suggested_steps / 50.0) * 50)
-    profile["suggested_steps"] = max(500, min(3000, suggested_steps))
+    profile["suggested_steps"] = max(50, min(10000, suggested_steps))
 
     # Keep roughly 8-12 checkpoints, aligned to clean 25/50 step boundaries.
     raw_save = max(25, profile["suggested_steps"] / 10.0)
@@ -225,7 +220,7 @@ def autotune(
     # Epoch mode remains available, but Steps is the recommendation for this
     # experimental trainer because optimizer updates are the stable unit.
     profile["suggested_epochs"] = max(
-        5,
+        1,
         int(math.ceil(profile["suggested_steps"] / optimizer_steps_per_pass)),
     )
     profile["save_epochs"] = max(1, profile["suggested_epochs"] // 8)
