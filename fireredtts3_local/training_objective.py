@@ -7,14 +7,11 @@ branch used by the released CFG inference implementation.
 from __future__ import annotations
 
 import contextlib
-import hashlib
-import os
-from pathlib import Path
-import uuid
 
 import torch
 import torch.nn.functional as F
-import torchaudio
+
+from .training_features import FeatureCache
 
 
 def autocast(device):
@@ -34,49 +31,6 @@ def adapter_targets(core, profile: str):
         raise ValueError("No LoRA targets found")
     # Explicit full names protect CAM++, RedAE, PatchEncoder and speaker/stop heads.
     return names
-
-
-class FeatureCache:
-    VERSION = "redae-campp-v1"
-
-    def __init__(self, tts, root=None, model_fingerprint=""):
-        self.tts = tts
-        self.root = Path(root) if root else None
-        if self.root and not model_fingerprint:
-            raise ValueError("Disk cache requires a fingerprint of the frozen encoder weights")
-        self.namespace = self.VERSION + model_fingerprint
-        if self.root:
-            self.root.mkdir(parents=True, exist_ok=True)
-
-    def get(self, row):
-        key = hashlib.sha256((self.namespace + row["audio_sha256"]).encode()).hexdigest()
-        path = self.root / f"{key}.pt" if self.root else None
-        if path and path.exists():
-            data = torch.load(path, map_location="cpu", weights_only=True)
-            if data.get("key") != key:
-                raise ValueError(f"Invalid cached feature: {path}")
-            return data["latents"].to(self.tts.device), data["speaker"].to(self.tts.device)
-        audio, sr = torchaudio.load(row["audio"])
-        if audio.shape[0] != 1 or not torch.isfinite(audio).all():
-            raise ValueError(f"Expected finite mono audio: {row['audio']}")
-        with torch.no_grad():
-            audio = torchaudio.functional.resample(audio, sr, self.tts.redae.sample_rate)
-            audio = self.tts.redae.pad_to_multiple_of(
-                audio, self.tts.redae.downsample_rate * self.tts.tts_core.patch_size
-            ).to(self.tts.device)
-            latents = self.tts.redae.encode(audio, self.tts.redae.sample_rate).float()
-            speaker = self.tts.spk_extractor(audio, self.tts.redae.sample_rate).to(self.tts.device).float()
-        # Some upstream encoders use inference_mode internally. Convert their
-        # outputs into ordinary tensors before trainable layers save them.
-        latents, speaker = latents.clone(), speaker.clone()
-        if path:
-            temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-            try:
-                torch.save({"key": key, "latents": latents.cpu(), "speaker": speaker.cpu()}, temporary)
-                os.replace(temporary, path)
-            finally:
-                temporary.unlink(missing_ok=True)
-        return latents, speaker
 
 
 def conditioning(core, text_tokens, prompt_latents, target_latents, speaker):
@@ -114,6 +68,8 @@ def flow_loss(tts, prompt_latents, speaker, target_latents, prompt_text, target_
               preservation_weight=0.0):
     core = tts.tts_core
     device = target_latents.device
+    if not any(p.requires_grad for p in core.patch_encoder.parameters()):
+        core.patch_encoder.eval()
     patch = core.patch_size
     targets = target_latents.reshape(-1, patch, target_latents.shape[-1])
     count = len(targets)
@@ -141,7 +97,8 @@ def flow_loss(tts, prompt_latents, speaker, target_latents, prompt_text, target_
                 cond, spk, teacher_stop = conditioning(core, tokens, prompt_latents, target_latents, speaker)
                 teacher_pred = flow_prediction(core, cond, spk, histories, noisy, times, indices, drop_mask)
         finally:
-            core.train(was_training)
+            from .training_batch import set_training
+            set_training(core, was_training)
 
     with autocast(device):
         cond, spk, stop_logits = conditioning(core, tokens, prompt_latents, target_latents, speaker)

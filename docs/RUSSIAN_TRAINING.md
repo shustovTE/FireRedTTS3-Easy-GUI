@@ -24,7 +24,9 @@
   маска выбрана по unconditional-ветке официального инференса. LoRA dropout иной.
 - LoRA применяется к полным именам разрешённых модулей, не к `all-linear`.
 - Есть replay и удержание исходной модели через отключение LoRA на frozen base.
-- Латенты RedAE и CAM++ кэшируются по хешам аудио и исходных весов/токенизатора.
+- Предрасчёт латентов RedAE, CAM++ и frozen PatchEncoder по хешам аудио и base.
+- Пакетные backbone/DiT с масками разной длины; loss усредняется по примерам.
+- Ограниченная фоновая загрузка CPU-признаков, pinned memory и перенос на GPU.
 - Validation имеет фиксированные пары/шум для сравнения чекпоинтов и не меняет RNG
   обучения. Сохраняются sampling RNG, Python/Torch/CUDA RNG, optimizer и scheduler.
 - Частичный gradient accumulation нормируется по фактическому числу примеров.
@@ -49,7 +51,7 @@ uv sync --frozen --extra data --no-install-project
 Рецепт не обещает конкретное потребление VRAM: размер модели, длина текста/аудио,
 число патчей, replay, preservation и профиль влияют на него. Сначала запускайте
 короткую проверку на целевом GPU. При нехватке памяти уменьшайте длины при подготовке
-данных, `patches_per_example` или используйте `backbone`; не обрезайте транскрипции
+данных, `batch_size`, `patches_per_example` или используйте `backbone`; не обрезайте транскрипции
 отдельно от аудио. Кэш может занимать много места; пустой `cache_dir` отключает его.
 
 ## Импорт YO-CPT-ru
@@ -144,6 +146,89 @@ python -m fireredtts3_local.adapt audit training/datasets/yo/manifest.jsonl
 Audit не скачивает модель и не требует GPU. Он читает аудиометаданные и хеширует файлы:
 для большого корпуса это занимает время. Неподходящие длины отклоняются, не обрезаются.
 
+## Предрасчёт и пакетное обучение на RTX PRO 6000 Blackwell 96 GB
+
+Для этой карты добавлен отдельный стартовый рецепт
+[recipes/russian_blackwell_96gb.json](../recipes/russian_blackwell_96gb.json).
+Он использует `batch_size=8`, `gradient_accumulation=1`, BF16, SDPA, без gradient
+checkpointing. Эффективный batch остаётся **8 пар на optimizer step**, как у
+прежнего рецепта 1×8. Это исходная конфигурация для замера, а не измеренный
+предел VRAM или обещание ускорения. Старый `russian_backbone.json` сохранён
+для небольших GPU и ленивого заполнения кэша.
+
+После импорта и split проверьте пути train/validation/replay в рецепте.
+Исходные веса `FireRedTeam/FireRedTTS3` должны уже находиться в
+`models/FireRedTTS3` (их скачивает обычная загрузка модели в GUI).
+Предрасчёт работает на GPU и загружает только RedAE, CAM++ и PatchEncoder,
+не создавая Qwen backbone и DiT:
+
+```bash
+python -m fireredtts3_local.adapt precompute recipes/russian_blackwell_96gb.json
+python -m fireredtts3_local.adapt train recipes/russian_blackwell_96gb.json --stop-after 30
+```
+
+`precompute` обрабатывает все клипы train, validation и replay, исключая повторные
+хеши аудио. Повторный запуск проверяет и переиспользует готовые файлы. Прерывание
+не требует пересчёта уже сохранённых клипов. Для восстановления повреждённых
+записей используйте ту же команду с `--repair`. Файлы записываются атомарно.
+Ключ кэша включает версию расчёта, полный fingerprint base/tokenizer, точность,
+версию PyTorch и attention backend; CPU- и CUDA-признаки не смешиваются.
+При изменении этих параметров нужен новый предрасчёт.
+
+RedAE и CAM++ вычисляются **отдельно для каждого клипа**: официальный RedAE.encode
+обрабатывает только первый элемент входа, а padding разных аудиозаписей меняет
+контекст encoder и статистику CAM++. Замороженный PatchEncoder работает в eval,
+включая его dropout. Его готовые выходы также сохранены. В режиме
+`require_precomputed_features=true` обучение проверяет наличие всех файлов до
+первого шага и запрещает скрытый запуск аудиоэнкодеров; содержимое проверяется
+при загрузке. RedAE/CAM++ выгружаются в CPU RAM, освобождая VRAM. Для необязательного
+Eval Audio они временно возвращаются на GPU.
+
+Кэш хранит float32-признаки без дополнительной квантизации. Для стандартных
+размерностей Base это примерно **0.21 GB на час аудио**, около 10–11 GB на 50 часов,
+плюс накладные расходы файлов. Оставьте место также для исходных shards, нарезанных
+WAV, весов и checkpoints. Кэш лучше держать на локальном NVMe, не сетевом диске.
+WAV не удаляйте: audit при каждом запуске проверяет их метаданные и хеши.
+Весь YO-CPT-ru скачивать не требуется — достаточно импортированной выборки.
+
+Один пакетный student forward обрабатывает несколько пар разной длины; teacher
+обрабатывает только примеры, где включено удержание base. Padding находится после
+полной последовательности и исключён из stop/flow loss. История акустики не
+смешивается с текстом или соседними примерами. Flow и stop усредняются сначала
+внутри примера, затем между примерами: длинная запись не получает больший вес.
+`bucket_by_length` сортирует уже выбранные пары только внутри текущего optimizer
+step. Баланс дикторов и вероятность replay сохраняются, примеры не отбрасываются.
+
+Первые 30 шагов нужны для проверки GPU, памяти и скорости. `--stop-after` завершает
+заданный бюджет обновлений этого запуска и сохраняет состояние с исходным
+`training_steps=1000` и расписанием LR. Для продолжения добавьте в тот же рецепт
+`"resume_checkpoint": "training/outputs/russian-blackwell-01"` и запустите `train`
+без `--stop-after`. Изменять batch, accumulation или остальные настройки при resume
+нельзя; для сравнения конфигураций создавайте новый output/run.
+
+В `performance.jsonl` записываются время шага с CUDA synchronization, пары/сек,
+объём целевого аудио, время ожидания данных/постановки копирования и пиковая
+allocated VRAM. CUDA allocator reserve и память драйвера в allocated VRAM не входят;
+смотрите также `nvidia-smi`. После разогрева оцените время 1000 шагов по медиане:
+
+```bash
+python - <<'PYTIME'
+import json, statistics
+from pathlib import Path
+rows = [json.loads(line) for line in Path(
+    'training/outputs/russian-blackwell-01/performance.jsonl').read_text().splitlines()]
+seconds = statistics.median(row['step_seconds'] for row in rows[5:])
+print(f'{seconds:.2f} s/step; 1000 updates: {1000*seconds/3600:.2f} h')
+PYTIME
+```
+
+Эта оценка не включает предрасчёт, validation, генерацию Eval Audio и сохранение.
+Их время прибавляется отдельно. При OOM начните новый run с `batch_size=4` и
+`gradient_accumulation=2` (те же 8 пар), уменьшите также `validation_batch_size`;
+при необходимости включите `gradient_checkpointing`. При наличии запаса VRAM
+сравнивайте скорости на одинаковом наборе и бюджете пар. Увеличение batch до 16
+при accumulation=1 удваивает примеры на шаг и меняет эксперимент.
+
 ## Обучение
 
 Исходный рецепт: [recipes/russian_backbone.json](../recipes/russian_backbone.json).
@@ -167,12 +252,17 @@ backbone_dit при одном split и сопоставимом бюджете.
 | Опция | Смысл |
 |---|---|
 | `replay_manifest` | Дополнительные настоящие пары для удержания разнообразия; не могут пересекаться с validation |
-| `replay_ratio` | Вероятность выбрать replay на каждом micro-batch; 0.2 — исходная гипотеза |
+| `replay_ratio` | Вероятность выбрать replay для каждой пары; 0.2 — исходная гипотеза |
 | `preservation_weight` | MSE flow-предсказаний и вероятностей остановки против base с отключённой LoRA |
 | `validation_pairs` | Число фиксированных, воспроизводимо выбранных пар для оценки loss |
 | `patience` | Число validation без улучшения; 0 отключает early stopping |
 | `patches_per_example` | Сколько равномерно выбранных целевых патчей участвует в flow loss |
 | `max_prompt_seconds`, `max_target_seconds` | Пределы целых подготовленных клипов; не команды обрезания |
+| `batch_size`, `validation_batch_size` | Число пар в одном пакетном проходе; default 1 для совместимости |
+| `require_precomputed_features` | Читать только готовый кэш; не вычислять аудиопризнаки во время обучения |
+| `offload_frozen_encoders` | Убрать RedAE/CAM++ с GPU; требует готового кэша |
+| `loader_workers`, `prefetch_batches` | Потоки CPU-загрузки и ограничение очереди; работают в режиме готового кэша |
+| `bucket_by_length` | Группировка по длине только внутри текущего optimizer step |
 | `gradient_checkpointing` | Non-reentrant checkpointing backbone для уменьшения памяти |
 
 Если replay задан, preservation применяется к replay. Иначе он явно применяется
@@ -184,9 +274,11 @@ t, историю и маску CFG; его LoRA отключена, dropout в�
 
 Для возобновления добавьте в исходный JSON `resume_checkpoint` с путём к checkpoint
 или корню завершённого/остановленного run. Остальные настройки, total_steps, входные
-файлы, split и base должны совпадать. Старые all-linear checkpoints несовместимы.
-Сохранение происходит на границах optimizer step; накопленные до запроса Stop
-micro-batch усредняются по фактическому количеству. Аварийное прерывание можно
+файлы, split и base должны совпадать. Checkpoints старого scalar-тренера (schema 2) и all-linear несовместимы с resume
+нового пакетного тренера (schema 3). Существующие adapters можно использовать
+для инференса. Stop завершает текущий optimizer step целиком и затем сохраняет
+состояние. Последний неполный batch/шаг эпохи нормируется по фактическому числу пар.
+Предварительно загруженные будущие пары не продвигают сохраняемый sampler RNG. Аварийное прерывание можно
 возобновить с последнего полностью записанного checkpoint. Не редактируйте аудио
 в процессе обучения.
 
@@ -198,6 +290,9 @@ resume не перезаписывается.
 
 В GUI рецепт находится в LoRA Training → Russian adaptation / validation recipe.
 Он сохраняется вместе с проектом. Можно вставить путь к импортированному manifest.
+В GUI вставляйте в это поле только объект `options` из JSON; остальные поля
+рецепта задаются отдельными контролами. Для рецепта Blackwell установите Gradient
+Accumulation = 1, иначе 8×8 даст 64 пары на шаг. Предрасчёт запускается из CLI.
 Одиночное Eval Audio предназначено для быстрого прослушивания и не заменяет benchmark.
 
 ## Проверка качества клонирования
@@ -264,4 +359,7 @@ python -m unittest discover -s tests -v
 optimizer/checkpoints, синтетическое аудио и Parquet. Проверяют градиенты, causal
 teacher-forcing против incremental generation, stop-target, CFG, teacher, split,
 replay leakage, cache invalidation и идентичность resumed/uninterrupted весов.
+Пакетный граф сверяется по loss и градиентам с независимым scalar-графом на
+разных длинах, смешанном preservation и короткой акустической истории; проверяются
+кэш против online-признаков, gradient checkpointing, предзагрузка и неполные batch.
 Они не заменяют GPU-прогон полной модели, оценку качества или проверку SGLang.

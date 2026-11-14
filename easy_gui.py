@@ -1728,8 +1728,10 @@ Epochs are speaker-balanced sampling budgets, not exhaustive passes over every c
                 gr.Markdown("Choose `backbone` or `backbone_dit`. Validation holds out speakers by default. "
                             "Use `validation_manifest` for a fixed split and `replay_manifest` for retention data. "
                             "`preservation_weight` compares against the frozen original model. "
+                            "`batch_size` is pairs per forward; effective batch = batch_size × Gradient Accumulation. "
+                            "For precomputed training, run `adapt precompute` with the same recipe first. "
                             "See docs/RUSSIAN_TRAINING.md for every option and YO-CPT-ru import.")
-                train_options=gr.Code(value=json.dumps(asdict(TrainingOptions()), indent=2), language="json", label="Training recipe", interactive=True)
+                train_options=gr.Code(value=json.dumps(asdict(TrainingOptions()), indent=2), language="json", label="Training options (JSON object)", interactive=True)
 
             with gr.Accordion("🎧 Eval Audio + TensorBoard",open=False):
                 with gr.Row():

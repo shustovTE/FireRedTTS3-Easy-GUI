@@ -24,7 +24,7 @@ class Backbone(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(32, 8)
         self.proj = nn.Linear(8, 8)
-    def forward(self, inputs_embeds, use_cache=False):
+    def forward(self, inputs_embeds, use_cache=False, attention_mask=None, position_ids=None):
         return SimpleNamespace(last_hidden_state=self.proj(inputs_embeds).cumsum(1))
 
 

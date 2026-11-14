@@ -8,13 +8,16 @@ import json
 import math
 from pathlib import Path
 import random
+import time
 
 import torch
 import torchaudio
 
 from .training_data import (SpeakerPairs, assert_disjoint, dataset_fingerprint,
                             model_identity, load_manifest, split_manifest, write_manifest)
-from .training_objective import FeatureCache, adapter_targets, flow_loss
+from .training_objective import adapter_targets
+from .training_features import BatchFeatures, BatchRequest, FeatureCache
+from .training_batch import Example, batch_flow_loss, set_training
 
 
 @dataclass
@@ -38,6 +41,13 @@ class TrainingOptions:
     cache_dir: str = ".runtime/training-cache"
     attention_backend: str = "sdpa"
     gradient_checkpointing: bool = True
+    batch_size: int = 1
+    validation_batch_size: int = 1
+    require_precomputed_features: bool = False
+    offload_frozen_encoders: bool = False
+    loader_workers: int = 2
+    prefetch_batches: int = 2
+    bucket_by_length: bool = True
 
     def validate(self):
         for name, value in asdict(self).items():
@@ -49,9 +59,19 @@ class TrainingOptions:
             raise ValueError("validation_scope must be speaker or recording")
         if self.attention_backend not in {"sdpa", "flash_attention_2"}:
             raise ValueError("Unsupported attention backend")
-        for name in ("validation_pairs", "validate_every", "patches_per_example"):
+        for name in ("validation_pairs", "validate_every", "patches_per_example", "batch_size", "validation_batch_size", "prefetch_batches"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
+        for name in ("loader_workers", "patience"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        for name in ("gradient_checkpointing", "require_precomputed_features", "offload_frozen_encoders", "bucket_by_length"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be boolean")
+        if self.require_precomputed_features and not self.cache_dir:
+            raise ValueError("Precomputed training requires cache_dir")
+        if self.offload_frozen_encoders and not self.require_precomputed_features:
+            raise ValueError("Offloading encoders requires precomputed features")
         if self.patience < 0 or not 0 < self.validation_fraction < 1:
             raise ValueError("Invalid patience/validation_fraction")
         if not 0 <= self.cfg_dropout < 1 or not 0 <= self.replay_ratio < 1:
@@ -110,23 +130,78 @@ def isolated_rng(seed):
         random.setstate(state)
 
 
+def to_examples(tts, loaded):
+    texts = [f"<|{target['language']}|><|sot|>{prompt['text']}{target['text']}<|eot|>"
+             for _, _, prompt, target, _ in loaded]
+    if hasattr(tts, "text_tokenizer"):
+        token_lists = tts.text_tokenizer(texts, truncation=False, padding=False, add_special_tokens=False)["input_ids"]
+        tokens = [torch.tensor(ids, dtype=torch.long, device=tts.device) for ids in token_lists]
+    else:
+        tokens = [tts._tokenize_text(text).flatten() for text in texts]
+    # Unique CPU tensors stay alive until the nonblocking copies are queued.
+    transferred = {}
+    def move(data, key):
+        tensor = data[key]
+        if id(tensor) not in transferred:
+            dtype = torch.bfloat16 if key == 'patch_embeddings' and torch.device(tts.device).type == 'cuda' else tensor.dtype
+            transferred[id(tensor)] = tensor.to(tts.device, dtype=dtype, non_blocking=True)
+        return transferred[id(tensor)]
+    return [Example(token, move(pa, 'latents'), move(ta, 'latents'), move(pa, 'speaker'), keep,
+                    move(pa, 'patch_embeddings'), move(ta, 'patch_embeddings'))
+            for token, (pa, ta, _, _, keep) in zip(tokens, loaded)]
+
+
+def planned_batches(train, replay, options, sampler_state, start, total, accumulation, length_mode):
+    """Prefetch can run ahead; only the last consumed batch commits sampler RNG.
+
+    Bucketing only reorders the same sampled optimizer update. It never rejects
+    examples, changes speaker/replay frequencies or moves examples across updates.
+    """
+    rng = random.Random()
+    rng.setstate(sampler_state)
+    effective = options.batch_size * accumulation
+    steps_per_epoch = math.ceil(len(train.rows) / effective)
+    for step in range(start, total):
+        count = (min(effective, len(train.rows)-(step % steps_per_epoch)*effective)
+                 if length_mode == "Epochs" else effective)
+        pairs = []
+        for _ in range(count):
+            is_replay = replay is not None and rng.random() < options.replay_ratio
+            prompt, target = (replay if is_replay else train).sample(rng)
+            keep = options.preservation_weight if is_replay or replay is None else 0.0
+            pairs.append((prompt, target, keep))
+        state = rng.getstate()
+        if options.bucket_by_length:
+            # Approximate token+patch lengths; grouping need not load GPU features.
+            pairs.sort(key=lambda pair: sum(len(row['text']) + 6.25*row['duration'] for row in pair[:2]))
+        for index in range(0, count, options.batch_size):
+            yield BatchRequest(pairs[index:index+options.batch_size],
+                               state if index+options.batch_size >= count else None)
+
+
 def validate_model(tts, cache, pairs, options, seed):
     was_training = tts.tts_core.training
-    values = []
+    loader = BatchFeatures(cache, options.loader_workers, options.prefetch_batches)
+    values = {}
     try:
-        tts.tts_core.eval()
+        set_training(tts.tts_core, False)
         with isolated_rng(seed), torch.no_grad():
             rng = random.Random(seed)
-            for _ in range(options.validation_pairs):
-                prompt, target = pairs.sample(rng)
-                pa, spk = cache.get(prompt)
-                ta, _ = cache.get(target)
-                _, metrics = flow_loss(tts, pa, spk, ta, prompt["text"], target["text"], target["language"],
-                                       options.patches_per_example, 0.0, options.stop_weight, 0.0)
-                values.append({k: float(v) for k, v in metrics.items()})
-        return {k: sum(v[k] for v in values) / len(values) for k in values[0]}
+            # Dedicated generator makes validation noise independent of batch size.
+            generator = torch.Generator(device=tts.device).manual_seed(seed)
+            sampled = [(*pairs.sample(rng), 0.0) for _ in range(options.validation_pairs)]
+            requests = (BatchRequest(sampled[i:i+options.validation_batch_size])
+                        for i in range(0, len(sampled), options.validation_batch_size))
+            for _, loaded in loader.iterate(requests):
+                examples = to_examples(tts, loaded)
+                _, metrics = batch_flow_loss(tts, examples, options.patches_per_example,
+                                             0.0, options.stop_weight, generator=generator)
+                for key, value in metrics.items():
+                    values[key] = values.get(key, 0.0) + float(value)*len(examples)
+        return {key: value/options.validation_pairs for key, value in values.items()}
     finally:
-        tts.tts_core.train(was_training)
+        loader.close()
+        set_training(tts.tts_core, was_training)
 
 
 def exclusive_model(function):
@@ -164,10 +239,11 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
     resume = Path(resume_checkpoint) if resume_checkpoint and str(resume_checkpoint) != "None" else None
     if out.exists() and any(out.iterdir()) and resume is None:
         raise ValueError("Output directory is not empty; choose a new run name or explicitly resume")
-    steps_per_epoch = math.ceil(len(train.rows) / gradient_accumulation)
+    effective_batch = opts.batch_size * gradient_accumulation
+    steps_per_epoch = math.ceil(len(train.rows) / effective_batch)
     total = training_steps if length_mode == "Steps" else steps_per_epoch * training_epochs
     recipe = {
-        "schema": 2, "options": asdict(opts), "rank": rank, "alpha": alpha, "dropout": dropout,
+        "schema": 3, "options": asdict(opts), "rank": rank, "alpha": alpha, "dropout": dropout,
         "learning_rate": learning_rate, "accumulation": gradient_accumulation,
         "seed": seed, "length_mode": length_mode, "total_steps": total,
         "train_fingerprint": dataset_fingerprint(train.rows),
@@ -191,7 +267,7 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
     random.seed(seed)
     torch.manual_seed(seed)
     rng = random.Random(seed)
-    writer = None
+    writer = loader = None
     try:
         # Always start from the clean base, never an inference adapter left in memory.
         manager.unload(log)
@@ -229,7 +305,16 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             fraction = min(1.0, (step - warmup) / max(1, total - warmup))
             return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * fraction))
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
-        cache = FeatureCache(tts, opts.cache_dir or None, base_fingerprint)
+        set_training(core)
+        cache = FeatureCache(tts, opts.cache_dir or None, base_fingerprint, opts.require_precomputed_features)
+        if opts.require_precomputed_features:
+            cache.require_all(train.rows + validation.rows + (replay.rows if replay else []))
+        if opts.offload_frozen_encoders:
+            tts.redae.to("cpu")
+            tts.spk_extractor.to("cpu")
+            torch.cuda.empty_cache()
+        loader = BatchFeatures(cache, opts.loader_workers, opts.prefetch_batches)
+        log(f"[training] batch={opts.batch_size}, accumulation={gradient_accumulation}, effective={effective_batch}; precomputed={opts.require_precomputed_features}")
         step, best, bad = 0, float("inf"), 0
         if state:
             optimizer.load_state_dict(state["optimizer"])
@@ -278,6 +363,9 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             was_training = core.training
             try:
                 core.eval()
+                if opts.offload_frozen_encoders:
+                    tts.redae.to(tts.device)
+                    tts.spk_extractor.to(tts.device)
                 with isolated_rng(seed), torch.inference_mode():
                     ref, sr = torchaudio.load(eval_reference_audio)
                     wav, rate = tts.generate(language=eval_language, prompt_text=eval_reference_transcript,
@@ -287,40 +375,44 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
                 folder.mkdir(exist_ok=True)
                 torchaudio.save(str(folder / f"step-{step:06d}.wav"), wav.cpu(), rate)
             finally:
-                core.train(was_training)
+                if opts.offload_frozen_encoders:
+                    tts.redae.to("cpu")
+                    tts.spk_extractor.to("cpu")
+                    torch.cuda.empty_cache()
+                set_training(core, was_training)
 
-        core.train()
+        set_training(core)
         if not state:
             evaluate()
             preview()
+        batches = loader.iterate(planned_batches(train, replay, opts, rng.getstate(), step, total,
+                                                gradient_accumulation, length_mode))
         while step < total and not STOP_EVENT.is_set():
+            if torch.device(tts.device).type == "cuda":
+                torch.cuda.synchronize(tts.device)
+                torch.cuda.reset_peak_memory_stats(tts.device)
+            started = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             metrics_sum = {}
-            used = 0
-            # Epoch mode's final update divides by its ACTUAL micro-batch count.
-            epoch_position = step % steps_per_epoch
-            batch_size = (min(gradient_accumulation, len(train.rows) - epoch_position * gradient_accumulation)
-                          if length_mode == "Epochs" else gradient_accumulation)
-            for _ in range(batch_size):
-                if STOP_EVENT.is_set():
-                    break
-                is_replay = replay is not None and rng.random() < opts.replay_ratio
-                prompt, target = (replay if is_replay else train).sample(rng)
-                pa, speaker = cache.get(prompt)
-                ta, _ = cache.get(target)
-                # When replay exists, preserve on replay only; otherwise regularize
-                # the main corpus against the original model with the explicit weight.
-                keep = opts.preservation_weight if is_replay or replay is None else 0.0
-                loss, metrics = flow_loss(tts, pa, speaker, ta, prompt["text"], target["text"], target["language"],
-                                          opts.patches_per_example, opts.cfg_dropout, opts.stop_weight, keep)
+            used, data_seconds, target_seconds = 0, 0.0, 0.0
+            # Finish the whole update on Stop: sampler state and optimizer remain aligned.
+            while True:
+                waiting = time.perf_counter()
+                request, loaded = next(batches)
+                examples = to_examples(tts, loaded)
+                data_seconds += time.perf_counter()-waiting
+                loss, metrics = batch_flow_loss(tts, examples, opts.patches_per_example,
+                                                opts.cfg_dropout, opts.stop_weight)
                 if not torch.isfinite(loss):
-                    raise FloatingPointError(f"Non-finite training loss at step {step}, utterance {target['utt_id']}")
-                loss.backward()
-                used += 1
+                    raise FloatingPointError(f"Non-finite training loss at step {step}")
+                (loss*len(examples)).backward()
+                used += len(examples)
+                target_seconds += sum(target['duration'] for _, _, _, target, _ in loaded)
                 for key, value in metrics.items():
-                    metrics_sum[key] = metrics_sum.get(key, 0.0) + float(value)
-            if not used:
-                break
+                    metrics_sum[key] = metrics_sum.get(key, 0.0) + float(value)*len(examples)
+                if request.sampler_state is not None:
+                    rng.setstate(request.sampler_state)
+                    break
             for _, parameter in named:
                 if parameter.grad is not None:
                     parameter.grad.div_(used)
@@ -328,11 +420,22 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             optimizer.step()
             scheduler.step()
             step += 1
+            if torch.device(tts.device).type == "cuda":
+                torch.cuda.synchronize(tts.device)
+            elapsed = time.perf_counter()-started
+            performance = {"step": step, "examples": used, "step_seconds": elapsed,
+                           "examples_per_second": used/elapsed, "target_audio_seconds": target_seconds,
+                           "data_wait_and_copy_enqueue_seconds": data_seconds,
+                           "peak_allocated_gb": torch.cuda.max_memory_allocated(tts.device)/1e9 if torch.device(tts.device).type == "cuda" else 0.0}
+            with (out / "performance.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(performance)+"\n")
+            writer.add_scalar("performance/step_seconds", elapsed, step)
+            writer.add_scalar("performance/examples_per_second", used/elapsed, step)
             for key, value in metrics_sum.items():
                 writer.add_scalar("train/" + key, value / used, step)
             writer.add_scalar("train/grad_norm", float(norm), step)
             writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], step)
-            message = f"[training] step={step}/{total} loss={metrics_sum['loss']/used:.6f}"
+            message = f"[training] step={step}/{total} loss={metrics_sum['loss']/used:.6f} {elapsed:.2f}s/step {used/elapsed:.2f} examples/s"
             log(message)
             if progress_cb:
                 progress_cb(step, total, message)
@@ -350,6 +453,8 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         log("[training] Compare best-validation and baseline on unseen voices before deployment.")
         return out, step if length_mode == "Steps" else step // steps_per_epoch
     finally:
+        if loader:
+            loader.close()
         if writer:
             writer.close()
         manager.unload(log)

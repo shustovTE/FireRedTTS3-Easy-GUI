@@ -33,6 +33,11 @@ def main():
     audit.add_argument("--seed", type=int, default=1234)
     train = commands.add_parser("train", help="Train from a JSON recipe")
     train.add_argument("recipe", help="JSON containing train_lora keyword arguments, including options")
+    train.add_argument("--stop-after", type=int, help="Stop after N completed updates in this invocation; resume with the same recipe")
+    precompute = commands.add_parser("precompute", help="Precompute frozen RedAE, CAM++ and PatchEncoder features")
+    precompute.add_argument("recipe", help="Use the exact recipe/split intended for training")
+    precompute.add_argument("--base", help="Local original weights; defaults to models/FireRedTTS3")
+    precompute.add_argument("--repair", action="store_true", help="Recompute invalid entries; valid entries are reused")
     defaults = commands.add_parser("options", help="Print all adaptation option defaults")
     evaluate = commands.add_parser("evaluate", help="Generate an unseen-voice benchmark and optional metrics")
     evaluate.add_argument("benchmark")
@@ -76,7 +81,22 @@ def main():
     elif args.command == "train":
         from .model_manager import ModelManager
         config = json.loads(Path(args.recipe).read_text(encoding="utf-8"))
+        if args.stop_after is not None:
+            if args.stop_after < 1:
+                parser.error("--stop-after must be positive")
+            from .training import STOP_EVENT
+            completed = 0
+            def stop_after(*_):
+                nonlocal completed
+                completed += 1
+                if completed >= args.stop_after:
+                    STOP_EVENT.set()
+            config['progress_cb'] = stop_after
         train_lora(ModelManager(), **config)
+    elif args.command == "precompute":
+        from .paths import MODEL_DIR
+        from .training_features import precompute_recipe
+        precompute_recipe(args.recipe, args.base or MODEL_DIR, repair=args.repair)
     elif args.command == "evaluate":
         from .evaluation import evaluate_benchmark
         evaluate_benchmark(args.benchmark, args.output, args.adapter, args.speaker_model, args.asr_model)

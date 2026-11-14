@@ -363,6 +363,8 @@ Prepared datasets and project metadata are kept separate from the original sourc
 
 Russian adaptation now includes speaker-aware data preparation, held-out validation, scoped LoRA, replay, base-model preservation and full-core export. See **[the Russian training guide](docs/RUSSIAN_TRAINING.md)** and **[the example recipe](recipes/russian_backbone.json)**. Existing manifests require explicit `speaker_id`; audio is no longer silently cropped.
 
+For RTX PRO 6000 Blackwell 96 GB, start with [the batched/precomputed recipe](recipes/russian_blackwell_96gb.json). `adapt precompute` caches RedAE, CAM++ and frozen PatchEncoder features; `batch_size` controls actual batched backbone/DiT execution. Effective pairs per update = `batch_size × gradient_accumulation`. The guide includes a resumable 30-step timing run; GPU throughput and quality still require measurement.
+
 ![tab4](assets/tab4.png)
 
 The **LoRA Training** tab provides experimental single-GPU voice-cloning training for FireRedTTS3-Base.
@@ -396,7 +398,7 @@ Choose:
 - **Training Steps**
 - **Save Every N Steps**
 
-If `Training Steps = 1500`, the run performs exactly 1500 optimizer steps.
+If `Training Steps = 1500`, the maximum budget is 1500 optimizer steps; Stop or early stopping may finish sooner.
 
 If `Save Every N Steps = 150`, checkpoints and evaluation audio are generated at approximately:
 
@@ -415,7 +417,7 @@ Choose:
 - **Training Epochs**
 - **Save Every N Epochs**
 
-If `Training Epochs = 20`, the dataset is processed for exactly 20 complete passes.
+If `Training Epochs = 20`, the budget is 20 speaker-balanced sampling epochs. Each epoch samples as many pairs as there are training clips; it is not an exhaustive pass.
 
 If `Save Every N Epochs = 2`, checkpoints and evaluation audio are generated after epochs:
 
@@ -472,14 +474,12 @@ The experimental trainer uses several safeguards intended to make small voice da
 - AdamW optimization;
 - warmup;
 - cosine learning-rate decay;
-- smoothed EMA training metrics;
-- raw training metrics retained separately;
-- additional stop-target sampling;
+- per-example flow/stop losses, excluding batch padding;
+- held-out validation and early stopping;
+- step timing, examples/second and peak allocated GPU memory;
 - checkpoint evaluation audio.
 
-The main TensorBoard curves are smoothed to make the optimization trend easier to read.
-
-Raw values remain available under separate `train_raw/*` metrics for detailed inspection.
+TensorBoard records `train/*`, `validation/*` and `performance/*`. JSONL files retain validation and timing measurements; use TensorBoard smoothing when comparing trends.
 
 ---
 
@@ -487,20 +487,13 @@ Raw values remain available under separate `train_raw/*` metrics for detailed in
 
 Intermediate checkpoints are stored inside the selected training output directory.
 
-Checkpoint names reflect the selected training unit.
+Checkpoint names use optimizer steps in both modes; epoch mode controls the save cadence.
 
 Examples:
 
 ```text
 checkpoint-step-000500/
 checkpoint-step-001000/
-```
-
-or:
-
-```text
-checkpoint-epoch-0005/
-checkpoint-epoch-0010/
 ```
 
 The **Resume Checkpoint** selector can restore an available training checkpoint and continue the run.
