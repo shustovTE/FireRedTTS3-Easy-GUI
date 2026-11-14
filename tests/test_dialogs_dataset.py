@@ -11,9 +11,9 @@ import numpy as np
 import soundfile as sf
 
 from fireredtts3_local.dialogs_dataset import (audio_name, category, choose_thirds,
-    eligible, file_inventory, lexical_key, plan_dialogs, prepare_dialogs, short_support_rows,
+    download_dialogs, eligible, file_inventory, lexical_key, plan_dialogs, prepare_dialogs, short_support_rows,
     validate_plan, METADATA, REPO, REVISION)
-from fireredtts3_local.training_data import SpeakerPairs, assert_disjoint, load_manifest, write_manifest
+from fireredtts3_local.training_data import SpeakerPairs, assert_disjoint, file_digest, load_manifest, write_manifest
 
 
 class DialogsTests(unittest.TestCase):
@@ -189,6 +189,24 @@ class DialogsTests(unittest.TestCase):
             for speaker in 'DMS':
                 summary=report['splits'][split][speaker]
                 self.assertEqual(set(summary['slots'].values()), {summary['clips']//3})
+
+    def test_separate_download_and_import_use_fixed_plan_without_network(self):
+        from huggingface_hub._local_folder import write_download_metadata
+        path, _ = self.plan()
+        plan = json.loads(path.read_text())
+        selected = plan['train']+plan['validation']
+        for row in selected:
+            write_download_metadata(self.source,row['audio_path'],REVISION,file_digest(self.source/row['audio_path']))
+        with patch('huggingface_hub.HfApi',side_effect=AssertionError('no inventory refresh')), \
+             patch('huggingface_hub.hf_hub_download',side_effect=AssertionError('no file request')):
+            report=download_dialogs(path,interval=0,log=lambda _:None)
+            prepare_dialogs(path,self.root/'import',log=lambda _:None)
+        self.assertEqual(report['reused'],len(selected))
+        self.assertEqual(report['downloaded'],0)
+        status=json.loads((path.parent/'download_report.json').read_text())
+        self.assertTrue(status['complete'])
+        self.assertEqual(status['plan_sha256'],file_digest(path))
+        self.assertEqual(len(load_manifest(self.root/'import'/'train.jsonl')),len(plan['train']))
 
     def test_tampered_metadata_plan_and_paths_rejected(self):
         for path in ('../secret.wav','/tmp/a.wav','wavs/../a.wav','wavs/a\\b.wav'):

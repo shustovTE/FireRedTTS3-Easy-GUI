@@ -189,13 +189,9 @@ def select_with_holdout(rows, train_seconds, validation_seconds, seed, max_secon
                      'Reduce the budgets or inspect the metadata; no speaker/quota was silently dropped.')
 
 
-def fetch_files(source, names, revision):
-    from concurrent.futures import ThreadPoolExecutor
-    from huggingface_hub import hf_hub_download
-    def fetch(name):
-        return hf_hub_download(REPO, name, repo_type='dataset', revision=revision, local_dir=source)
-    with ThreadPoolExecutor(max_workers=8) as workers:
-        list(workers.map(fetch, names))
+def fetch_files(source, names, revision, **options):
+    from .hub_download import download_files
+    return download_files(source, names, REPO, revision, **options)
 
 
 def file_inventory(source, revision, refresh=False):
@@ -328,19 +324,12 @@ def validate_plan(plan):
         raise ValueError('Plan train/validation text leakage')
 
 
-def prepare_dialogs(plan_path, output, download=False, log=print, replay_manifest=None, validation_manifest=None):
-    import numpy as np
-    import soundfile as sf
-    import torch
-    import torchaudio
+def checked_plan(plan_path, download=False):
+    """Validate the selection and source snapshot before downloads or import."""
     plan = json.loads(Path(plan_path).read_text(encoding='utf-8'))
     if plan.get('schema') != 1 or plan['report']['repo'] != REPO:
         raise ValueError('Unsupported Dialogs plan')
-    root, source = Path(output).resolve(), Path(plan['source_dir']).resolve()
-    if root.exists() and any(root.iterdir()):
-        raise ValueError('Import output must be new/empty')
-    if bool(replay_manifest) != bool(validation_manifest):
-        raise ValueError('Supply both YO replay and unseen validation manifests')
+    source = Path(plan['source_dir']).resolve()
     for name in METADATA:
         if file_digest(source/name) != plan['source_hashes'].get(name):
             raise ValueError(f'Source metadata changed: {name}; regenerate the plan')
@@ -359,7 +348,8 @@ def prepare_dialogs(plan_path, output, download=False, log=print, replay_manifes
     # Reject stale CSV-only plans before loading YO or downloading any WAVs.
     # Legacy plans remain usable if every selected file actually exists.
     if download or plan.get('file_inventory_sha256'):
-        available, inventory_hash = file_inventory(source, plan['report']['revision'], refresh=download)
+        available, inventory_hash = file_inventory(source, plan['report']['revision'],
+            refresh=download and not plan.get('file_inventory_sha256'))
         if plan.get('file_inventory_sha256') and inventory_hash != plan['file_inventory_sha256']:
             raise ValueError('File inventory changed; regenerate the plan')
         missing = sorted(r['audio_path'] for r in selected if r['audio_path'] not in available)
@@ -367,13 +357,44 @@ def prepare_dialogs(plan_path, output, download=False, log=print, replay_manifes
             raise ValueError(f'Plan selects {len(missing)} WAVs absent from the pinned repository; '
                              f'first: {missing[:3]}. Rerun plan-dialogs --download with a new output '
                              'directory, then import the new plan. Keep existing downloaded WAVs.')
+    return plan, source, selected
+
+
+def download_dialogs(plan_path, interval=2., max_retries=8, log=print):
+    """Fetch the fixed plan separately; importing afterwards needs no network."""
+    from filelock import FileLock
+    plan_path = Path(plan_path).resolve()
+    plan, source, selected = checked_plan(plan_path, download=True)
+    report_path = plan_path.parent/'download_report.json'
+    fingerprint = file_digest(plan_path)
+    def progress(state):
+        temporary = report_path.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps({**state, 'plan_sha256': fingerprint}, indent=2), encoding='utf-8')
+        temporary.replace(report_path)
+    # Prevent duplicate background launches from doubling request pressure.
+    with FileLock(str(source/'.dialogs-download.lock'), timeout=0):
+        return fetch_files(source, [r['audio_path'] for r in selected], plan['report']['revision'],
+                           interval=interval, max_retries=max_retries, log=log, progress=progress)
+
+
+def prepare_dialogs(plan_path, output, download=False, log=print, replay_manifest=None, validation_manifest=None):
+    import numpy as np
+    import soundfile as sf
+    import torch
+    import torchaudio
+    root = Path(output).resolve()
+    if root.exists() and any(root.iterdir()):
+        raise ValueError('Import output must be new/empty')
+    if bool(replay_manifest) != bool(validation_manifest):
+        raise ValueError('Supply both YO replay and unseen validation manifests')
+    plan, source, selected = checked_plan(plan_path, download=download)
     support, support_reports = {}, {}
     if replay_manifest:
         for name, path in [('replay', replay_manifest), ('unseen-validation', validation_manifest)]:
             support[name], support_reports[name] = short_support_rows(path, plan['report']['max_seconds'])
         assert_disjoint(support['replay'], support['unseen-validation'], 'speaker')
     if download:
-        fetch_files(source, [r['audio_path'] for r in selected], plan['report']['revision'])
+        fetch_files(source, [r['audio_path'] for r in selected], plan['report']['revision'], log=log)
     (root/'audio').mkdir(parents=True, exist_ok=True)
     accepted, rejected, hashes = {}, {}, set()
     for index, row in enumerate(selected, 1):

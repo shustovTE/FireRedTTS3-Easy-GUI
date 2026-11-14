@@ -33,6 +33,10 @@ def main():
     dialogs.add_argument('--validation-minutes', type=float, default=10/3)
     dialogs.add_argument('--seed', type=int, default=1234)
     dialogs.add_argument('--download', action='store_true', help='Fetch pinned CSV metadata, license and full file inventory; no audio')
+    dialogs_download = commands.add_parser('download-dialogs', help='Resume a fixed plan with serial HTTP, verified cache reuse and rate backoff')
+    dialogs_download.add_argument('plan')
+    dialogs_download.add_argument('--interval', type=float, default=2., help='Minimum seconds between new download requests')
+    dialogs_download.add_argument('--max-retries', type=int, default=8, help='Retries per file after temporary network/rate errors')
     dialogs_import = commands.add_parser('prepare-dialogs', help='Download/audit planned WAVs, keeping exact thirds')
     dialogs_import.add_argument('plan')
     dialogs_import.add_argument('--output', default='training/datasets/dialogs-neutral')
@@ -87,6 +91,9 @@ def main():
         report = plan_dialogs(args.source, args.output, args.source_revision, args.max_seconds,
                               args.train_minutes, args.validation_minutes, args.seed, args.download)
         print(json.dumps(report, ensure_ascii=False, indent=2))
+    elif args.command == 'download-dialogs':
+        from .dialogs_dataset import download_dialogs
+        print(json.dumps(download_dialogs(args.plan, args.interval, args.max_retries), ensure_ascii=False, indent=2))
     elif args.command == 'prepare-dialogs':
         from .dialogs_dataset import prepare_dialogs
         print(json.dumps(prepare_dialogs(args.plan, args.output, args.download,

@@ -7,6 +7,10 @@ revision `a74ff44d8d27ca3d21098ea3ed4d31a32923fbdd`. Используем тол
 Метаданные, лицензионный файл и полный список файлов этой revision фиксируются
 SHA256 в плане. Наличие строки в CSV само по себе не означает наличие WAV.
 
+**Полного Parquet с аудио у этой версии датасета нет.** `preview.parquet` и
+автоматическая ветка `refs/convert/parquet` содержат только preview: 60 записей,
+около 29 МБ. Для обучающей выборки используются исходные WAV из `wavs/`.
+
 ## Правило отбора
 
 - Только `emotion=neutral`, положительная длительность **не более 10 секунд**.
@@ -84,17 +88,37 @@ git pull --ff-only origin feat/russian-tts-adaptation
 `training/plans/dialogs-neutral/report.json` содержит часы, трети, длины и число
 сессий отдельно по актёрам. `plan.json` сохраняет точный выбор и хеши исходников.
 
+Сначала скачайте аудио выбранного плана:
+
 ```bash
-.venv/bin/python -u -m fireredtts3_local.adapt prepare-dialogs \
+.venv/bin/python -u -m fireredtts3_local.adapt download-dialogs \
+  training/plans/dialogs-neutral/plan.json
+```
+
+Загрузчик использует **один HTTP-поток**, отключает Xet на время загрузки и
+выдерживает минимум 2 секунды между началами запросов новых файлов. Уже скачанный
+файл проверяется локально по revision и SHA256/git blob SHA1 из служебных метаданных
+Hugging Face. Совпавшие файлы переиспользуются **без HEAD/GET запросов**. Сохраняйте
+и `wavs/`, и скрытый каталог `training/raw/dialogs/.cache/huggingface/`.
+
+При 429, временных сетевых сбоях и некоторых 5xx действует до 8 повторов на файл
+с растущей паузой; более длинный `Retry-After` сервера соблюдается. 401/403/404
+останавливают загрузку. Ошибки не превращаются в пропущенные обучающие примеры.
+После обрыва запускайте ту же команду: завершённые файлы проверяются и пропускаются,
+частичные передачи возобновляет Hub. `download_report.json` рядом с планом содержит
+`status`, `complete`, `processed`, `reused`, `downloaded` и число повторов.
+
+После `"status": "completed", "complete": true` выполните полностью локальный импорт:
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 .venv/bin/python -u -m fireredtts3_local.adapt prepare-dialogs \
   training/plans/dialogs-neutral/plan.json \
   --output training/datasets/dialogs-neutral \
   --replay-manifest training/datasets/yo-split/train.jsonl \
-  --validation-manifest training/datasets/yo-split/validation.jsonl \
-  --download
+  --validation-manifest training/datasets/yo-split/validation.jsonl
 ```
 
-Скачиваются только выбранные WAV, до 8 файлов одновременно. Аудио проверяется
-на моно, конечность значений, длительность, сильный clipping и дубликаты, затем
+Импорт проверяет аудио на моно, конечность значений, длительность, сильный clipping и дубликаты, затем
 целиком пересчитывается в 24 кГц. Пары используют разные файлы того же актёра.
 Если WAV не проходит проверку, удаляется вся его отборочная тройка, чтобы
 отношение 1:1:1 не изменилось; это явно отражается в `import_report.json`.
@@ -114,6 +138,28 @@ git pull --ff-only origin feat/russian-tts-adaptation
 Старый план проверяется по файловому списку **до** скачивания WAV. Отсутствующие
 записи требуют пересоздания плана, чтобы заново набрать около 30 минут каждому
 актёру плюс дополнительную валидацию с точными третями.
+
+Если план `dialogs-neutral-v2` уже подготовлен, а WAV скачались лишь частично
+из-за **429 на `xet-read-token`**, используйте тот же план. После обновления кода
+можно оставить докачку в фоне:
+
+```bash
+mkdir -p training/logs
+nohup .venv/bin/python -u -m fireredtts3_local.adapt download-dialogs \
+  training/plans/dialogs-neutral-v2/plan.json \
+  >> training/logs/dialogs-download.log 2>&1 < /dev/null &
+
+tail -f training/logs/dialogs-download.log
+```
+
+SSH можно закрыть; `Ctrl+C` завершает только просмотр `tail`. Статус:
+`cat training/plans/dialogs-neutral-v2/download_report.json`. После завершения
+используйте локальную команду `prepare-dialogs` выше, заменив путь плана на
+`training/plans/dialogs-neutral-v2/plan.json`. Для ручной остановки/перезапуска
+сначала завершите запущенный процесс; второй загрузчик на тот же `source`
+защищён файловой блокировкой. Старый флаг `prepare-dialogs --download` также
+использует последовательную HTTP-докачку, но отдельная команда позволяет
+отделить сетевые ошибки от локальной аудиопроверки.
 
 У Dialogs нет исходного MOS и word alignment, как у YO: они не выдумываются и
 не подменяются проверкой пунктуации. Нужно прослушать часть аудио с текстом;
