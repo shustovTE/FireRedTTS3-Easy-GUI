@@ -5,12 +5,14 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
 
 from fireredtts3_local.dialogs_dataset import (audio_name, category, choose_thirds,
-    eligible, lexical_key, plan_dialogs, prepare_dialogs, short_support_rows, validate_plan)
+    eligible, file_inventory, lexical_key, plan_dialogs, prepare_dialogs, short_support_rows,
+    validate_plan, METADATA, REPO, REVISION)
 from fireredtts3_local.training_data import SpeakerPairs, assert_disjoint, load_manifest, write_manifest
 
 
@@ -38,6 +40,7 @@ class DialogsTests(unittest.TestCase):
                                      emotion_on_russian='нейтрально', accent_text=text, duration=str(duration)))
         self.rows = rows
         self.write_sources(rows[:-2], rows[-2:-1], rows[-1:])
+        self.write_inventory()
 
     def write_sources(self, train, val, test):
         for name, rows in [('metadata.csv', train+val+test), ('train.csv', train), ('val.csv', val), ('test.csv', test)]:
@@ -45,6 +48,12 @@ class DialogsTests(unittest.TestCase):
                 writer = csv.DictWriter(stream, fieldnames=list(self.rows[0]), delimiter='|')
                 writer.writeheader(); writer.writerows(rows)
         (self.source/'LICENSE.md').write_text('test license')
+
+    def write_inventory(self, excluded=()):
+        path = self.source/f'file-inventory-{REVISION}.json'
+        files = sorted(set(METADATA) | {r['audio_path'] for r in self.rows if r['audio_path'] not in excluded})
+        path.write_text(json.dumps(dict(schema=1, repo=REPO, revision=REVISION, files=files), indent=2))
+        return path
 
     def plan(self, folder='plan'):
         report = plan_dialogs(self.source, self.root/folder, max_seconds=3, train_minutes=.5,
@@ -89,6 +98,74 @@ class DialogsTests(unittest.TestCase):
         self.assertEqual(len(selected), len({r['audio_path'] for r in selected}))
         self.assertEqual(len(selected), len({r['text'] for r in selected}))
         self.assertTrue(all(r['category'] in {'question','statement'} for r in selected if r['selection_slot']=='random'))
+
+    def test_missing_remote_wavs_reselected_before_quotas_and_holdout(self):
+        path, _ = self.plan()
+        old = json.loads(path.read_text())
+        missing = {next(r['audio_path'] for r in old[split] if r['speaker_id']==speaker)
+                   for split in ('train','validation') for speaker in 'DMS'}
+        self.write_inventory(missing)
+        # A stray local WAV does not make an absent remote entry eligible.
+        self.assertTrue(all((self.source/name).is_file() for name in missing))
+        new_path, report = self.plan('replanned')
+        new = json.loads(new_path.read_text())
+        validate_plan(new)
+        self.assertFalse(missing & {r['audio_path'] for r in new['train']+new['validation']})
+        self.assertEqual(report['official_train_rejections']['missing_audio'],len(missing))
+        self.assertEqual(report['file_inventory']['metadata_missing_audio'],len(missing))
+        for speaker in 'DMS':
+            for split, budget in [('train',30),('validation',12)]:
+                stats=report['speakers'][speaker][split]
+                self.assertGreaterEqual(stats['minutes']*60,budget-3)
+                self.assertLessEqual(stats['minutes']*60,budget+1e-6)
+                self.assertEqual(set(stats['slots'].values()),{stats['clips']//3})
+
+    def test_old_plan_rejected_before_any_audio_download_or_output(self):
+        path, _ = self.plan()
+        legacy = json.loads(path.read_text())
+        del legacy['file_inventory_sha256']
+        del legacy['report']['file_inventory']
+        path.write_text(json.dumps(legacy))
+        files=json.loads(self.write_inventory({legacy['train'][0]['audio_path']}).read_text())['files']
+        with patch('huggingface_hub.HfApi') as api, patch('fireredtts3_local.dialogs_dataset.fetch_files') as fetch:
+            api.return_value.list_repo_files.return_value=files
+            with self.assertRaisesRegex(ValueError,'1 WAVs absent.*Rerun plan-dialogs'):
+                prepare_dialogs(path,self.root/'import',download=True)
+            fetch.assert_not_called()
+            api.return_value.list_repo_files.assert_called_once_with(REPO,repo_type='dataset',revision=REVISION)
+        self.assertFalse((self.root/'import').exists())
+
+    def test_inventory_download_offline_integrity_and_network_errors(self):
+        path=self.write_inventory()
+        files=json.loads(path.read_text())['files']
+        with patch('huggingface_hub.HfApi') as api, patch('fireredtts3_local.dialogs_dataset.fetch_files'):
+            api.return_value.list_repo_files.return_value=files
+            report=plan_dialogs(self.source,self.root/'online',max_seconds=3,train_minutes=.5,
+                                validation_minutes=.2,download=True)
+            api.return_value.list_repo_files.assert_called_once_with(REPO,repo_type='dataset',revision=REVISION)
+        _, offline_report=self.plan('offline')
+        self.assertEqual(report,offline_report)
+        previous=path.read_bytes()
+        with patch('huggingface_hub.HfApi') as api:
+            api.return_value.list_repo_files.side_effect=RuntimeError('network unavailable')
+            with self.assertRaisesRegex(RuntimeError,'network unavailable'):
+                file_inventory(self.source,REVISION,refresh=True)
+        self.assertEqual(path.read_bytes(),previous)
+        with patch('huggingface_hub.HfApi') as api:
+            api.return_value.list_repo_files.return_value=[]
+            with self.assertRaisesRegex(ValueError,'Invalid pinned file inventory'):
+                file_inventory(self.source,REVISION,refresh=True)
+        self.assertEqual(path.read_bytes(),previous)
+        path.write_bytes(previous+b'\n')
+        with self.assertRaisesRegex(ValueError,'File inventory changed'):
+            prepare_dialogs(self.root/'online'/'plan.json',self.root/'bad')
+        invalid=json.loads(path.read_text()); invalid['revision']='0'*40
+        path.write_text(json.dumps(invalid))
+        with self.assertRaisesRegex(ValueError,'Invalid pinned file inventory'):
+            file_inventory(self.source,REVISION)
+        path.unlink()
+        with self.assertRaisesRegex(ValueError,'Missing pinned file inventory'):
+            self.plan('missing')
 
     def test_import_real_audio_and_drop_whole_bad_triple(self):
         path, _ = self.plan()

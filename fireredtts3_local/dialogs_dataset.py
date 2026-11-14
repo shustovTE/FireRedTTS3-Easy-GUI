@@ -58,7 +58,7 @@ def read_csv(path):
     return rows
 
 
-def eligible(rows, max_seconds=10.):
+def eligible(rows, max_seconds=10., available_files=None):
     result, rejected = [], Counter()
     for row in rows:
         try:
@@ -73,6 +73,8 @@ def eligible(rows, max_seconds=10.):
             if not lexical_key(text) or not has_sentence_ending(text):
                 raise ValueError('incomplete_sentence_ending')
             name = audio_name(row['audio_path'])
+            if available_files is not None and name not in available_files:
+                raise ValueError('missing_audio')
             result.append(dict(audio_path=name, speaker_id=row['speaker_id'], text=text,
                                duration=duration, emotion='neutral', category=category(text),
                                session=re.sub(r'_\d+\.wav$', '', PurePosixPath(name).name)))
@@ -196,6 +198,37 @@ def fetch_files(source, names, revision):
         list(workers.map(fetch, names))
 
 
+def file_inventory(source, revision, refresh=False):
+    """Cache the full paginated file tree, without downloading audio payloads.
+
+    CSV rows are not evidence that a WAV was uploaded. Keep the inventory tied
+    to the same immutable revision and fail on API errors, not an empty list.
+    """
+    if not re.fullmatch(r'[0-9a-f]{40}', revision):
+        raise ValueError('Pin Dialogs to a full commit SHA')
+    path = Path(source)/f'file-inventory-{revision}.json'
+    if refresh:
+        from huggingface_hub import HfApi
+        # list_repo_files consumes every page; do not use a preview/file sample.
+        files = HfApi().list_repo_files(REPO, repo_type='dataset', revision=revision)
+        data = dict(schema=1, repo=REPO, revision=revision, files=sorted(files))
+    else:
+        if not path.is_file():
+            raise ValueError('Missing pinned file inventory; run plan-dialogs with --download first')
+        data = json.loads(path.read_text(encoding='utf-8'))
+    files = data.get('files')
+    if (data.get('schema') != 1 or data.get('repo') != REPO or data.get('revision') != revision
+            or not isinstance(files, list) or not all(isinstance(name, str) for name in files)
+            or len(set(files)) != len(files) or not set(METADATA).issubset(files)):
+        raise ValueError('Invalid pinned file inventory; regenerate with plan-dialogs --download')
+    if refresh:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        temporary.replace(path)
+    return set(files), file_digest(path)
+
+
 def plan_dialogs(source, output, revision=REVISION, max_seconds=10., train_minutes=30.,
                  validation_minutes=10/3, seed=1234, download=False):
     source, output = Path(source).resolve(), Path(output).resolve()
@@ -219,22 +252,27 @@ def plan_dialogs(source, output, revision=REVISION, max_seconds=10., train_minut
             seen.add(row['audio_path'])
     if seen != canonical.keys():
         raise ValueError('Official splits do not cover metadata.csv exactly')
-    all_rows, all_rejected = eligible(files['metadata.csv'], max_seconds)
-    pool, rejected = eligible(files['train.csv'], max_seconds)
+    available, inventory_hash = file_inventory(source, revision, refresh=download)
+    all_rows, all_rejected = eligible(files['metadata.csv'], max_seconds, available)
+    pool, rejected = eligible(files['train.csv'], max_seconds, available)
     train, validation, heldout = select_with_holdout(pool, train_minutes*60, validation_minutes*60, seed, max_seconds)
     report = {'repo': REPO, 'revision': revision, 'max_seconds': max_seconds, 'emotion': 'neutral',
               'seed': seed, 'train_minutes_per_speaker': train_minutes,
               'validation_minutes_per_speaker': validation_minutes, 'heldout_sessions': heldout,
               'all_metadata_rejections': all_rejected, 'official_train_rejections': rejected,
+              'file_inventory': {'repo_files': len(available),
+                                 'metadata_missing_audio': len(canonical.keys()-available),
+                                 'sha256': inventory_hash},
               'random_slot': 'All remaining eligible recordings; no repeated recording or text within a speaker/split.',
               'speakers': {s: {'name': SPEAKERS[s],
                              'all_metadata_eligible': summarize([r for r in all_rows if r['speaker_id'] == s]),
                              'official_train_eligible': summarize([r for r in pool if r['speaker_id'] == s]),
                              'train': summarize(train[s]), 'validation': summarize(validation[s])} for s in SPEAKERS},
-              'note': 'Metadata estimates, before waveform audit. Dialogs validation has known actors but '
+              'note': 'Metadata estimates after checking the pinned file tree, before waveform audit. Dialogs validation has known actors but '
                       'disjoint sessions and word sequences; keep separate unseen-speaker YO validation.'}
     plan = {'schema': 1, 'source_dir': str(source), 'report': report,
             'source_hashes': {name: file_digest(source/name) for name in METADATA},
+            'file_inventory_sha256': inventory_hash,
             'train': [r for s in SPEAKERS for r in train[s]],
             'validation': [r for s in SPEAKERS for r in validation[s]]}
     output.mkdir(parents=True, exist_ok=True)
@@ -318,6 +356,17 @@ def prepare_dialogs(plan_path, output, download=False, log=print, replay_manifes
         if any(row.get(k) != v for k, v in by_name.get(row['audio_path'], {}).items()) or row['audio_path'] not in by_name:
             raise ValueError('Plan row differs from official eligible metadata')
         audio_name(row['audio_path'])
+    # Reject stale CSV-only plans before loading YO or downloading any WAVs.
+    # Legacy plans remain usable if every selected file actually exists.
+    if download or plan.get('file_inventory_sha256'):
+        available, inventory_hash = file_inventory(source, plan['report']['revision'], refresh=download)
+        if plan.get('file_inventory_sha256') and inventory_hash != plan['file_inventory_sha256']:
+            raise ValueError('File inventory changed; regenerate the plan')
+        missing = sorted(r['audio_path'] for r in selected if r['audio_path'] not in available)
+        if missing:
+            raise ValueError(f'Plan selects {len(missing)} WAVs absent from the pinned repository; '
+                             f'first: {missing[:3]}. Rerun plan-dialogs --download with a new output '
+                             'directory, then import the new plan. Keep existing downloaded WAVs.')
     support, support_reports = {}, {}
     if replay_manifest:
         for name, path in [('replay', replay_manifest), ('unseen-validation', validation_manifest)]:

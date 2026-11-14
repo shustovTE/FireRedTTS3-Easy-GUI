@@ -32,7 +32,7 @@ def main():
     dialogs.add_argument('--train-minutes', type=float, default=30.)
     dialogs.add_argument('--validation-minutes', type=float, default=10/3)
     dialogs.add_argument('--seed', type=int, default=1234)
-    dialogs.add_argument('--download', action='store_true', help='Download pinned CSV metadata and license only')
+    dialogs.add_argument('--download', action='store_true', help='Fetch pinned CSV metadata, license and full file inventory; no audio')
     dialogs_import = commands.add_parser('prepare-dialogs', help='Download/audit planned WAVs, keeping exact thirds')
     dialogs_import.add_argument('plan')
     dialogs_import.add_argument('--output', default='training/datasets/dialogs-neutral')
