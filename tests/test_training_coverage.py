@@ -1,8 +1,10 @@
 """Coverage, all-patch objectives, and a new stage initialized from an adapter."""
 from dataclasses import replace
+import copy
 import json
 from pathlib import Path
 import random
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -11,9 +13,63 @@ from safetensors.torch import load_file
 
 from fireredtts3_local.training_batch import Example, sample_flow
 from fireredtts3_local.training_data import SpeakerPairs
+from fireredtts3_local.training_objective import adapter_targets, validate_adapter_targets
 from fireredtts3_local.training_run import (TrainingOptions, initial_adapter_info,
     planned_batches, train_lora)
 import test_russian_training as toy
+
+
+class AdapterTargetTests(unittest.TestCase):
+    def test_real_peft_compressed_targets_save_and_reload_28_layers(self):
+        from test_training_batch import tiny_core
+        from peft import LoraConfig, PeftModel, get_peft_model, get_peft_model_state_dict
+        from peft.tuners.lora.layer import LoraLayer
+        for profile in ('backbone', 'backbone_dit'):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                core = tiny_core(layers=28)
+                clean = copy.deepcopy(core)
+                targets = adapter_targets(core, profile)
+                model = get_peft_model(core, LoraConfig(r=2,lora_alpha=4,lora_dropout=.05,target_modules=targets))
+                with torch.no_grad():
+                    for name, parameter in model.named_parameters():
+                        if 'lora_B' in name:
+                            parameter.normal_(std=.01)
+                model.save_pretrained(directory)
+                root = Path(directory)
+                stored = json.loads((root/'adapter_config.json').read_text())['target_modules']
+                # Exercise PEFT's real optimization threshold, without mocking it.
+                self.assertLess(len(stored),len(targets))
+                self.assertNotEqual(set(stored),set(targets))
+                (root/'firered_lora_metadata.json').write_text(json.dumps({
+                    'base_fingerprint':'toy', 'recipe':{'options':{'profile':profile}}}))
+                initial = initial_adapter_info(root,2,4,.05,profile)
+                self.assertEqual(validate_adapter_targets(clean,initial['targets'],targets),set(targets))
+                loaded = PeftModel.from_pretrained(clean,directory,is_trainable=True)
+                actual = {name for name, layer in loaded.get_base_model().named_modules() if isinstance(layer,LoraLayer)}
+                self.assertEqual(actual,set(targets))
+                before, after = get_peft_model_state_dict(model), get_peft_model_state_dict(loaded)
+                self.assertEqual(before.keys(),after.keys())
+                for name in before:
+                    torch.testing.assert_close(before[name],after[name],rtol=0,atol=0)
+                config = json.loads((root/'adapter_config.json').read_text())
+                config['layers_to_transform'] = 0
+                (root/'adapter_config.json').write_text(json.dumps(config))
+                with self.assertRaisesRegex(ValueError,'Unsupported initial_adapter'):
+                    initial_adapter_info(root,2,4,.05,profile)
+
+    def test_target_resolution_rejects_extra_missing_and_unused_targets(self):
+        core = toy.Core()
+        targets = adapter_targets(core,'backbone')
+        self.assertEqual(validate_adapter_targets(core,targets,targets),set(targets))
+        self.assertEqual(validate_adapter_targets(core,['proj'],targets),set(targets))
+        for stored, reason in [(['proj','stop_head'],'extra'), (['proj','linear'],'extra'),
+                               (['proj','backbone_llm'],'extra'), (['stop_head'],'missing'),
+                               (['proj','not_a_module'],'unmatched')]:
+            with self.subTest(stored=stored), self.assertRaisesRegex(ValueError,reason):
+                validate_adapter_targets(core,stored,targets)
+        for invalid in ('all-linear',[],['']):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_adapter_targets(core,invalid,targets)
 
 
 class CoverageTests(unittest.TestCase):
@@ -157,6 +213,23 @@ class WarmStartTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'different base'):
             train_lora(toy.Manager(),self.fixture.manifest,self.root/'wrong-base',rank=2,alpha=4,
                        training_steps=1,options=self.opts,initial_adapter=self.source,log=lambda _:None)
+        self.assertFalse((self.root/'wrong-base').exists())
+
+    def test_compressed_targets_warm_start_and_failed_preflight_does_not_block_retry(self):
+        config_path = self.source/'adapter_config.json'
+        config = json.loads(config_path.read_text())
+        config['target_modules'] = ['proj','stop_head']
+        config_path.write_text(json.dumps(config))
+        output = self.root/'retry'
+        kwargs = dict(rank=2,alpha=4,training_steps=1,gradient_accumulation=1,
+                      options=self.opts,initial_adapter=self.source,log=lambda _:None)
+        with self.assertRaisesRegex(ValueError,'extra=.*stop_head'):
+            train_lora(toy.Manager(),self.fixture.manifest,output,**kwargs)
+        self.assertFalse(output.exists())
+        config['target_modules'] = ['proj']
+        config_path.write_text(json.dumps(config))
+        train_lora(toy.Manager(),self.fixture.manifest,output,**kwargs)
+        self.assertTrue((output/'trainer_state.pt').is_file())
 
     def test_legacy_schema3_default_options_still_resume(self):
         state_path = self.source/'trainer_state.pt'

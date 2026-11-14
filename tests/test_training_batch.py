@@ -24,12 +24,12 @@ from test_russian_training import tts, Manager
 import test_russian_training as toy
 
 
-def tiny_core():
+def tiny_core(layers=2):
     from fireredtts3_local.model_manager import ModelManager
     ModelManager._ensure_upstream_namespace()
     import fireredtts3.llm.fireredtts3_base as upstream
     cfg = dict(upstream.Qwen3_1_7B_ConfigDict)
-    cfg.update(hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+    cfg.update(hidden_size=32, intermediate_size=64, num_hidden_layers=layers,
                num_attention_heads=4, num_key_value_heads=2, head_dim=8,
                vocab_size=64, attn_implementation='sdpa')
     with patch.object(upstream, 'Qwen3_1_7B_ConfigDict', cfg):

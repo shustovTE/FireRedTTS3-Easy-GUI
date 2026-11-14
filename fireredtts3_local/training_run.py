@@ -16,7 +16,7 @@ import torchaudio
 
 from .training_data import (SpeakerPairs, assert_disjoint, dataset_fingerprint,
                             model_identity, file_digest, load_manifest, split_manifest, write_manifest)
-from .training_objective import adapter_targets
+from .training_objective import adapter_targets, validate_adapter_targets
 from .training_features import BatchFeatures, BatchRequest, FeatureCache
 from .training_batch import Example, batch_flow_loss, set_training
 
@@ -265,11 +265,15 @@ def initial_adapter_info(path, rank, alpha, dropout, profile):
                                        "lora_bias", "modules_to_save", "exclude_modules", "layers_to_transform",
                                        "target_parameters", "trainable_token_indices", "fan_in_fan_out")):
         raise ValueError("Unsupported initial_adapter configuration")
+    if config.get("layers_to_transform") is not None:
+        # Layer zero is a real restriction despite being falsey. Suffix resolution
+        # below is valid only when PEFT has no additional layer filter.
+        raise ValueError("Unsupported initial_adapter configuration: layers_to_transform")
     if metadata.get("recipe", {}).get("options", {}).get("profile") != profile or not metadata.get("base_fingerprint"):
         raise ValueError("initial_adapter profile/base provenance is missing or incompatible")
     targets = config.get("target_modules")
-    if not isinstance(targets, list) or not targets or not all(isinstance(t, str) for t in targets):
-        raise ValueError("initial_adapter must use explicit target module names")
+    if not isinstance(targets, list) or not targets or not all(isinstance(t, str) and t for t in targets):
+        raise ValueError("initial_adapter must use a list of target module names/suffixes")
     digest = hashlib.sha256()
     for file in files:
         digest.update(file.name.encode())
@@ -331,12 +335,6 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             saved_recipe["options"] = asdict(TrainingOptions.parse(saved_recipe.get("options")))
         if saved_recipe != recipe:
             raise ValueError("Resume recipe/data differ. Resume with the original recipe; legacy all-linear checkpoints are not resumable here.")
-    out.mkdir(parents=True, exist_ok=True)
-    write_manifest(out / "train.jsonl", train.rows)
-    write_manifest(out / "validation.jsonl", validation.rows)
-    if replay:
-        write_manifest(out / "replay.jsonl", replay.rows)
-    (out / "recipe.json").write_text(json.dumps(recipe, indent=2, ensure_ascii=False), encoding="utf-8")
     log(f"[training] {len(train.groups)} speaker/language groups; {len(validation.rows)} validation clips ({opts.validation_scope}); profile={opts.profile}")
     if opts.sampling_strategy == "coverage":
         log(f"[training] Coverage: each of {len(train.rows)} targets exactly once per epoch; {steps_per_epoch} updates/epoch.")
@@ -361,8 +359,8 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             module.requires_grad_(False)
         core = tts.tts_core
         targets = adapter_targets(core, opts.profile)
-        if initial and set(initial["targets"]) != set(targets):
-            raise ValueError("initial_adapter target modules do not match the requested profile")
+        if initial:
+            validate_adapter_targets(core, initial["targets"], targets)
         if resume:
             core = PeftModel.from_pretrained(core, str(resume), is_trainable=True)
         elif initial:
@@ -377,7 +375,6 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         named = [(n, p) for n, p in core.named_parameters() if p.requires_grad]
         if not named or any("lora_" not in n for n, _ in named):
             raise RuntimeError("Expected only LoRA parameters to be trainable")
-        (out / "trainable_parameters.json").write_text(json.dumps([n for n, _ in named], indent=2))
         acoustic = [p for n, p in named if ".dit." in n or ".dit_head." in n]
         backbone = [p for n, p in named if ".dit." not in n and ".dit_head." not in n]
         groups = [{"params": backbone, "lr": learning_rate}]
@@ -410,6 +407,17 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             torch.set_rng_state(state["torch_rng"])
             torch.cuda.set_rng_state_all(state["cuda_rng"])
             step, best, bad = state["step"], state["best_validation"], state["bad_validations"]
+        # Failed model/adapter/cache preflight must not leave a nonempty run
+        # directory that blocks a corrected first launch.
+        if out.exists() and any(out.iterdir()) and resume is None:
+            raise ValueError("Output directory became nonempty during preflight; choose a new run")
+        out.mkdir(parents=True, exist_ok=True)
+        write_manifest(out / "train.jsonl", train.rows)
+        write_manifest(out / "validation.jsonl", validation.rows)
+        if replay:
+            write_manifest(out / "replay.jsonl", replay.rows)
+        (out / "recipe.json").write_text(json.dumps(recipe, indent=2, ensure_ascii=False), encoding="utf-8")
+        (out / "trainable_parameters.json").write_text(json.dumps([n for n, _ in named], indent=2))
         writer = SummaryWriter(str(out / "tensorboard"))
         metadata = {"experimental": True, "recipe": recipe, "base_model": "FireRedTeam/FireRedTTS3", "base_fingerprint": base_fingerprint,
                     "selection_metric": "held-out flow + stop loss; NOT a guarantee of voice similarity"}

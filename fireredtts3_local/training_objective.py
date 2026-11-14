@@ -33,6 +33,34 @@ def adapter_targets(core, profile: str):
     return names
 
 
+def validate_adapter_targets(core, stored_targets, expected_targets):
+    """Compare selected modules, allowing PEFT's lossless target-name shortening.
+
+    PEFT matches list entries by exact name or a dot-delimited suffix. Resolve
+    against EVERY module so broad suffixes cannot silently include frozen heads,
+    PatchEncoder, embeddings, or non-linear container modules.
+    """
+    if isinstance(stored_targets, str) or not stored_targets or any(
+        not isinstance(target, str) or not target for target in stored_targets
+    ):
+        raise ValueError("initial_adapter requires a nonempty list of target names/suffixes")
+    names = {name for name, _ in core.named_modules() if name}
+    selected, unmatched = set(), []
+    for target in stored_targets:
+        matches = {name for name in names if name == target or name.endswith("." + target)}
+        if not matches:
+            unmatched.append(target)
+        selected.update(matches)
+    expected = set(expected_targets)
+    missing, extra = sorted(expected - selected), sorted(selected - expected)
+    if unmatched or missing or extra:
+        raise ValueError(
+            "initial_adapter target modules do not match the requested profile: "
+            f"missing={missing[:5]}, extra={extra[:5]}, unmatched={sorted(unmatched)[:5]}"
+        )
+    return selected
+
+
 def conditioning(core, text_tokens, prompt_latents, target_latents, speaker):
     """Return the N next-patch states AND the state after the final patch."""
     prompt_emb = core.patch_encoder(prompt_latents)
