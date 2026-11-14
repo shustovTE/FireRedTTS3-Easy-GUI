@@ -46,7 +46,8 @@ def sample_flow(example, patch_size, patches_per_example, cfg_dropout, generator
     if not count or example.target.shape[1] % patch_size or example.prompt.shape[1] % patch_size or example.prompt.shape[1] < patch_size:
         raise ValueError("Prompt/target must contain complete nonempty patches")
     device = example.target.device
-    indices = torch.randperm(count, device=device, generator=generator)[:min(count, patches_per_example)]
+    selected = count if patches_per_example == "all" else min(count, patches_per_example)
+    indices = torch.randperm(count, device=device, generator=generator)[:selected]
     shape = (len(indices), patch_size, example.target.shape[-1])
     return FlowSample(indices,
                       torch.randn(shape, dtype=example.target.dtype, device=device, generator=generator),

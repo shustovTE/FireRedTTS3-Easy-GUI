@@ -220,13 +220,18 @@ class SpeakerPairs:
 
     def sample(self, rng: random.Random):
         identity = rng.choice(self.balance_ids)
-        targets, refs = self.groups[rng.choice(self.balance_groups[identity])]
+        targets, _ = self.groups[rng.choice(self.balance_groups[identity])]
         target = rng.choice(targets)
+        return self.reference_for(target, rng), target
+
+    def reference_for(self, target, rng: random.Random):
+        """Choose a distinct reference for an explicitly scheduled target."""
+        _, refs = self.groups[(target["speaker_id"], target["language"])]
         for _ in range(16):
             prompt = rng.choice(refs)
             if self.distinct(prompt, target):
-                return prompt, target
-        return rng.choice([p for p in refs if self.distinct(p, target)]), target
+                return prompt
+        return rng.choice([p for p in refs if self.distinct(p, target)])
 
 
 def dataset_fingerprint(rows: list[dict]) -> str:

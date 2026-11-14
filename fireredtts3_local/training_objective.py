@@ -75,7 +75,8 @@ def flow_loss(tts, prompt_latents, speaker, target_latents, prompt_text, target_
     count = len(targets)
     if count < 1 or prompt_latents.shape[1] < patch:
         raise ValueError("Prompt and target must contain at least one complete patch")
-    indices = torch.randperm(count, device=device)[:min(count, patches_per_example)]
+    selected = count if patches_per_example == "all" else min(count, patches_per_example)
+    indices = torch.randperm(count, device=device)[:selected]
     current = targets[indices]
     noise = torch.randn_like(current)
     times = torch.rand(len(indices), device=device, dtype=current.dtype)

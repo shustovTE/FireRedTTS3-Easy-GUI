@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import asdict, dataclass
 from functools import wraps
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -14,7 +15,7 @@ import torch
 import torchaudio
 
 from .training_data import (SpeakerPairs, assert_disjoint, dataset_fingerprint,
-                            model_identity, load_manifest, split_manifest, write_manifest)
+                            model_identity, file_digest, load_manifest, split_manifest, write_manifest)
 from .training_objective import adapter_targets
 from .training_features import BatchFeatures, BatchRequest, FeatureCache
 from .training_batch import Example, batch_flow_loss, set_training
@@ -27,14 +28,15 @@ class TrainingOptions:
     validation_scope: str = "speaker"
     validation_fraction: float = 0.1
     validation_pairs: int = 32
-    validate_every: int = 100
+    validate_every: int | str = 100
     patience: int = 10
     replay_manifest: str = ""
     replay_ratio: float = 0.2
     preservation_weight: float = 0.1
     max_prompt_seconds: float = 12.0
     max_target_seconds: float = 20.0
-    patches_per_example: int = 8
+    patches_per_example: int | str = 8
+    validation_patches_per_example: int | str | None = None
     cfg_dropout: float = 0.1
     stop_weight: float = 0.05
     dit_lr_scale: float = 0.25
@@ -48,6 +50,7 @@ class TrainingOptions:
     loader_workers: int = 2
     prefetch_batches: int = 2
     bucket_by_length: bool = True
+    sampling_strategy: str = "speaker_balanced"
 
     def validate(self):
         for name, value in asdict(self).items():
@@ -59,7 +62,19 @@ class TrainingOptions:
             raise ValueError("validation_scope must be speaker or recording")
         if self.attention_backend not in {"sdpa", "flash_attention_2"}:
             raise ValueError("Unsupported attention backend")
-        for name in ("validation_pairs", "validate_every", "patches_per_example", "batch_size", "validation_batch_size", "prefetch_batches"):
+        if self.sampling_strategy not in {"speaker_balanced", "coverage"}:
+            raise ValueError("sampling_strategy must be speaker_balanced or coverage")
+        if self.sampling_strategy == "coverage" and self.replay_manifest:
+            raise ValueError("coverage requires an empty replay_manifest; use speaker_balanced for replay")
+        for name in ("patches_per_example", "validation_patches_per_example"):
+            value = getattr(self, name)
+            if name == "validation_patches_per_example" and value is None:
+                continue
+            if value != "all" and (type(value) is not int or value < 1):
+                raise ValueError(f'{name} must be a positive integer or "all"')
+        if self.validate_every != "epoch" and (type(self.validate_every) is not int or self.validate_every < 1):
+            raise ValueError('validate_every must be a positive integer or "epoch"')
+        for name in ("validation_pairs", "batch_size", "validation_batch_size", "prefetch_batches"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
         for name in ("loader_workers", "patience"):
@@ -151,7 +166,14 @@ def to_examples(tts, loaded):
             for token, (pa, ta, _, _, keep) in zip(tokens, loaded)]
 
 
-def planned_batches(train, replay, options, sampler_state, start, total, accumulation, length_mode):
+def coverage_order(count, seed, epoch):
+    """Epoch order is reconstructible from step alone, including mid-epoch resume."""
+    order = list(range(count))
+    random.Random(f"coverage-v1:{seed}:{epoch}").shuffle(order)
+    return order
+
+
+def planned_batches(train, replay, options, sampler_state, start, total, accumulation, length_mode, seed=1234):
     """Prefetch can run ahead; only the last consumed batch commits sampler RNG.
 
     Bucketing only reorders the same sampled optimizer update. It never rejects
@@ -161,15 +183,29 @@ def planned_batches(train, replay, options, sampler_state, start, total, accumul
     rng.setstate(sampler_state)
     effective = options.batch_size * accumulation
     steps_per_epoch = math.ceil(len(train.rows) / effective)
+    coverage = options.sampling_strategy == "coverage"
+    if coverage and (length_mode != "Epochs" or replay is not None):
+        raise ValueError("coverage requires Epochs mode and no replay")
+    previous_epoch, order = None, None
     for step in range(start, total):
         count = (min(effective, len(train.rows)-(step % steps_per_epoch)*effective)
                  if length_mode == "Epochs" else effective)
         pairs = []
-        for _ in range(count):
-            is_replay = replay is not None and rng.random() < options.replay_ratio
-            prompt, target = (replay if is_replay else train).sample(rng)
-            keep = options.preservation_weight if is_replay or replay is None else 0.0
-            pairs.append((prompt, target, keep))
+        if coverage:
+            epoch = step // steps_per_epoch
+            if epoch != previous_epoch:
+                order = coverage_order(len(train.rows), seed, epoch)
+                previous_epoch = epoch
+            offset = (step % steps_per_epoch)*effective
+            for index in order[offset:offset+count]:
+                target = train.rows[index]
+                pairs.append((train.reference_for(target, rng), target, options.preservation_weight))
+        else:
+            for _ in range(count):
+                is_replay = replay is not None and rng.random() < options.replay_ratio
+                prompt, target = (replay if is_replay else train).sample(rng)
+                keep = options.preservation_weight if is_replay or replay is None else 0.0
+                pairs.append((prompt, target, keep))
         state = rng.getstate()
         if options.bucket_by_length:
             # Approximate token+patch lengths; grouping need not load GPU features.
@@ -194,7 +230,8 @@ def validate_model(tts, cache, pairs, options, seed):
                         for i in range(0, len(sampled), options.validation_batch_size))
             for _, loaded in loader.iterate(requests):
                 examples = to_examples(tts, loaded)
-                _, metrics = batch_flow_loss(tts, examples, options.patches_per_example,
+                validation_patches = options.validation_patches_per_example or options.patches_per_example
+                _, metrics = batch_flow_loss(tts, examples, validation_patches,
                                              0.0, options.stop_weight, generator=generator)
                 for key, value in metrics.items():
                     values[key] = values.get(key, 0.0) + float(value)*len(examples)
@@ -213,6 +250,34 @@ def exclusive_model(function):
     return run
 
 
+def initial_adapter_info(path, rank, alpha, dropout, profile):
+    """Bind a new stage to an existing adapter, not its optimizer/schedule."""
+    path = Path(path).resolve()
+    files = [path/name for name in ("adapter_config.json", "adapter_model.safetensors", "firered_lora_metadata.json")]
+    if not all(p.is_file() for p in files):
+        raise ValueError("initial_adapter needs a complete adapter with firered_lora_metadata.json")
+    config = json.loads(files[0].read_text(encoding="utf-8"))
+    metadata = json.loads(files[2].read_text(encoding="utf-8"))
+    expected = {"peft_type": "LORA", "r": rank, "lora_alpha": alpha, "lora_dropout": dropout, "bias": "none"}
+    if any(config.get(key) != value for key, value in expected.items()):
+        raise ValueError("initial_adapter rank/alpha/dropout/type differ from the new stage")
+    if any(config.get(key) for key in ("rank_pattern", "alpha_pattern", "use_dora", "use_rslora",
+                                       "lora_bias", "modules_to_save", "exclude_modules", "layers_to_transform",
+                                       "target_parameters", "trainable_token_indices", "fan_in_fan_out")):
+        raise ValueError("Unsupported initial_adapter configuration")
+    if metadata.get("recipe", {}).get("options", {}).get("profile") != profile or not metadata.get("base_fingerprint"):
+        raise ValueError("initial_adapter profile/base provenance is missing or incompatible")
+    targets = config.get("target_modules")
+    if not isinstance(targets, list) or not targets or not all(isinstance(t, str) for t in targets):
+        raise ValueError("initial_adapter must use explicit target module names")
+    digest = hashlib.sha256()
+    for file in files:
+        digest.update(file.name.encode())
+        digest.update(file_digest(file).encode())
+    return {"path": str(path), "fingerprint": digest.hexdigest(),
+            "base_fingerprint": metadata["base_fingerprint"], "targets": targets}
+
+
 @exclusive_model
 def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.05,
                learning_rate=1e-5, length_mode="Steps", training_steps=1000,
@@ -220,7 +285,7 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
                progress_cb=None, save_every=100, resume_checkpoint=None,
                enable_eval_audio=False, eval_text="Проверяем произношение и естественность русской речи.",
                eval_reference_audio=None, eval_reference_transcript="", eval_language="Russian",
-               options=None):
+               options=None, initial_adapter=None):
     from peft import LoraConfig, PeftModel, get_peft_model
     from torch.utils.tensorboard import SummaryWriter
     from .training import STOP_EVENT
@@ -233,6 +298,10 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         raise ValueError("Invalid dropout/learning rate")
     if length_mode not in {"Steps", "Epochs"}:
         raise ValueError("length_mode must be Steps or Epochs")
+    if opts.sampling_strategy == "coverage" and length_mode != "Epochs":
+        raise ValueError("coverage requires length_mode=Epochs")
+    if opts.validate_every == "epoch" and length_mode != "Epochs":
+        raise ValueError('validate_every="epoch" requires length_mode=Epochs')
     train, validation, replay = prepare_run_data(manifest_path, opts, seed)
     require_training_hardware()
     out = Path(output_dir)
@@ -250,10 +319,17 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         "validation_fingerprint": dataset_fingerprint(validation.rows),
         "replay_fingerprint": dataset_fingerprint(replay.rows) if replay else None,
     }
+    initial = initial_adapter_info(initial_adapter, rank, alpha, dropout, opts.profile) if initial_adapter else None
+    if initial:
+        recipe["initial_adapter_fingerprint"] = initial["fingerprint"]
     state = None
     if resume:
         state = torch.load(resume / "trainer_state.pt", map_location="cpu", weights_only=True)
-        if state.get("recipe") != recipe:
+        saved_recipe = dict(state.get("recipe", {}))
+        if saved_recipe.get("schema") == 3:
+            # New defaults retain the original sampler and validation behavior.
+            saved_recipe["options"] = asdict(TrainingOptions.parse(saved_recipe.get("options")))
+        if saved_recipe != recipe:
             raise ValueError("Resume recipe/data differ. Resume with the original recipe; legacy all-linear checkpoints are not resumable here.")
     out.mkdir(parents=True, exist_ok=True)
     write_manifest(out / "train.jsonl", train.rows)
@@ -262,7 +338,10 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         write_manifest(out / "replay.jsonl", replay.rows)
     (out / "recipe.json").write_text(json.dumps(recipe, indent=2, ensure_ascii=False), encoding="utf-8")
     log(f"[training] {len(train.groups)} speaker/language groups; {len(validation.rows)} validation clips ({opts.validation_scope}); profile={opts.profile}")
-    log("[training] Epoch means a speaker-balanced sampling budget, not an exhaustive pass over clips.")
+    if opts.sampling_strategy == "coverage":
+        log(f"[training] Coverage: each of {len(train.rows)} targets exactly once per epoch; {steps_per_epoch} updates/epoch.")
+    else:
+        log("[training] Epoch means a speaker-balanced sampling budget, not an exhaustive pass over clips.")
     STOP_EVENT.clear()
     random.seed(seed)
     torch.manual_seed(seed)
@@ -275,13 +354,20 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         base_fingerprint = model_identity(MODEL_DIR)
         if state and state.get("base_fingerprint") != base_fingerprint:
             raise ValueError("The base weights/tokenizer have changed since this checkpoint")
+        if initial and initial["base_fingerprint"] != base_fingerprint:
+            raise ValueError("initial_adapter was trained against different base weights/tokenizer")
         for module in (tts.redae, tts.spk_extractor):
             module.eval()
             module.requires_grad_(False)
         core = tts.tts_core
         targets = adapter_targets(core, opts.profile)
+        if initial and set(initial["targets"]) != set(targets):
+            raise ValueError("initial_adapter target modules do not match the requested profile")
         if resume:
             core = PeftModel.from_pretrained(core, str(resume), is_trainable=True)
+        elif initial:
+            core = PeftModel.from_pretrained(core, initial["path"], is_trainable=True)
+            log(f"[training] New stage from {initial['path']}; optimizer, scheduler and stage step start fresh.")
         else:
             core = get_peft_model(core, LoraConfig(r=rank, lora_alpha=alpha, lora_dropout=dropout,
                                                  target_modules=targets, bias="none"))
@@ -327,6 +413,8 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         writer = SummaryWriter(str(out / "tensorboard"))
         metadata = {"experimental": True, "recipe": recipe, "base_model": "FireRedTeam/FireRedTTS3", "base_fingerprint": base_fingerprint,
                     "selection_metric": "held-out flow + stop loss; NOT a guarantee of voice similarity"}
+        if initial:
+            metadata["initial_adapter"] = {key: initial[key] for key in ("path", "fingerprint")}
 
         def save(path):
             path.mkdir(parents=True, exist_ok=True)
@@ -386,7 +474,7 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             evaluate()
             preview()
         batches = loader.iterate(planned_batches(train, replay, opts, rng.getstate(), step, total,
-                                                gradient_accumulation, length_mode))
+                                                gradient_accumulation, length_mode, seed))
         while step < total and not STOP_EVENT.is_set():
             if torch.device(tts.device).type == "cuda":
                 torch.cuda.synchronize(tts.device)
@@ -437,11 +525,18 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], step)
             message = f"[training] step={step}/{total} loss={metrics_sum['loss']/used:.6f} {elapsed:.2f}s/step {used/elapsed:.2f} examples/s"
             log(message)
+            if opts.sampling_strategy == "coverage" and step % steps_per_epoch == 0:
+                coverage = {"epoch": step//steps_per_epoch, "step": step, "targets": len(train.rows),
+                            "target_hours": sum(row['duration'] for row in train.rows)/3600}
+                with (out / "coverage.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(coverage)+"\n")
+                log(f"[coverage] epoch={coverage['epoch']}/{training_epochs} targets={coverage['targets']} target_hours={coverage['target_hours']:.2f}")
             if progress_cb:
                 progress_cb(step, total, message)
             due_save = (step % save_every == 0 if length_mode == "Steps"
                         else step % (save_every * steps_per_epoch) == 0)
-            if step % opts.validate_every == 0 or step == total or due_save:
+            validation_interval = steps_per_epoch if opts.validate_every == "epoch" else opts.validate_every
+            if step % validation_interval == 0 or step == total or due_save:
                 evaluate()
                 if due_save or step == total:
                     save(out / f"checkpoint-step-{step:06d}")

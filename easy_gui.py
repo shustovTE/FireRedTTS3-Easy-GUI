@@ -1652,7 +1652,7 @@ Choose one **Training Length Mode**:
 
 Only the controls for the selected mode are shown. Audio is never silently cropped. Long clips must be aligned and segmented before training.
 Validation is mandatory; best-validation is selected by loss and still requires listening on unseen voices.
-Epochs are speaker-balanced sampling budgets, not exhaustive passes over every clip.
+Epochs follow sampling_strategy: speaker_balanced samples pairs; coverage visits every target once.
 """)
 
             with gr.Row(elem_classes="project-strip"):

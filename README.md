@@ -387,6 +387,8 @@ Training outputs are stored under:
 training/outputs/
 ```
 
+For a subsequent stage from the pilot adapter, [the coverage recipe](recipes/russian_coverage_96gb.json) visits every training clip once per epoch and uses all target flow patches. It keeps the held-out split and cached features. See the guide for `initial_adapter`, the fresh optimizer/schedule, and a short memory/timing run before continuing.
+
 ### Training Length Mode
 
 Training uses one explicit unit at a time.
@@ -417,7 +419,7 @@ Choose:
 - **Training Epochs**
 - **Save Every N Epochs**
 
-If `Training Epochs = 20`, the budget is 20 speaker-balanced sampling epochs. Each epoch samples as many pairs as there are training clips; it is not an exhaustive pass.
+If `Training Epochs = 20`, the budget is up to 20 epochs. The default `speaker_balanced` strategy samples as many pairs as there are training clips. With `sampling_strategy="coverage"`, each training clip is a target exactly once per epoch. Early stopping may finish the run sooner.
 
 If `Save Every N Epochs = 2`, checkpoints and evaluation audio are generated after epochs:
 
