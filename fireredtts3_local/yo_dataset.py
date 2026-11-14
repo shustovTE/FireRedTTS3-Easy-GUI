@@ -1,7 +1,7 @@
 """Bounded-memory YO-CPT-ru import from local Parquet shards or JSONL.
 
-Only alignment-consistent transcripts are accepted. Segments end at punctuation
-or measured pauses; overlong uninterrupted speech is rejected, never truncated.
+Only alignment-consistent transcripts are accepted. The legacy segmented mode
+uses punctuation/pauses; complete-utterance mode keeps whole punctuated records.
 """
 from __future__ import annotations
 
@@ -46,7 +46,23 @@ def parse_alignment(value):
     return result
 
 
-def aligned_segments(row, max_seconds=10.0, min_seconds=1.5, pause_seconds=0.18):
+def has_sentence_ending(text):
+    """Punctuation gate, not a claim of semantic completeness or ASR accuracy.
+
+    Permit closing quotes/brackets and ?!/!!; reject ellipses, including spaced
+    dots and combinations such as !.. or …?. Do not add missing punctuation.
+    """
+    tail = re.search(r'([.!?…⋯\s»”’"\'\)\]\}]+)$', text.strip())
+    if not tail:
+        return False
+    marks = re.sub(r'[\s»”’"\'\)\]\}]', '', tail[1])
+    return bool(marks) and all(c in '.!?' for c in marks) and marks.count('.') <= 1
+
+
+def aligned_segments(row, max_seconds=10.0, min_seconds=1.5, pause_seconds=0.18,
+                     segmentation="bounded"):
+    if segmentation not in {"bounded", "complete-utterance"}:
+        raise ValueError("Unknown segmentation mode")
     alignment = parse_alignment(row["text_alignment"])
     expected = [words(w["word"])[0] for w in alignment]
     if words(row["text"]) != expected:
@@ -56,6 +72,17 @@ def aligned_segments(row, max_seconds=10.0, min_seconds=1.5, pause_seconds=0.18)
     text = plain_text(row.get("text_denorm") or row["text"])
     if words(text) != expected:
         raise ValueError("denormalized_transcript_mismatch")
+    if segmentation == "complete-utterance":
+        if not has_sentence_ending(text):
+            raise ValueError("incomplete_sentence_ending")
+        duration = float(row["duration"])
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("invalid_duration")
+        if alignment[-1]["end"] > duration + 0.025:
+            raise ValueError("alignment_outside_audio")
+        # Preserve the whole source waveform, pauses and text. No duration cap,
+        # no concatenation of separate utterances, and no invented sentence end.
+        return [(0.0, duration, text)]
     spans = list(re.finditer(r"\w+", text))
     boundaries = []
     for i, current in enumerate(alignment):
@@ -109,11 +136,16 @@ def iter_records(paths):
 
 
 def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
-              max_speaker_minutes=30.0, source_revision="", log=print):
+              max_speaker_minutes=30.0, source_revision="", log=print,
+              segmentation="bounded"):
     if not source_revision.strip():
         raise ValueError("Record the YO-CPT-ru source revision for reproducibility")
-    if min(max_seconds, max_hours, max_speaker_minutes) <= 0 or not math.isfinite(min_mos):
+    if segmentation not in {"bounded", "complete-utterance"}:
+        raise ValueError("Unknown segmentation mode")
+    if (not all(math.isfinite(x) for x in (min_mos, max_seconds, max_hours, max_speaker_minutes))
+            or max_seconds <= 0 or max_hours < 0 or max_speaker_minutes <= 0):
         raise ValueError("Invalid import limits")
+    hours_budget = max_hours * 3600 if max_hours else math.inf
     root = Path(output).resolve()
     if root.exists() and any(root.iterdir()):
         raise ValueError("Import output must be a new/empty directory")
@@ -122,7 +154,7 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
     seen = set()
     total = 0.0
     for row, base in iter_records(paths):
-        if total >= max_hours * 3600:
+        if total >= hours_budget:
             break
         try:
             utt = str(row["utt_id"])
@@ -135,11 +167,12 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
             if not speaker:
                 raise ValueError("missing_speaker")
             duration = float(row["duration"])
-            if not 0 < duration <= 120 or not math.isfinite(duration):
+            if (not math.isfinite(duration) or duration <= 0
+                    or (segmentation == "bounded" and duration > 120)):
                 raise ValueError("invalid_duration")
             if seconds[speaker] + duration > max_speaker_minutes * 60:
                 raise ValueError("speaker_budget")
-            segments = aligned_segments(row, max_seconds)
+            segments = aligned_segments(row, max_seconds, segmentation=segmentation)
             audio = row["audio"]
             if isinstance(audio, dict) and audio.get("bytes") is not None:
                 audio = io.BytesIO(audio["bytes"])
@@ -155,12 +188,17 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
                 raise ValueError("clipping")
             if max(s[1] for s in segments) > len(signal)/sr + 0.025:
                 raise ValueError("alignment_outside_audio")
+            if segmentation == "complete-utterance":
+                # Record actual sample duration, including a small allowed
+                # metadata discrepancy. Never silently drop trailing samples.
+                segments = [(0.0, len(signal)/sr, segments[0][2])]
         except (ValueError, KeyError, TypeError, RuntimeError) as exc:
             rejected[str(exc) if isinstance(exc, ValueError) else type(exc).__name__] += 1
             continue
         source = "YO-CPT-ru:" + speaker.split("__spk")[0]
         for index, (start, end, text) in enumerate(segments):
-            if total + end - start > max_hours * 3600:
+            if total + end - start > hours_budget:
+                rejected["hours_budget"] += 1
                 break
             clip = torch.from_numpy(signal[round(start*sr):round(end*sr), 0].copy())[None]
             if sr != 24000:
@@ -195,7 +233,12 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
     write_manifest(root / "manifest.jsonl", manifest)
     report = {"accepted_segments": len(manifest), "hours": total/3600, "local_speakers": len({r["speaker_id"] for r in manifest}),
               "rejections": dict(rejected), "source_revision": source_revision,
-              "min_distillmos": min_mos, "max_segment_seconds": max_seconds,
+              "min_distillmos": min_mos,
+              "segmentation": segmentation,
+              "max_segment_seconds": max_seconds if segmentation == "bounded" else None,
+              "max_hours": max_hours or None, "max_speaker_minutes": max_speaker_minutes,
+              "duration_seconds": {"min": min((r['end']-r['start'] for r in manifest), default=0),
+                                   "max": max((r['end']-r['start'] for r in manifest), default=0)},
               "note": "Automatic filtering; inspect audio, text and speaker identities before training. Input order affects capped subsets."}
     (root / "import_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     log(json.dumps(report, ensure_ascii=False))

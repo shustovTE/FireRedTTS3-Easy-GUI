@@ -137,7 +137,20 @@ def flow_inputs(core, examples, samples):
     return tuple(torch.cat(values) for values in (currents, histories, noises, times, masks))
 
 
-def predict(core, conditions, speaker, tensors):
+def predict(core, conditions, speaker, tensors, chunk_size=0):
+    if chunk_size:
+        # Keep ALL patches, but bound DiT activations. Checkpoint each student
+        # chunk so their saved activations do not accumulate until backward.
+        from torch.utils.checkpoint import checkpoint
+        def chunk(cond, spk, *flow_tensors):
+            return predict(core, cond, spk, flow_tensors)
+        results = []
+        for first in range(0, len(conditions), chunk_size):
+            stop = first + chunk_size
+            args = (conditions[first:stop], speaker[first:stop], *(t[first:stop] for t in tensors))
+            results.append(checkpoint(chunk, *args, use_reentrant=False) if torch.is_grad_enabled()
+                           else chunk(*args))
+        return torch.cat(results)
     current, history, noise, times, drop = tensors
     noisy = (1-times[:, None, None])*noise + times[:, None, None]*current
     h = conditions.repeat_interleave(core.patch_size, dim=1)
@@ -154,7 +167,7 @@ def example_mean(values, owners, count):
 
 
 def batch_flow_loss(tts, examples, patches_per_example=8, cfg_dropout=.1,
-                    stop_weight=.05, samples=None, generator=None):
+                    stop_weight=.05, samples=None, generator=None, dit_chunk_size=0):
     if not examples:
         raise ValueError("Empty training batch")
     core = tts.tts_core
@@ -184,13 +197,13 @@ def batch_flow_loss(tts, examples, patches_per_example=8, cfg_dropout=.1,
                 subset_samples = [samples[i] for i in retained]
                 subset_embeds = [{k: v.detach() for k, v in embeddings[i].items()} for i in retained]
                 cond, spk, stop, _, stop_owner, patch_owner = batch_conditioning(core, subset, subset_samples, subset_embeds)
-                pred = predict(core, cond, spk, flow_inputs(core, subset, subset_samples))
+                pred = predict(core, cond, spk, flow_inputs(core, subset, subset_samples), dit_chunk_size)
                 teacher = pred, stop, stop_owner, patch_owner
         finally:
             set_training(core, was_training)
     with autocast(device):
         cond, spk, stop, targets, stop_owner, patch_owner = batch_conditioning(core, examples, samples, embeddings)
-        pred = predict(core, cond, spk, tensors)
+        pred = predict(core, cond, spk, tensors, dit_chunk_size)
     count = len(examples)
     flow = example_mean((pred-(tensors[0]-tensors[2]).float()).square().mean((1, 2)), patch_owner, count)
     stop_loss = example_mean(F.binary_cross_entropy_with_logits(stop, targets, reduction="none"), stop_owner, count)

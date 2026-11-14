@@ -6,7 +6,8 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 
-from .training_data import SpeakerPairs, load_manifest, split_manifest, write_manifest
+from .training_data import (SpeakerPairs, dataset_fingerprint, load_manifest,
+                            split_manifest, split_with_anchors, write_manifest)
 from .training_run import TrainingOptions, prepare_run_data, train_lora
 
 
@@ -19,7 +20,9 @@ def main():
     prepare.add_argument("--source-revision", required=True)
     prepare.add_argument("--min-mos", type=float, default=4.0)
     prepare.add_argument("--max-seconds", type=float, default=10.0)
-    prepare.add_argument("--max-hours", type=float, default=50.0)
+    prepare.add_argument("--segmentation", choices=["bounded", "complete-utterance"], default="bounded",
+                         help="complete-utterance: whole records ending in . ! ?, no ellipsis or duration cap")
+    prepare.add_argument("--max-hours", type=float, default=50.0, help="Total accepted hours; 0 processes all supplied shards")
     prepare.add_argument("--max-speaker-minutes", type=float, default=30.0)
     split = commands.add_parser("split", help="Create disjoint train and validation manifests")
     split.add_argument("manifest")
@@ -27,6 +30,9 @@ def main():
     split.add_argument("--fraction", type=float, default=.1)
     split.add_argument("--scope", choices=["speaker", "recording"], default="speaker")
     split.add_argument("--seed", type=int, default=1234)
+    split.add_argument("--unlimited-duration", action="store_true", help="Allow whole targets and references of any duration")
+    split.add_argument("--anchor-train", help="Previous train manifest: preserve known identities in train")
+    split.add_argument("--anchor-validation", help="Previous validation manifest: preserve its held-out identities")
     audit = commands.add_parser("audit", help="Validate data and pairing without GPU/model downloads")
     audit.add_argument("manifest")
     audit.add_argument("--options")
@@ -59,16 +65,33 @@ def main():
     if args.command == "prepare-yo":
         from .yo_dataset import import_yo
         import_yo(args.inputs, args.output, args.min_mos, args.max_seconds,
-                  args.max_hours, args.max_speaker_minutes, args.source_revision)
+                  args.max_hours, args.max_speaker_minutes, args.source_revision,
+                  segmentation=args.segmentation)
     elif args.command == "split":
         root = Path(args.output)
         if root.exists() and any(root.iterdir()):
             parser.error("split output must be empty")
-        train_rows, validation = split_manifest(load_manifest(args.manifest), args.fraction, args.seed, args.scope)
-        SpeakerPairs(train_rows); SpeakerPairs(validation)
+        rows = load_manifest(args.manifest)
+        anchors = {}
+        if bool(args.anchor_train) != bool(args.anchor_validation):
+            parser.error("Supply both --anchor-train and --anchor-validation")
+        if args.anchor_train:
+            old_train, old_val = load_manifest(args.anchor_train), load_manifest(args.anchor_validation)
+            train_rows, validation = split_with_anchors(rows, old_train, old_val, args.fraction, args.seed, args.scope)
+            anchors = {"train_fingerprint": dataset_fingerprint(old_train),
+                       "validation_fingerprint": dataset_fingerprint(old_val)}
+        else:
+            train_rows, validation = split_manifest(rows, args.fraction, args.seed, args.scope)
+        limits = (None, None) if args.unlimited_duration else (12.0, 20.0)
+        SpeakerPairs(train_rows, *limits); SpeakerPairs(validation, *limits)
         write_manifest(root / "train.jsonl", train_rows)
         write_manifest(root / "validation.jsonl", validation)
-        print(json.dumps({"train_clips": len(train_rows), "validation_clips": len(validation), "scope": args.scope}))
+        report = {"train_clips": len(train_rows), "validation_clips": len(validation), "scope": args.scope,
+                  "train_hours": sum(r['duration'] for r in train_rows)/3600,
+                  "validation_hours": sum(r['duration'] for r in validation)/3600,
+                  "longest_clip_seconds": max(r['duration'] for r in rows), "anchors": anchors}
+        (root / "split_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(json.dumps(report))
     elif args.command == "audit":
         options = TrainingOptions.parse(Path(args.options).read_text() if args.options else None)
         train_pairs, val_pairs, replay_pairs = prepare_run_data(args.manifest, options, args.seed)
@@ -79,12 +102,13 @@ def main():
     elif args.command == "options":
         print(json.dumps(asdict(TrainingOptions()), indent=2))
     elif args.command == "train":
+        import signal
         from .model_manager import ModelManager
+        from .training import STOP_EVENT
         config = json.loads(Path(args.recipe).read_text(encoding="utf-8"))
         if args.stop_after is not None:
             if args.stop_after < 1:
                 parser.error("--stop-after must be positive")
-            from .training import STOP_EVENT
             completed = 0
             def stop_after(*_):
                 nonlocal completed
@@ -92,7 +116,15 @@ def main():
                 if completed >= args.stop_after:
                     STOP_EVENT.set()
             config['progress_cb'] = stop_after
-        train_lora(ModelManager(), **config)
+        def stop_signal(signum, _frame):
+            print(f"[training] Signal {signum}: finish the current update and save a resumable checkpoint.", flush=True)
+            STOP_EVENT.set()
+        previous = {sig: signal.signal(sig, stop_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            train_lora(ModelManager(), **config)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
     elif args.command == "precompute":
         from .paths import MODEL_DIR
         from .training_features import precompute_recipe

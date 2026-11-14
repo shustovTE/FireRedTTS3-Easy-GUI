@@ -389,6 +389,8 @@ training/outputs/
 
 For a subsequent stage from the pilot adapter, [the coverage recipe](recipes/russian_coverage_96gb.json) visits every training clip once per epoch and uses all target flow patches. It keeps the held-out split and cached features. See the guide for `initial_adapter`, the fresh optimizer/schedule, and a short memory/timing run before continuing.
 
+For whole punctuated utterances of unrestricted duration, use the separate [complete-utterance recipe](recipes/russian_complete_96gb.json). The [training guide](docs/RUSSIAN_TRAINING.md) covers punctuation filtering, preserving previous speaker splits, memory-aware batches, and `python -m fireredtts3_local.training_job` for detached Linux jobs with logs, status and graceful stopping.
+
 ### Training Length Mode
 
 Training uses one explicit unit at a time.

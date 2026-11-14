@@ -83,6 +83,25 @@ class BatchMathTests(unittest.TestCase):
                          for text, prompt, target, keep in [(2,1,1,.1), (7,3,4,0.), (1,2,2,.7)]]
         self.samples = [sample_flow(e, 2, 3, .35) for e in self.examples]
 
+    def test_all_patch_chunking_matches_loss_and_backbone_dit_gradients(self):
+        samples = [sample_flow(e, 2, 'all', .35) for e in self.examples]
+        expected, metrics = batch_flow_loss(self.tts, self.examples, samples=samples)
+        expected.backward()
+        gradients = {n: p.grad.clone() for n,p in self.core.named_parameters() if p.grad is not None}
+        self.core.zero_grad(set_to_none=True)
+        shapes = []
+        hook = self.core.dit.register_forward_pre_hook(lambda _m, args: shapes.append(len(args[0])))
+        actual, chunked_metrics = batch_flow_loss(self.tts, self.examples, samples=samples, dit_chunk_size=2)
+        actual.backward()
+        hook.remove()
+        self.assertTrue(shapes and max(shapes) <= 2)
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+        for key in metrics:
+            torch.testing.assert_close(chunked_metrics[key], metrics[key], atol=2e-6, rtol=2e-5)
+        for name, parameter in self.core.named_parameters():
+            if name in gradients:
+                torch.testing.assert_close(parameter.grad, gradients[name], atol=3e-6, rtol=3e-4, msg=name)
+
     def test_batch_matches_original_scalar_losses_and_gradients(self):
         expected = sum(scalar_reference(self.core, e, s) for e, s in zip(self.examples, self.samples))/3
         expected.backward()

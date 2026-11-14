@@ -153,9 +153,16 @@ class WarmStartTests(unittest.TestCase):
                    training_steps=2,gradient_accumulation=1,save_every=1,options=self.opts,log=lambda _:None)
 
     def test_initial_weights_validation_and_resumed_coverage_match(self):
+        self.check_warm_start_resume(dynamic=False)
+
+    def test_dynamic_batches_chunked_loss_resume_matches_uninterrupted(self):
+        self.check_warm_start_resume(dynamic=True)
+
+    def check_warm_start_resume(self, dynamic):
         from fireredtts3_local.training import STOP_EVENT
         options = replace(self.opts, sampling_strategy='coverage', patches_per_example='all', batch_size=4,
                           validation_patches_per_example=3, validate_every='epoch',
+                          batch_token_budget=1 if dynamic else 0, dit_chunk_size=2 if dynamic else 0,
                           require_precomputed_features=True, offload_frozen_encoders=True)
         # Phase one may not have sampled every training file. Precompute all here.
         from fireredtts3_local.training_data import load_manifest
@@ -178,7 +185,10 @@ class WarmStartTests(unittest.TestCase):
         initial_validation = json.loads((self.root/'paused'/'validation_metrics.jsonl').read_text().splitlines()[0])
         self.assertEqual(initial_validation['step'],0)
         for key in ('loss','flow','stop'):
-            self.assertEqual(initial_validation[key],source_validation[key])
+            if dynamic:
+                self.assertAlmostEqual(initial_validation[key],source_validation[key],places=6)
+            else:
+                self.assertEqual(initial_validation[key],source_validation[key])
         state = torch.load(self.root/'paused'/'trainer_state.pt',weights_only=True)
         self.assertEqual(state['step'],2)
         self.assertEqual(state['scheduler']['last_epoch'],2)  # new stage, not source step + 2
@@ -234,7 +244,7 @@ class WarmStartTests(unittest.TestCase):
     def test_legacy_schema3_default_options_still_resume(self):
         state_path = self.source/'trainer_state.pt'
         state = torch.load(state_path,weights_only=True)
-        for name in ('sampling_strategy','validation_patches_per_example'):
+        for name in ('sampling_strategy','validation_patches_per_example','batch_token_budget','dit_chunk_size'):
             state['recipe']['options'].pop(name)
         torch.save(state,state_path)
         train_lora(toy.Manager(),self.fixture.manifest,self.source,rank=2,alpha=4,

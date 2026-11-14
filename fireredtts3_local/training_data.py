@@ -1,7 +1,7 @@
 """Validated, speaker-aware data for conditional speech training.
 
 An utterance is never cropped here: audio and transcript are an indivisible pair.
-Long recordings must be segmented with aligned transcripts during preparation.
+Duration limits are optional; neither audio nor text is truncated to fit them.
 """
 from __future__ import annotations
 
@@ -130,10 +130,8 @@ def assert_disjoint(train: list[dict], validation: list[dict], scope: str = "spe
         raise ValueError(f"Train/validation leakage ({scope}): {sorted(overlap)[:5]}")
 
 
-def split_manifest(rows: list[dict], fraction: float = 0.1, seed: int = 1234, scope: str = "speaker"):
-    """Connected components prevent identities/recordings spanning both splits."""
-    if not 0 < fraction < 1 or scope not in {"speaker", "recording"}:
-        raise ValueError("Invalid split fraction/scope")
+def identity_components(rows, scope):
+    """Indices connected transitively by speaker/global ID/source/audio hash."""
     parent = list(range(len(rows)))
 
     def root(i):
@@ -149,9 +147,16 @@ def split_manifest(rows: list[dict], fraction: float = 0.1, seed: int = 1234, sc
                 parent[root(i)] = root(owners[key])
             owners[key] = i
     groups = defaultdict(list)
-    for i, row in enumerate(rows):
-        groups[root(i)].append(row)
-    groups = list(groups.values())
+    for i in range(len(rows)):
+        groups[root(i)].append(i)
+    return list(groups.values())
+
+
+def split_manifest(rows: list[dict], fraction: float = 0.1, seed: int = 1234, scope: str = "speaker"):
+    """Connected components prevent identities/recordings spanning both splits."""
+    if not 0 < fraction < 1 or scope not in {"speaker", "recording"}:
+        raise ValueError("Invalid split fraction/scope")
+    groups = [[rows[i] for i in group] for group in identity_components(rows, scope)]
     if len(groups) < 2:
         raise ValueError("Cannot create disjoint validation: need more independent speakers/recordings.")
     random.Random(seed).shuffle(groups)
@@ -164,6 +169,46 @@ def split_manifest(rows: list[dict], fraction: float = 0.1, seed: int = 1234, sc
     return train, validation
 
 
+def split_with_anchors(rows, anchor_train, anchor_validation, fraction=.1, seed=1234, scope="speaker"):
+    """Preserve previous split membership when reimporting or expanding data.
+
+    Include old rows in the connectivity graph: absent intermediate identities
+    must still connect new rows. A new bridge between old splits is an error.
+    Only NEW rows are emitted, never the anchor rows themselves.
+    """
+    if not 0 < fraction < 1 or scope != "speaker":
+        raise ValueError("Anchored splitting requires speaker scope and a valid fraction")
+    if not anchor_train or not anchor_validation:
+        raise ValueError("Both train and validation anchors are required")
+    assert_disjoint(anchor_train, anchor_validation, scope)
+    n, train_end = len(rows), len(rows) + len(anchor_train)
+    combined = rows + anchor_train + anchor_validation
+    train, validation, free = [], [], []
+    for indices in identity_components(combined, scope):
+        old_train = any(n <= i < train_end for i in indices)
+        old_validation = any(i >= train_end for i in indices)
+        if old_train and old_validation:
+            raise ValueError("New identities bridge the previous train/validation split; resolve IDs before training")
+        group = [combined[i] for i in indices if i < n]
+        if not group:
+            continue
+        if old_train:
+            train.extend(group)
+        elif old_validation:
+            validation.extend(group)
+        else:
+            free.append(group)
+    random.Random(seed).shuffle(free)
+    wanted = max(1, round(n * fraction))
+    while free and len(validation) < wanted and (train or len(free) > 1):
+        validation.extend(free.pop())
+    train.extend(row for group in free for row in group)
+    if not train or not validation:
+        raise ValueError("Anchored split is empty; add independent usable speakers, do not move old identities")
+    assert_disjoint(train + anchor_train, validation + anchor_validation, scope)
+    return train, validation
+
+
 class SpeakerPairs:
     """Sample speakers uniformly, then targets, then a distinct valid reference.
 
@@ -171,16 +216,20 @@ class SpeakerPairs:
     Duplicate files and overlapping excerpts of a source are never paired.
     """
     def __init__(self, rows, max_prompt_seconds=12.0, max_target_seconds=20.0):
+        for limit in (max_prompt_seconds, max_target_seconds):
+            if limit is not None and (not math.isfinite(limit) or limit <= 0):
+                raise ValueError("Duration limits must be positive finite numbers or None")
         self.rows = rows
         groups = defaultdict(list)
         for row in rows:
-            if not 0 < row["duration"] <= max_target_seconds:
+            if (not math.isfinite(row["duration"]) or row["duration"] <= 0
+                    or (max_target_seconds is not None and row["duration"] > max_target_seconds)):
                 raise ValueError(f"Clip {row['utt_id']} is {row['duration']:.2f}s; align/segment it before training (limit {max_target_seconds}s).")
             groups[(row["speaker_id"], row["language"])].append(row)
         self.groups = {}
         rejected = []
         for key, clips in groups.items():
-            refs = [r for r in clips if r["duration"] <= max_prompt_seconds]
+            refs = [r for r in clips if max_prompt_seconds is None or r["duration"] <= max_prompt_seconds]
             # Linear-size indexes; candidate rejection is handled in sample().
             usable = []
             for row in clips:

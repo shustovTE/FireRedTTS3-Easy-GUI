@@ -33,8 +33,8 @@ class TrainingOptions:
     replay_manifest: str = ""
     replay_ratio: float = 0.2
     preservation_weight: float = 0.1
-    max_prompt_seconds: float = 12.0
-    max_target_seconds: float = 20.0
+    max_prompt_seconds: float | None = 12.0
+    max_target_seconds: float | None = 20.0
     patches_per_example: int | str = 8
     validation_patches_per_example: int | str | None = None
     cfg_dropout: float = 0.1
@@ -51,6 +51,8 @@ class TrainingOptions:
     prefetch_batches: int = 2
     bucket_by_length: bool = True
     sampling_strategy: str = "speaker_balanced"
+    batch_token_budget: int = 0
+    dit_chunk_size: int = 0
 
     def validate(self):
         for name, value in asdict(self).items():
@@ -77,7 +79,7 @@ class TrainingOptions:
         for name in ("validation_pairs", "batch_size", "validation_batch_size", "prefetch_batches"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
-        for name in ("loader_workers", "patience"):
+        for name in ("loader_workers", "patience", "batch_token_budget", "dit_chunk_size"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
         for name in ("gradient_checkpointing", "require_precomputed_features", "offload_frozen_encoders", "bucket_by_length"):
@@ -93,8 +95,12 @@ class TrainingOptions:
             raise ValueError("Dropout/replay ratio must be in [0, 1)")
         if not 0 < self.dit_lr_scale <= 1 or self.preservation_weight < 0 or self.stop_weight < 0:
             raise ValueError("Invalid loss weights or DiT learning rate scale")
-        if not 0 < self.max_prompt_seconds <= self.max_target_seconds:
-            raise ValueError("Require 0 < max_prompt_seconds <= max_target_seconds")
+        for limit in (self.max_prompt_seconds, self.max_target_seconds):
+            if limit is not None and (type(limit) not in (int, float) or limit <= 0):
+                raise ValueError("Duration limits must be positive finite numbers or null (unlimited)")
+        if (self.max_prompt_seconds is not None and self.max_target_seconds is not None
+                and self.max_prompt_seconds > self.max_target_seconds):
+            raise ValueError("Require max_prompt_seconds <= max_target_seconds")
         return self
 
     @classmethod
@@ -153,6 +159,13 @@ def to_examples(tts, loaded):
         tokens = [torch.tensor(ids, dtype=torch.long, device=tts.device) for ids in token_lists]
     else:
         tokens = [tts._tokenize_text(text).flatten() for text in texts]
+    context_limit = getattr(getattr(tts.tts_core.backbone_llm, "config", None), "max_position_embeddings", None)
+    if context_limit:
+        for token, (pa, ta, prompt, target, _) in zip(tokens, loaded):
+            length = 1 + token.numel() + pa['patch_embeddings'].shape[1] + ta['patch_embeddings'].shape[1]
+            if length > context_limit:
+                raise ValueError(f"Whole pair exceeds model context ({length} > {context_limit} tokens): "
+                                 f"{prompt['utt_id']} + {target['utt_id']}. No audio/text was truncated or skipped.")
     # Unique CPU tensors stay alive until the nonblocking copies are queued.
     transferred = {}
     def move(data, key):
@@ -171,6 +184,26 @@ def coverage_order(count, seed, epoch):
     order = list(range(count))
     random.Random(f"coverage-v1:{seed}:{epoch}").shuffle(order)
     return order
+
+
+def bounded_batches(pairs, batch_size, token_budget=0):
+    """Split an update into smaller batches, never discard or crop a long pair.
+
+    Budget estimates padded backbone tokens from text + 6.25 audio patches/s.
+    A single oversized example is still yielded whole. The optimizer update's
+    example count and order are independent of this memory-oriented partition.
+    """
+    batch, longest = [], 0
+    for pair in pairs:
+        size = 32 + sum(len(row['text']) + math.ceil(6.25*row['duration']) for row in pair[:2])
+        if batch and (len(batch) >= batch_size or
+                      (token_budget and max(longest, size)*(len(batch)+1) > token_budget)):
+            yield batch
+            batch, longest = [], 0
+        batch.append(pair)
+        longest = max(longest, size)
+    if batch:
+        yield batch
 
 
 def planned_batches(train, replay, options, sampler_state, start, total, accumulation, length_mode, seed=1234):
@@ -210,9 +243,9 @@ def planned_batches(train, replay, options, sampler_state, start, total, accumul
         if options.bucket_by_length:
             # Approximate token+patch lengths; grouping need not load GPU features.
             pairs.sort(key=lambda pair: sum(len(row['text']) + 6.25*row['duration'] for row in pair[:2]))
-        for index in range(0, count, options.batch_size):
-            yield BatchRequest(pairs[index:index+options.batch_size],
-                               state if index+options.batch_size >= count else None)
+        batches = list(bounded_batches(pairs, options.batch_size, options.batch_token_budget))
+        for index, batch in enumerate(batches):
+            yield BatchRequest(batch, state if index == len(batches)-1 else None)
 
 
 def validate_model(tts, cache, pairs, options, seed):
@@ -226,13 +259,14 @@ def validate_model(tts, cache, pairs, options, seed):
             # Dedicated generator makes validation noise independent of batch size.
             generator = torch.Generator(device=tts.device).manual_seed(seed)
             sampled = [(*pairs.sample(rng), 0.0) for _ in range(options.validation_pairs)]
-            requests = (BatchRequest(sampled[i:i+options.validation_batch_size])
-                        for i in range(0, len(sampled), options.validation_batch_size))
+            requests = (BatchRequest(batch) for batch in bounded_batches(
+                sampled, options.validation_batch_size, options.batch_token_budget))
             for _, loaded in loader.iterate(requests):
                 examples = to_examples(tts, loaded)
                 validation_patches = options.validation_patches_per_example or options.patches_per_example
                 _, metrics = batch_flow_loss(tts, examples, validation_patches,
-                                             0.0, options.stop_weight, generator=generator)
+                                             0.0, options.stop_weight, generator=generator,
+                                             dit_chunk_size=options.dit_chunk_size)
                 for key, value in metrics.items():
                     values[key] = values.get(key, 0.0) + float(value)*len(examples)
         return {key: value/options.validation_pairs for key, value in values.items()}
@@ -498,7 +532,8 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
                 examples = to_examples(tts, loaded)
                 data_seconds += time.perf_counter()-waiting
                 loss, metrics = batch_flow_loss(tts, examples, opts.patches_per_example,
-                                                opts.cfg_dropout, opts.stop_weight)
+                                                opts.cfg_dropout, opts.stop_weight,
+                                                dit_chunk_size=opts.dit_chunk_size)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite training loss at step {step}")
                 (loss*len(examples)).backward()
