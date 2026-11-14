@@ -24,6 +24,21 @@ def main():
                          help="complete-utterance: whole records ending in . ! ?, no ellipsis or duration cap")
     prepare.add_argument("--max-hours", type=float, default=50.0, help="Total accepted hours; 0 processes all supplied shards")
     prepare.add_argument("--max-speaker-minutes", type=float, default=30.0)
+    dialogs = commands.add_parser('plan-dialogs', help='Plan neutral <=10s Dialogs thirds with extra session-disjoint validation')
+    dialogs.add_argument('--source', default='training/raw/dialogs')
+    dialogs.add_argument('--output', default='training/plans/dialogs-neutral')
+    dialogs.add_argument('--source-revision', default='a74ff44d8d27ca3d21098ea3ed4d31a32923fbdd')
+    dialogs.add_argument('--max-seconds', type=float, default=10.)
+    dialogs.add_argument('--train-minutes', type=float, default=30.)
+    dialogs.add_argument('--validation-minutes', type=float, default=10/3)
+    dialogs.add_argument('--seed', type=int, default=1234)
+    dialogs.add_argument('--download', action='store_true', help='Download pinned CSV metadata and license only')
+    dialogs_import = commands.add_parser('prepare-dialogs', help='Download/audit planned WAVs, keeping exact thirds')
+    dialogs_import.add_argument('plan')
+    dialogs_import.add_argument('--output', default='training/datasets/dialogs-neutral')
+    dialogs_import.add_argument('--download', action='store_true', help='Download only planned audio files at the pinned revision')
+    dialogs_import.add_argument('--replay-manifest', help='Existing YO train manifest; select complete <=10s replay with valid pairs')
+    dialogs_import.add_argument('--validation-manifest', help='Existing unseen-speaker YO validation; select complete <=10s paired clips')
     split = commands.add_parser("split", help="Create disjoint train and validation manifests")
     split.add_argument("manifest")
     split.add_argument("--output", required=True)
@@ -67,6 +82,15 @@ def main():
         import_yo(args.inputs, args.output, args.min_mos, args.max_seconds,
                   args.max_hours, args.max_speaker_minutes, args.source_revision,
                   segmentation=args.segmentation)
+    elif args.command == 'plan-dialogs':
+        from .dialogs_dataset import plan_dialogs
+        report = plan_dialogs(args.source, args.output, args.source_revision, args.max_seconds,
+                              args.train_minutes, args.validation_minutes, args.seed, args.download)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    elif args.command == 'prepare-dialogs':
+        from .dialogs_dataset import prepare_dialogs
+        print(json.dumps(prepare_dialogs(args.plan, args.output, args.download,
+              replay_manifest=args.replay_manifest, validation_manifest=args.validation_manifest), ensure_ascii=False, indent=2))
     elif args.command == "split":
         root = Path(args.output)
         if root.exists() and any(root.iterdir()):
@@ -94,11 +118,12 @@ def main():
         print(json.dumps(report))
     elif args.command == "audit":
         options = TrainingOptions.parse(Path(args.options).read_text() if args.options else None)
-        train_pairs, val_pairs, replay_pairs = prepare_run_data(args.manifest, options, args.seed)
+        train_pairs, val_pairs, replay_pairs, adaptation = prepare_run_data(args.manifest, options, args.seed, include_adaptation_validation=True)
         print(json.dumps({"train_clips": len(train_pairs.rows), "train_speakers": len(train_pairs.groups),
                           "validation_clips": len(val_pairs.rows), "validation_speakers": len(val_pairs.groups),
                           "validation_scope": options.validation_scope,
-                          "replay_clips": len(replay_pairs.rows) if replay_pairs else 0}, indent=2))
+                          "replay_clips": len(replay_pairs.rows) if replay_pairs else 0,
+                          "adaptation_validation_clips": len(adaptation.rows) if adaptation else 0}, indent=2))
     elif args.command == "options":
         print(json.dumps(asdict(TrainingOptions()), indent=2))
     elif args.command == "train":

@@ -25,6 +25,7 @@ from .training_batch import Example, batch_flow_loss, set_training
 class TrainingOptions:
     profile: str = "backbone"
     validation_manifest: str = ""
+    adaptation_validation_manifest: str = ""
     validation_scope: str = "speaker"
     validation_fraction: float = 0.1
     validation_pairs: int = 32
@@ -64,10 +65,12 @@ class TrainingOptions:
             raise ValueError("validation_scope must be speaker or recording")
         if self.attention_backend not in {"sdpa", "flash_attention_2"}:
             raise ValueError("Unsupported attention backend")
-        if self.sampling_strategy not in {"speaker_balanced", "coverage"}:
-            raise ValueError("sampling_strategy must be speaker_balanced or coverage")
+        if self.sampling_strategy not in {"speaker_balanced", "coverage", "coverage_replay"}:
+            raise ValueError("sampling_strategy must be speaker_balanced, coverage or coverage_replay")
         if self.sampling_strategy == "coverage" and self.replay_manifest:
             raise ValueError("coverage requires an empty replay_manifest; use speaker_balanced for replay")
+        if self.sampling_strategy == "coverage_replay" and (not self.replay_manifest or not 0 < self.replay_ratio < 1):
+            raise ValueError("coverage_replay requires replay_manifest and 0 < replay_ratio < 1")
         for name in ("patches_per_example", "validation_patches_per_example"):
             value = getattr(self, name)
             if name == "validation_patches_per_example" and value is None:
@@ -119,7 +122,7 @@ def require_training_hardware():
         raise RuntimeError("This training implementation requires CUDA bfloat16 support")
 
 
-def prepare_run_data(manifest, options, seed):
+def prepare_run_data(manifest, options, seed, *, include_adaptation_validation=False):
     options = TrainingOptions.parse(options)
     rows = load_manifest(manifest)
     if options.validation_manifest:
@@ -133,8 +136,18 @@ def prepare_run_data(manifest, options, seed):
         if not options.replay_ratio:
             raise ValueError("Replay manifest supplied but replay_ratio is zero")
     pair_args = (options.max_prompt_seconds, options.max_target_seconds)
-    return (SpeakerPairs(train, *pair_args), SpeakerPairs(validation, *pair_args),
-            SpeakerPairs(replay, *pair_args) if replay else None)
+    adaptation = load_manifest(options.adaptation_validation_manifest) if options.adaptation_validation_manifest else []
+    if adaptation:
+        assert_disjoint(train, adaptation, 'recording')
+        assert_disjoint(replay, adaptation, 'recording')
+        assert_disjoint(validation, adaptation, 'speaker')
+        # Secondary validation may use known voices, but not the same words.
+        from .dialogs_dataset import lexical_key
+        if {lexical_key(r['text']) for r in train} & {lexical_key(r['text']) for r in adaptation}:
+            raise ValueError('Adaptation train/validation text leakage')
+    result = (SpeakerPairs(train, *pair_args), SpeakerPairs(validation, *pair_args),
+              SpeakerPairs(replay, *pair_args) if replay else None)
+    return result + (SpeakerPairs(adaptation, *pair_args) if adaptation else None,) if include_adaptation_validation else result
 
 
 @contextlib.contextmanager
@@ -206,6 +219,16 @@ def bounded_batches(pairs, batch_size, token_budget=0):
         yield batch
 
 
+def primary_examples_per_update(options, accumulation):
+    effective = options.batch_size * accumulation
+    if options.sampling_strategy != 'coverage_replay':
+        return effective
+    replay = effective * options.replay_ratio
+    if not math.isclose(replay, round(replay)) or not 0 < round(replay) < effective:
+        raise ValueError('coverage_replay requires an integer replay count within the effective batch')
+    return effective - round(replay)
+
+
 def planned_batches(train, replay, options, sampler_state, start, total, accumulation, length_mode, seed=1234):
     """Prefetch can run ahead; only the last consumed batch commits sampler RNG.
 
@@ -215,13 +238,16 @@ def planned_batches(train, replay, options, sampler_state, start, total, accumul
     rng = random.Random()
     rng.setstate(sampler_state)
     effective = options.batch_size * accumulation
-    steps_per_epoch = math.ceil(len(train.rows) / effective)
-    coverage = options.sampling_strategy == "coverage"
-    if coverage and (length_mode != "Epochs" or replay is not None):
+    primary = primary_examples_per_update(options, accumulation)
+    steps_per_epoch = math.ceil(len(train.rows) / primary)
+    coverage = options.sampling_strategy in {"coverage", "coverage_replay"}
+    if options.sampling_strategy == 'coverage_replay' and (length_mode != 'Epochs' or replay is None):
+        raise ValueError('coverage_replay requires Epochs mode and replay data')
+    if options.sampling_strategy == 'coverage' and (length_mode != "Epochs" or replay is not None):
         raise ValueError("coverage requires Epochs mode and no replay")
     previous_epoch, order = None, None
     for step in range(start, total):
-        count = (min(effective, len(train.rows)-(step % steps_per_epoch)*effective)
+        count = (min(primary, len(train.rows)-(step % steps_per_epoch)*primary)
                  if length_mode == "Epochs" else effective)
         pairs = []
         if coverage:
@@ -229,10 +255,14 @@ def planned_batches(train, replay, options, sampler_state, start, total, accumul
             if epoch != previous_epoch:
                 order = coverage_order(len(train.rows), seed, epoch)
                 previous_epoch = epoch
-            offset = (step % steps_per_epoch)*effective
+            offset = (step % steps_per_epoch)*primary
             for index in order[offset:offset+count]:
                 target = train.rows[index]
                 pairs.append((train.reference_for(target, rng), target, options.preservation_weight))
+            if options.sampling_strategy == 'coverage_replay':
+                for _ in range(round(count*(effective-primary)/primary)):
+                    prompt, target = replay.sample(rng)
+                    pairs.append((prompt, target, options.preservation_weight))
         else:
             for _ in range(count):
                 is_replay = replay is not None and rng.random() < options.replay_ratio
@@ -248,7 +278,7 @@ def planned_batches(train, replay, options, sampler_state, start, total, accumul
             yield BatchRequest(batch, state if index == len(batches)-1 else None)
 
 
-def validate_model(tts, cache, pairs, options, seed):
+def validate_model(tts, cache, pairs, options, seed, *, all_targets=False):
     was_training = tts.tts_core.training
     loader = BatchFeatures(cache, options.loader_workers, options.prefetch_batches)
     values = {}
@@ -258,7 +288,8 @@ def validate_model(tts, cache, pairs, options, seed):
             rng = random.Random(seed)
             # Dedicated generator makes validation noise independent of batch size.
             generator = torch.Generator(device=tts.device).manual_seed(seed)
-            sampled = [(*pairs.sample(rng), 0.0) for _ in range(options.validation_pairs)]
+            sampled = ([(pairs.reference_for(target, rng), target, 0.0) for target in pairs.rows]
+                       if all_targets else [(*pairs.sample(rng), 0.0) for _ in range(options.validation_pairs)])
             requests = (BatchRequest(batch) for batch in bounded_batches(
                 sampled, options.validation_batch_size, options.batch_token_budget))
             for _, loaded in loader.iterate(requests):
@@ -269,7 +300,7 @@ def validate_model(tts, cache, pairs, options, seed):
                                              dit_chunk_size=options.dit_chunk_size)
                 for key, value in metrics.items():
                     values[key] = values.get(key, 0.0) + float(value)*len(examples)
-        return {key: value/options.validation_pairs for key, value in values.items()}
+        return {key: value/len(sampled) for key, value in values.items()}
     finally:
         loader.close()
         set_training(tts.tts_core, was_training)
@@ -336,18 +367,19 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         raise ValueError("Invalid dropout/learning rate")
     if length_mode not in {"Steps", "Epochs"}:
         raise ValueError("length_mode must be Steps or Epochs")
-    if opts.sampling_strategy == "coverage" and length_mode != "Epochs":
-        raise ValueError("coverage requires length_mode=Epochs")
+    if opts.sampling_strategy in {"coverage", "coverage_replay"} and length_mode != "Epochs":
+        raise ValueError("coverage modes require length_mode=Epochs")
     if opts.validate_every == "epoch" and length_mode != "Epochs":
         raise ValueError('validate_every="epoch" requires length_mode=Epochs')
-    train, validation, replay = prepare_run_data(manifest_path, opts, seed)
+    train, validation, replay, adaptation = prepare_run_data(manifest_path, opts, seed, include_adaptation_validation=True)
     require_training_hardware()
     out = Path(output_dir)
     resume = Path(resume_checkpoint) if resume_checkpoint and str(resume_checkpoint) != "None" else None
     if out.exists() and any(out.iterdir()) and resume is None:
         raise ValueError("Output directory is not empty; choose a new run name or explicitly resume")
     effective_batch = opts.batch_size * gradient_accumulation
-    steps_per_epoch = math.ceil(len(train.rows) / effective_batch)
+    primary_batch = primary_examples_per_update(opts, gradient_accumulation)
+    steps_per_epoch = math.ceil(len(train.rows) / primary_batch)
     total = training_steps if length_mode == "Steps" else steps_per_epoch * training_epochs
     recipe = {
         "schema": 3, "options": asdict(opts), "rank": rank, "alpha": alpha, "dropout": dropout,
@@ -357,6 +389,8 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         "validation_fingerprint": dataset_fingerprint(validation.rows),
         "replay_fingerprint": dataset_fingerprint(replay.rows) if replay else None,
     }
+    if adaptation:
+        recipe['adaptation_validation_fingerprint'] = dataset_fingerprint(adaptation.rows)
     initial = initial_adapter_info(initial_adapter, rank, alpha, dropout, opts.profile) if initial_adapter else None
     if initial:
         recipe["initial_adapter_fingerprint"] = initial["fingerprint"]
@@ -370,8 +404,10 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         if saved_recipe != recipe:
             raise ValueError("Resume recipe/data differ. Resume with the original recipe; legacy all-linear checkpoints are not resumable here.")
     log(f"[training] {len(train.groups)} speaker/language groups; {len(validation.rows)} validation clips ({opts.validation_scope}); profile={opts.profile}")
-    if opts.sampling_strategy == "coverage":
+    if opts.sampling_strategy in {"coverage", "coverage_replay"}:
         log(f"[training] Coverage: each of {len(train.rows)} targets exactly once per epoch; {steps_per_epoch} updates/epoch.")
+        if replay:
+            log(f'[training] Each full update: {primary_batch} adaptation + {effective_batch-primary_batch} speaker-balanced replay pairs; preservation on both.')
     else:
         log("[training] Epoch means a speaker-balanced sampling budget, not an exhaustive pass over clips.")
     STOP_EVENT.clear()
@@ -425,7 +461,7 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         set_training(core)
         cache = FeatureCache(tts, opts.cache_dir or None, base_fingerprint, opts.require_precomputed_features)
         if opts.require_precomputed_features:
-            cache.require_all(train.rows + validation.rows + (replay.rows if replay else []))
+            cache.require_all(train.rows + validation.rows + (replay.rows if replay else []) + (adaptation.rows if adaptation else []))
         if opts.offload_frozen_encoders:
             tts.redae.to("cpu")
             tts.spk_extractor.to("cpu")
@@ -450,11 +486,15 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         write_manifest(out / "validation.jsonl", validation.rows)
         if replay:
             write_manifest(out / "replay.jsonl", replay.rows)
+        if adaptation:
+            write_manifest(out / 'adaptation_validation.jsonl', adaptation.rows)
         (out / "recipe.json").write_text(json.dumps(recipe, indent=2, ensure_ascii=False), encoding="utf-8")
         (out / "trainable_parameters.json").write_text(json.dumps([n for n, _ in named], indent=2))
         writer = SummaryWriter(str(out / "tensorboard"))
         metadata = {"experimental": True, "recipe": recipe, "base_model": "FireRedTeam/FireRedTTS3", "base_fingerprint": base_fingerprint,
                     "selection_metric": "held-out flow + stop loss; NOT a guarantee of voice similarity"}
+        if adaptation:
+            metadata['selection_metric'] = 'Mean of unseen-speaker and adaptation recording/text holdout flow + stop losses; NOT a guarantee of voice similarity'
         if initial:
             metadata["initial_adapter"] = {key: initial[key] for key in ("path", "fingerprint")}
 
@@ -478,8 +518,22 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             with (out / "validation_metrics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"step": step, **metrics}) + "\n")
             log(f"[validation] step={step} loss={metrics['loss']:.6f} flow={metrics['flow']:.6f} stop={metrics['stop']:.6f}")
-            if metrics["loss"] < best:
-                best, bad = metrics["loss"], 0
+            selection_loss = metrics['loss']
+            if adaptation:
+                adapted_metrics = validate_model(tts, cache, adaptation, opts, seed + 20000, all_targets=True)
+                if not all(math.isfinite(x) for x in adapted_metrics.values()):
+                    raise FloatingPointError('Non-finite adaptation validation metrics')
+                for key, value in adapted_metrics.items():
+                    writer.add_scalar('adaptation_validation/' + key, value, step)
+                with (out/'adaptation_validation_metrics.jsonl').open('a', encoding='utf-8') as stream:
+                    stream.write(json.dumps({'step': step, 'targets': len(adaptation.rows), **adapted_metrics})+'\n')
+                selection_loss = (metrics['loss'] + adapted_metrics['loss'])/2
+                with (out/'selection_metrics.jsonl').open('a', encoding='utf-8') as stream:
+                    stream.write(json.dumps({'step': step, 'unseen_voice_loss': metrics['loss'],
+                                             'adaptation_loss': adapted_metrics['loss'], 'loss': selection_loss})+'\n')
+                log(f"[adaptation-validation] step={step} loss={adapted_metrics['loss']:.6f}; selection_loss={selection_loss:.6f}")
+            if selection_loss < best:
+                best, bad = selection_loss, 0
                 save(out / "best-validation")
             else:
                 bad += 1
@@ -568,9 +622,12 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], step)
             message = f"[training] step={step}/{total} loss={metrics_sum['loss']/used:.6f} {elapsed:.2f}s/step {used/elapsed:.2f} examples/s"
             log(message)
-            if opts.sampling_strategy == "coverage" and step % steps_per_epoch == 0:
+            if opts.sampling_strategy in {"coverage", "coverage_replay"} and step % steps_per_epoch == 0:
                 coverage = {"epoch": step//steps_per_epoch, "step": step, "targets": len(train.rows),
                             "target_hours": sum(row['duration'] for row in train.rows)/3600}
+                if opts.sampling_strategy == 'coverage_replay':
+                    full, partial = divmod(len(train.rows), primary_batch)
+                    coverage['replay_targets'] = full*(effective_batch-primary_batch) + round(partial*(effective_batch-primary_batch)/primary_batch)
                 with (out / "coverage.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(coverage)+"\n")
                 log(f"[coverage] epoch={coverage['epoch']}/{training_epochs} targets={coverage['targets']} target_hours={coverage['target_hours']:.2f}")

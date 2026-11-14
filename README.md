@@ -391,6 +391,8 @@ For a subsequent stage from the pilot adapter, [the coverage recipe](recipes/rus
 
 For whole punctuated utterances of unrestricted duration, use the separate [complete-utterance recipe](recipes/russian_complete_96gb.json). The [training guide](docs/RUSSIAN_TRAINING.md) covers punctuation filtering, preserving previous speaker splits, memory-aware batches, and `python -m fireredtts3_local.training_job` for detached Linux jobs with logs, status and graceful stopping.
 
+For short neutral questions and replies, see [Dialogs preparation and training](docs/DIALOGS_TRAINING.md): per-actor question/statement/random thirds, 30 training minutes plus additional session-disjoint validation, and the [Dialogs recipe](recipes/russian_dialogs_96gb.json) with YO replay and separate unseen-voice validation.
+
 ### Training Length Mode
 
 Training uses one explicit unit at a time.

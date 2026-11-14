@@ -244,7 +244,7 @@ class WarmStartTests(unittest.TestCase):
     def test_legacy_schema3_default_options_still_resume(self):
         state_path = self.source/'trainer_state.pt'
         state = torch.load(state_path,weights_only=True)
-        for name in ('sampling_strategy','validation_patches_per_example','batch_token_budget','dit_chunk_size'):
+        for name in ('sampling_strategy','validation_patches_per_example','batch_token_budget','dit_chunk_size','adaptation_validation_manifest'):
             state['recipe']['options'].pop(name)
         torch.save(state,state_path)
         train_lora(toy.Manager(),self.fixture.manifest,self.source,rank=2,alpha=4,

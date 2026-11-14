@@ -209,8 +209,8 @@ def precompute_recipe(recipe_path, base, repair=False, log=print):
     options = TrainingOptions.parse(recipe.get('options'))
     if not options.cache_dir:
         raise ValueError('Recipe needs cache_dir')
-    train, validation, replay = prepare_run_data(recipe['manifest_path'], options, recipe.get('seed', 1234))
-    rows = train.rows + validation.rows + (replay.rows if replay else [])
+    train, validation, replay, adaptation = prepare_run_data(recipe['manifest_path'], options, recipe.get('seed', 1234), include_adaptation_validation=True)
+    rows = train.rows + validation.rows + (replay.rows if replay else []) + (adaptation.rows if adaptation else [])
     require_training_hardware()
     fingerprint = model_identity(base)
     pipeline = load_feature_pipeline(base, attention_backend=options.attention_backend)
