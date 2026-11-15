@@ -89,8 +89,12 @@ def main():
     export.add_argument("--evaluation-adapted", help="Existing report for the adapter being merged")
     publish = commands.add_parser("publish", help="Upload a verified model release to the account of the local HF token")
     publish.add_argument("export_dir")
-    publish.add_argument("--repo-name", default="FireRedTTS3-Base-Russian")
+    destination = publish.add_mutually_exclusive_group()
+    destination.add_argument("--repo-name", default="FireRedTTS3-Base-Russian")
+    destination.add_argument("--repo-id", help="Exact destination, whose owner must match the local HF token")
     publish.add_argument("--public", action="store_true", help="Create a public model repository (otherwise private)")
+    publish.add_argument("--update-existing", action="store_true", help="Update an existing verified release in one new commit; retain history")
+    publish.add_argument("--expected-parent", help="Optional full SHA of the destination HEAD; reject concurrent/unexpected changes")
     args = parser.parse_args()
     if args.command == "prepare-yo":
         from .yo_dataset import import_yo
@@ -195,7 +199,9 @@ def main():
                 evaluation_adapted=args.evaluation_adapted), ensure_ascii=False, indent=2))
     elif args.command == "publish":
         from .release import publish_release
-        print(json.dumps(publish_release(args.export_dir, args.repo_name, public=args.public), ensure_ascii=False, indent=2))
+        print(json.dumps(publish_release(args.export_dir, args.repo_name, public=args.public,
+            repo_id=args.repo_id, update_existing=args.update_existing, expected_parent=args.expected_parent),
+            ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

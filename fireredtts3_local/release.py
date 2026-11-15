@@ -202,12 +202,7 @@ def seal_release(root):
 def verify_release(root):
     root = Path(root).resolve()
     manifest = json.loads((root / MANIFEST).read_text())
-    if manifest.get("schema") != 1 or manifest.get("producer") != PRODUCER:
-        raise ValueError("Not a verified FireRedTTS3 release")
-    files = manifest["files"]
-    identity = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    if manifest.get("release_id") != identity:
-        raise ValueError("Release manifest identity mismatch")
+    files = validated_manifest_files(manifest)
     actual = set()
     for path in root.rglob("*"):
         if path.is_symlink():
@@ -218,14 +213,33 @@ def verify_release(root):
         raise ValueError("Release contains missing/extra files; do not put tokens, audio or training data here")
     for name, record in files.items():
         path = root / name
-        if (Path(name).is_absolute() or ".." in Path(name).parts or "\\" in name
-                or path.stat().st_size != record["size"] or file_digest(path) != record["sha256"]):
+        if path.stat().st_size != record["size"] or file_digest(path) != record["sha256"]:
             raise ValueError(f"Release checksum mismatch: {name}")
+    return manifest
+
+
+def validated_manifest_files(manifest):
+    """Validate a local or remote release inventory before using any paths."""
+    if manifest.get("schema") != 1 or manifest.get("producer") != PRODUCER:
+        raise ValueError("Not a verified FireRedTTS3 release")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        raise ValueError("Missing release inventory")
+    for name, record in files.items():
+        if (not isinstance(name, str) or not name or Path(name).is_absolute()
+                or any(part in {"", ".", ".."} for part in name.split("/")) or "\\" in name
+                or name in {MANIFEST, ".gitattributes"}
+                or not isinstance(record, dict) or type(record.get("size")) is not int or record["size"] < 0
+                or not isinstance(record.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])):
+            raise ValueError(f"Invalid release inventory entry: {name}")
+    identity = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if manifest.get("release_id") != identity:
+        raise ValueError("Release manifest identity mismatch")
     required = {"README.md", "LICENSE", "config.json", "tokenizer.json", "export_provenance.json",
                 "redae/model.safetensors", "campp/campplus_voxceleb.bin"}
     if not required <= set(files) or not any("/" not in n and n.endswith(".safetensors") for n in files):
         raise ValueError("Incomplete serving package")
-    return manifest
+    return files
 
 
 def build_release(base, adapter, output, *, template_repo=TEMPLATE_REPO, template_revision=TEMPLATE_REVISION,
@@ -298,7 +312,34 @@ def remote_matches(info, root, names):
     return all(matches_hub_file(root / name, inventory[name]) for name in sorted(names))
 
 
-def publish_release(output, repo_name="FireRedTTS3-Base-Russian", *, public=False, log=print):
+def verified_remote_release(api, repo_id, info):
+    """Verify a previous managed release without downloading its large weights."""
+    inventory = {f.rfilename: f for f in info.siblings}
+    if MANIFEST not in inventory:
+        raise ValueError("Existing repository has no release manifest; refusing to replace an unrelated model")
+
+    def download(name):
+        path = Path(api.hf_hub_download(repo_id=repo_id, filename=name, repo_type="model", revision=info.sha))
+        if not matches_hub_file(path, inventory[name]):
+            raise ValueError(f"Previous release download checksum mismatch: {name}")
+        return path
+
+    manifest = json.loads(download(MANIFEST).read_text())
+    files = validated_manifest_files(manifest)
+    if set(inventory) - {".gitattributes"} != set(files) | {MANIFEST}:
+        raise ValueError("Existing repository has missing/unmanaged files; refusing to replace them")
+    for name, record in files.items():
+        metadata = inventory[name]
+        if metadata.size != record["size"]:
+            raise ValueError(f"Previous release changed outside its manifest: {name}")
+        digest = metadata.lfs.sha256 if metadata.lfs else file_digest(download(name))
+        if digest != record["sha256"]:
+            raise ValueError(f"Previous release changed outside its manifest: {name}")
+    return manifest
+
+
+def publish_release(output, repo_name="FireRedTTS3-Base-Russian", *, public=False,
+                    repo_id=None, update_existing=False, expected_parent=None, log=print):
     from huggingface_hub import HfApi
     from huggingface_hub.errors import RepositoryNotFoundError
     from huggingface_hub.utils import validate_repo_id
@@ -306,31 +347,57 @@ def publish_release(output, repo_name="FireRedTTS3-Base-Russian", *, public=Fals
     manifest = verify_release(root)
     if "/" in repo_name:
         raise ValueError("Use a repository NAME only; the account comes from the local HF token")
+    if expected_parent is not None and not re.fullmatch(r"[0-9a-f]{40}", expected_parent):
+        raise ValueError("expected_parent must be a full commit SHA")
     api = HfApi(token=True)
     owner = api.whoami()["name"]
-    repo_id = f"{owner}/{repo_name}"
+    repo_id = repo_id or f"{owner}/{repo_name}"
     validate_repo_id(repo_id)
+    if repo_id.split("/")[0] != owner or "/" not in repo_id:
+        raise ValueError("Destination must belong to the account of the local HF token")
     names = set(manifest["files"]) | {MANIFEST}
     log(f"[publish] Account: {owner}; repository: {repo_id}; visibility: {'public' if public else 'private'}")
     try:
         info = api.model_info(repo_id, files_metadata=True)
     except RepositoryNotFoundError:
+        if update_existing or expected_parent:
+            raise ValueError("Update destination does not exist or is inaccessible; no repository was created") from None
         api.create_repo(repo_id, repo_type="model", private=not public, exist_ok=False)
         info = api.model_info(repo_id, files_metadata=True)
     if info.private != (not public):
         raise ValueError("Existing repository visibility differs; refusing to change it automatically")
     existing = {f.rfilename for f in info.siblings} - {".gitattributes"}
-    if existing:
-        if not remote_matches(info, root, names):
-            raise ValueError("Destination already contains different files; use a new repository name")
+    previous_commit = previous_release_id = None
+    removed = []
+    if existing and remote_matches(info, root, names):
         commit = info.sha
         log("[publish] Identical release already exists; no files uploaded")
     else:
-        # Exact allowlist + an optimistic parent bind. No recursive upload of a
-        # training directory and no deletion/overwrite of an unrelated model.
-        result = api.upload_folder(repo_id=repo_id, repo_type="model", folder_path=str(root),
-            allow_patterns=sorted(names), parent_commit=info.sha,
-            commit_message=f"Publish merged FireRedTTS3 release {manifest['release_id'][:12]}")
+        if expected_parent is not None and info.sha != expected_parent:
+            raise ValueError("Remote HEAD differs from expected_parent; no files were uploaded")
+        if existing:
+            if not update_existing:
+                raise ValueError("Destination already contains different files; pass --update-existing for a new commit")
+            from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+            previous = verified_remote_release(api, repo_id, info)
+            previous_commit, previous_release_id = info.sha, previous["release_id"]
+            removed = sorted(existing - names)
+            inventory = {f.rfilename: f for f in info.siblings}
+            changed = [name for name in sorted(names)
+                       if name not in inventory or not matches_hub_file(root / name, inventory[name])]
+            operations = [CommitOperationDelete(path_in_repo=name, is_folder=False) for name in removed]
+            operations += [CommitOperationAdd(path_in_repo=name, path_or_fileobj=root / name) for name in changed]
+            log(f"[publish] Updating {repo_id}@{info.sha}: {len(changed)} changed/new files, "
+                f"{len(removed)} obsolete files; previous commit remains in history")
+            # One atomic commit for additions and stale shard/index deletions.
+            # A concurrent push makes the parent check fail, never a force push.
+            result = api.create_commit(repo_id=repo_id, repo_type="model", revision="main",
+                operations=operations, parent_commit=info.sha,
+                commit_message=f"Update FireRedTTS3 release to {manifest['release_id'][:12]}")
+        else:
+            result = api.upload_folder(repo_id=repo_id, repo_type="model", folder_path=str(root),
+                allow_patterns=sorted(names), parent_commit=info.sha,
+                commit_message=f"Publish merged FireRedTTS3 release {manifest['release_id'][:12]}")
         commit = result.oid
         info = api.model_info(repo_id, revision=commit, files_metadata=True)
         if not remote_matches(info, root, names):
@@ -338,5 +405,17 @@ def publish_release(output, repo_name="FireRedTTS3-Base-Russian", *, public=Fals
     result = {"repo_id": repo_id, "url": f"https://huggingface.co/{repo_id}", "commit": commit,
               "revision_url": f"https://huggingface.co/{repo_id}/tree/{commit}", "public": public,
               "release_id": manifest["release_id"], "remote_files_verified": True}
+    if previous_commit:
+        result.update(previous_commit=previous_commit, previous_release_id=previous_release_id, removed_files=removed)
+    else:
+        # A successful retry should not erase the rollback reference from its receipt.
+        receipt = root.parent / f"{root.name}.published.json"
+        if receipt.is_file():
+            try:
+                old = json.loads(receipt.read_text())
+                if all(old.get(key) == result[key] for key in ("repo_id", "commit", "release_id")):
+                    result.update({key: old[key] for key in ("previous_commit", "previous_release_id", "removed_files") if key in old})
+            except (OSError, ValueError):
+                pass
     write_json(root.parent / f"{root.name}.published.json", result)
     return result

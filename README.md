@@ -399,6 +399,8 @@ After expansion, use the [YO training stage guide](docs/YO_HALF_TRAINING.md) to 
 
 To restart from the original base after reviewing endings, see [trimmed retraining](docs/TRIMMED_RETRAINING.md): reuse local YO alignments for final-word +200 ms crops, review Dialogs with transcript-matched ASR timestamps and acoustic VAD, preserve holdouts, and monitor terminal versus premature stop predictions.
 
+For a fresh YO + Dialogs run restricted to existing tail-reviewed recordings of at most 20 seconds, see [duration-limited retraining](docs/DURATION_RETRAINING.md). It preserves holdouts and complete transcripts, checks same-speaker references again, and reuses the audio feature cache.
+
 To serve the adapted model, see [LoRA merging and Hugging Face publication](docs/MERGE_AND_PUBLISH.md): build a complete CKermit-compatible SGLang Omni package, verify merged tensors/tokenizer, and publish an explicit file manifest under the authenticated HF account.
 
 ### Training Length Mode

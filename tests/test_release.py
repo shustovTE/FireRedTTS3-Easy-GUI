@@ -17,7 +17,7 @@ import torch
 from fireredtts3_local.export import TOKENIZER_FILES, export_merged
 from fireredtts3_local.model_manager import ModelManager
 from fireredtts3_local.release import (MANIFEST, TEMPLATE_REPO, TEMPLATE_REVISION, WEIGHTS,
-    build_release, git_blob_digest, prepare_template, publish_release, verify_release, write_json)
+    build_release, git_blob_digest, prepare_template, publish_release, seal_release, verify_release, write_json)
 from fireredtts3_local.training_data import file_digest, model_identity
 from fireredtts3_local.training_objective import adapter_targets
 
@@ -223,6 +223,117 @@ class ReleaseTests(unittest.TestCase):
         (root / "tokenizer.json").write_text("changed")
         with self.assertRaisesRegex(ValueError, "checksum mismatch"):
             verify_release(root)
+
+
+class PublishUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.old, self.new = self.root / "old", self.root / "new"
+        for name in ("README.md", "LICENSE", "config.json", "tokenizer.json", "export_provenance.json",
+                     "redae/model.safetensors", "campp/campplus_voxceleb.bin",
+                     "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+                     "model.safetensors.index.json"):
+            path = self.old / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}" if name.endswith(".json") else f"old fixture {name}")
+        seal_release(self.old)
+        shutil.copytree(self.old, self.new)
+        for path in self.new.glob("model*"):
+            path.unlink()
+        (self.new / "model.safetensors").write_bytes(b"new merged core fixture")
+        (self.new / "README.md").write_text("New release card")
+        seal_release(self.new)
+        self.attributes = self.root / "attributes"
+        self.attributes.write_text("*.safetensors filter=lfs diff=lfs merge=lfs -text\n")
+        self.old_info = self.remote(self.old, "a" * 40)
+        self.new_info = self.remote(self.new, "b" * 40)
+        self.context = patch("huggingface_hub.HfApi")
+        self.api = self.context.start().return_value
+        self.addCleanup(self.context.stop)
+        self.api.whoami.return_value = {"name": "shustov-te"}
+        self.api.model_info.side_effect = [self.old_info, self.new_info]
+        self.api.hf_hub_download.side_effect = lambda **kw: str(self.old / kw["filename"])
+        self.api.create_commit.return_value = SimpleNamespace(oid=self.new_info.sha)
+
+    def remote(self, root, sha):
+        siblings = [file_info(p, p.relative_to(root).as_posix()) for p in root.rglob("*") if p.is_file()]
+        siblings.append(file_info(self.attributes, ".gitattributes"))
+        return SimpleNamespace(sha=sha, private=False, siblings=siblings)
+
+    def publish(self, **kwargs):
+        return publish_release(self.new, repo_id="shustov-te/FireRedTTS3-Base-Russian", public=True,
+                               update_existing=True, log=lambda _: None, **kwargs)
+
+    def test_atomic_commit_removes_obsolete_shards_and_index_preserves_assets_and_retry(self):
+        from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+        result = self.publish(expected_parent=self.old_info.sha)
+        args = self.api.create_commit.call_args.kwargs
+        self.assertEqual(args["repo_id"], "shustov-te/FireRedTTS3-Base-Russian")
+        self.assertEqual(args["parent_commit"], self.old_info.sha)
+        self.assertEqual(args["revision"], "main")
+        removed = {op.path_in_repo for op in args["operations"] if isinstance(op, CommitOperationDelete)}
+        self.assertEqual(removed, {"model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+                                   "model.safetensors.index.json"})
+        added = {op.path_in_repo for op in args["operations"] if isinstance(op, CommitOperationAdd)}
+        self.assertEqual(added, {"model.safetensors", "README.md", MANIFEST})
+        self.assertEqual(result["previous_commit"], self.old_info.sha)
+        self.assertEqual(result["commit"], self.new_info.sha)
+        self.api.upload_folder.assert_not_called()
+        self.api.create_repo.assert_not_called()
+        downloads = [call.kwargs for call in self.api.hf_hub_download.call_args_list]
+        self.assertTrue(all(d["revision"] == self.old_info.sha for d in downloads))
+        self.assertFalse(any(d["filename"].endswith((".safetensors", ".bin")) for d in downloads))
+        self.api.create_commit.reset_mock()
+        self.api.model_info.side_effect = None
+        self.api.model_info.return_value = self.new_info
+        # Same release after a successful/lost response is an idempotent retry,
+        # even if expected_parent still refers to the old HEAD.
+        self.assertEqual(self.publish(expected_parent=self.old_info.sha), result)
+        self.api.create_commit.assert_not_called()
+        verify_release(self.new)
+
+    def test_nonmanaged_or_edited_repositories_are_never_overwritten(self):
+        for case in ("missing_manifest", "unmanaged_file", "changed_weight", "changed_small_file"):
+            with self.subTest(case=case):
+                info = copy.deepcopy(self.old_info)
+                if case == "missing_manifest":
+                    info.siblings = [f for f in info.siblings if f.rfilename != MANIFEST]
+                elif case == "unmanaged_file":
+                    info.siblings.append(file_info(self.attributes, "custom-notes.txt"))
+                elif case == "changed_weight":
+                    next(f for f in info.siblings if f.rfilename.startswith("model-")).lfs.sha256 = "0" * 64
+                else:
+                    next(f for f in info.siblings if f.rfilename == "config.json").blob_id = "0" * 40
+                self.api.model_info.side_effect = [info]
+                with self.assertRaises(ValueError):
+                    self.publish()
+                self.api.create_commit.assert_not_called()
+                self.assertFalse((self.root / "new.published.json").exists())
+
+    def test_wrong_owner_parent_and_concurrent_push_fail_without_receipt(self):
+        self.api.whoami.return_value = {"name": "another-owner"}
+        with self.assertRaisesRegex(ValueError, "local HF token"):
+            self.publish()
+        self.api.model_info.assert_not_called()
+        self.api.whoami.return_value = {"name": "shustov-te"}
+        with self.assertRaisesRegex(ValueError, "expected_parent"):
+            self.publish(expected_parent="c" * 40)
+        self.api.create_commit.assert_not_called()
+        self.api.model_info.side_effect = [self.old_info]
+        self.api.create_commit.side_effect = RuntimeError("409 concurrent parent change")
+        with self.assertRaisesRegex(RuntimeError, "concurrent"):
+            self.publish()
+        self.assertFalse((self.root / "new.published.json").exists())
+
+    def test_remote_verification_failure_does_not_write_success_receipt(self):
+        broken = copy.deepcopy(self.new_info)
+        next(f for f in broken.siblings if f.rfilename == "model.safetensors").lfs.sha256 = "0" * 64
+        self.api.model_info.side_effect = [self.old_info, broken]
+        with self.assertRaisesRegex(ValueError, "remote content verification failed"):
+            self.publish()
+        self.assertFalse((self.root / "new.published.json").exists())
 
 
 if __name__ == "__main__":

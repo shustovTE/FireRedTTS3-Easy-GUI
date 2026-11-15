@@ -13,10 +13,13 @@ diag_status=0
 docker exec -i -e DIAG_OUTPUT="$diag_remote" -e DIAG_VOICE="$diag_voice" \
   -e DIAG_SEED="${DIAG_SEED:-1234}" \
   -e DIAG_STOP_THRESHOLD="${DIAG_STOP_THRESHOLD:-0.5}" \
+  -e DIAG_WHOLE_TEXT="${DIAG_WHOLE_TEXT:-0}" \
+  -e DIAG_READY_TIMEOUT="${DIAG_READY_TIMEOUT:-1800}" \
   "$diag_container" /opt/sglang/bin/python3 -u - <<'PY' || diag_status=$?
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -48,15 +51,17 @@ sentences = [
 ]
 original = " ".join(sentences)
 (root / "original_text.txt").write_text(original + "\n", encoding="utf-8")
-# The pinned SGLang runtime rejects requests longer than 400 characters.
-# Keep the longest control sentence-complete; never truncate a word.
-cases = [("long", " ".join(sentences[:3]))]
+# Whole text requires lifting the runtime's 400-character guard first.
+whole_text = os.environ.get("DIAG_WHOLE_TEXT", "0")
+if whole_text not in {"0", "1"}:
+    raise ValueError("DIAG_WHOLE_TEXT must be 0 or 1")
+cases = [("long", original if whole_text == "1" else " ".join(sentences[:3]))]
 cases.extend((f"sentence-{i:02d}", text) for i, text in enumerate(sentences, 1))
-assert len(original) == 470 and len(cases[0][1]) == 371
-assert all(len(text) <= 400 for _, text in cases)
+assert len(original) == 470 and len(cases[0][1]) == (470 if whole_text == "1" else 371)
 settings = {
     "voice": voice, "seed": seed, "stop_threshold": threshold,
     "original_characters": len(original), "long_characters": len(cases[0][1]),
+    "whole_text": whole_text == "1",
     "note": "Sequential direct requests. Identical seeds do not guarantee identical audio across stream modes. No resampling, normalization or added silence.",
 }
 try:
@@ -71,7 +76,31 @@ try:
     settings["release_id"] = json.loads((model_path / "release_manifest.json").read_text())["release_id"]
 except (OSError, ValueError, KeyError) as error:
     settings["release_metadata_error"] = str(error)
+try:
+    runtime_source = Path("/opt/firered-omni/sglang_omni/models/firered_tts3/preprocessing.py")
+    limit = re.search(r"(?m)^MAX_TEXT_CHARS = ([0-9]+)$", runtime_source.read_text())
+    settings["runtime_source_text_limit"] = int(limit.group(1)) if limit else None
+except OSError as error:
+    settings["runtime_source_error"] = str(error)
 save_json("settings.json", settings)
+
+ready_timeout = int(os.environ.get("DIAG_READY_TIMEOUT", "1800"))
+if ready_timeout < 1:
+    raise ValueError("DIAG_READY_TIMEOUT must be positive")
+deadline, next_notice = time.monotonic() + ready_timeout, 0.
+while True:
+    try:
+        with http.open(api + "/health", timeout=5) as response:
+            if response.status != 200:
+                raise RuntimeError(f"Health HTTP {response.status}")
+        break
+    except Exception:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("SGLang health timeout; inspect container logs") from None
+        if time.monotonic() >= next_notice:
+            print("Waiting for SGLang /health after startup...", flush=True)
+            next_notice = time.monotonic() + 30
+        time.sleep(5)
 
 with http.open(api + "/v1/audio/voices", timeout=30) as response:
     voices = json.load(response)
