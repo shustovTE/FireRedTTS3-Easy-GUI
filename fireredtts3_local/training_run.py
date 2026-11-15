@@ -30,6 +30,7 @@ class TrainingOptions:
     validation_scope: str = "speaker"
     validation_fraction: float = 0.1
     validation_pairs: int = 32
+    validation_all_targets: bool = False
     validate_every: int | str = 100
     patience: int = 10
     replay_manifest: str = ""
@@ -90,7 +91,7 @@ class TrainingOptions:
         for name in ("loader_workers", "patience", "batch_token_budget", "dit_chunk_size"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        for name in ("gradient_checkpointing", "require_precomputed_features", "offload_frozen_encoders", "bucket_by_length"):
+        for name in ("gradient_checkpointing", "require_precomputed_features", "offload_frozen_encoders", "bucket_by_length", "validation_all_targets"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
         if self.require_precomputed_features and not self.cache_dir:
@@ -521,13 +522,15 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
 
         def evaluate():
             nonlocal best, bad
-            metrics = validate_model(tts, cache, validation, opts, seed + 10000)
+            metrics = validate_model(tts, cache, validation, opts, seed + 10000,
+                                     all_targets=opts.validation_all_targets)
             if not all(math.isfinite(x) for x in metrics.values()):
                 raise FloatingPointError("Non-finite validation metrics")
             for key, value in metrics.items():
                 writer.add_scalar("validation/" + key, value, step)
             with (out / "validation_metrics.jsonl").open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"step": step, **metrics}) + "\n")
+                stream.write(json.dumps({"step": step, **({"targets": len(validation.rows)}
+                    if opts.validation_all_targets else {}), **metrics}) + "\n")
             log(f"[validation] step={step} loss={metrics['loss']:.6f} flow={metrics['flow']:.6f} stop={metrics['stop']:.6f}")
             log(f"[stop-validation] terminal_recall@0.5={metrics['stop_terminal_recall_05']:.3f} "
                 f"early_any@0.5={metrics['stop_early_any_05']:.3f}; "

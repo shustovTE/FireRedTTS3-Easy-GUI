@@ -1,5 +1,9 @@
 # Короткие нейтральные вопросы и ответы: Dialogs после YO
 
+Для нового режима **только Dialogs от исходной base, без обрезки окончаний** см.
+[подготовку, очистку YO и фоновый запуск](DIALOGS_ONLY_FROM_BASE.md).
+Описанный ниже старый этап 04 использует YO replay и предыдущий адаптер.
+
 Источник: [langswap/dialogs-ru-emotional-conversations](https://huggingface.co/datasets/langswap/dialogs-ru-emotional-conversations),
 revision `a74ff44d8d27ca3d21098ea3ed4d31a32923fbdd`. Используем только авторский
 `train.csv`; оригинальные `val.csv` и `test.csv` в новый этап не включаем.

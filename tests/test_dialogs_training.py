@@ -85,6 +85,23 @@ class DialogsTrainingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'text leakage'):
             prepare_run_data(self.train,replace(self.options,adaptation_validation_manifest=str(self.root/'bad.jsonl')),1234)
 
+    def test_dialogs_only_coverage_evaluates_every_holdout_target_without_sampling(self):
+        opts = replace(self.options, validation_manifest=str(self.domain), validation_scope='recording',
+            adaptation_validation_manifest='', replay_manifest='', replay_ratio=0.,
+            sampling_strategy='coverage', validation_pairs=1, validation_all_targets=True)
+        with patch('fireredtts3_local.training_run.require_training_hardware'), \
+             patch('fireredtts3_local.training_run.model_identity', return_value='toy'), \
+             patch('fireredtts3_local.training_data.SpeakerPairs.sample',
+                   side_effect=AssertionError('Full coverage/validation must not sample targets')):
+            train_lora(toy.Manager(), self.train, self.root/'dialogs-only', rank=2, alpha=4,
+                       length_mode='Epochs', training_epochs=2, gradient_accumulation=1,
+                       save_every=1, options=opts, log=lambda _: None)
+        scores = [json.loads(line) for line in (self.root/'dialogs-only/validation_metrics.jsonl').read_text().splitlines()]
+        self.assertEqual([(r['step'], r['targets']) for r in scores], [(0,4), (3,4), (6,4)])
+        coverage = [json.loads(line) for line in (self.root/'dialogs-only/coverage.jsonl').read_text().splitlines()]
+        self.assertEqual([r['targets'] for r in coverage], [10,10])
+        self.assertTrue(all(not r.get('replay_targets') for r in coverage))
+
     def test_precompute_both_validations_and_exact_resumed_training(self):
         from fireredtts3_local.training import STOP_EVENT
         opts=replace(self.options,require_precomputed_features=True,offload_frozen_encoders=True)

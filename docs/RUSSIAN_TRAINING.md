@@ -459,6 +459,7 @@ backbone_dit при одном split и сопоставимом бюджете.
 | `replay_ratio` | Вероятность выбрать replay для каждой пары; 0.2 — исходная гипотеза |
 | `preservation_weight` | MSE flow-предсказаний и вероятностей остановки против base с отключённой LoRA |
 | `validation_pairs` | Число фиксированных, воспроизводимо выбранных пар для оценки loss |
+| `validation_all_targets` | При `true` основная валидация использует каждый отложенный target один раз; `validation_pairs` не применяется |
 | `patience` | Число validation без улучшения; 0 отключает early stopping |
 | `patches_per_example` | Число выбранных целевых патчей или `"all"` для всех патчей |
 | `validation_patches_per_example` | Отдельный бюджет validation; `null` наследует обучающий |
