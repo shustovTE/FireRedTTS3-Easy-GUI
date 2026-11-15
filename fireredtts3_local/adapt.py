@@ -75,11 +75,20 @@ def main():
     compare.add_argument("adapted")
     compare.add_argument("--max-sim-drop", type=float, default=.02)
     compare.add_argument("--max-wer-increase", type=float, default=.01)
-    export = commands.add_parser("export", help="Merge the entire Base core and package for SGLang Omni")
+    export = commands.add_parser("export", help="Merge the full core and build a verified SGLang Omni release")
     export.add_argument("--base", required=True, help="Original FireRedTeam/FireRedTTS3 directory")
     export.add_argument("--adapter", required=True)
-    export.add_argument("--sglang-config", required=True, help="Compatible CKermit config.json")
+    export.add_argument("--sglang-config", help="Legacy local-config export, without the verified Hub release workflow")
     export.add_argument("--output", required=True)
+    export.add_argument("--sglang-repo", default="CKermit/FireRedTTS3-Base")
+    export.add_argument("--sglang-revision", default="53f8b59c3252f15d539a9205fbcab3e334a36b9f")
+    export.add_argument("--template-cache", default=".runtime/export-templates")
+    export.add_argument("--evaluation-baseline", help="Optional existing baseline report, summarized without reference audio/text")
+    export.add_argument("--evaluation-adapted", help="Existing report for the adapter being merged")
+    publish = commands.add_parser("publish", help="Upload a verified model release to the account of the local HF token")
+    publish.add_argument("export_dir")
+    publish.add_argument("--repo-name", default="FireRedTTS3-Base-Russian")
+    publish.add_argument("--public", action="store_true", help="Create a public model repository (otherwise private)")
     args = parser.parse_args()
     if args.command == "prepare-yo":
         from .yo_dataset import import_yo
@@ -171,8 +180,20 @@ def main():
         if not report["automatic_gate_passed"]:
             raise SystemExit(1)
     elif args.command == "export":
-        from .export import export_merged
-        export_merged(args.base, args.adapter, args.sglang_config, args.output)
+        if args.sglang_config:
+            if args.evaluation_baseline or args.evaluation_adapted:
+                parser.error("Evaluation summaries require the verified Hub-template export (omit --sglang-config)")
+            from .export import export_merged
+            export_merged(args.base, args.adapter, args.sglang_config, args.output)
+        else:
+            from .release import build_release
+            print(json.dumps(build_release(args.base, args.adapter, args.output,
+                template_repo=args.sglang_repo, template_revision=args.sglang_revision,
+                template_cache=args.template_cache, evaluation_baseline=args.evaluation_baseline,
+                evaluation_adapted=args.evaluation_adapted), ensure_ascii=False, indent=2))
+    elif args.command == "publish":
+        from .release import publish_release
+        print(json.dumps(publish_release(args.export_dir, args.repo_name, public=args.public), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

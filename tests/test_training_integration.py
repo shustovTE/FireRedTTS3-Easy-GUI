@@ -141,7 +141,8 @@ class ExportTests(unittest.TestCase):
             for name,parameter in core.named_parameters():
                 if 'lora_B' in name:parameter.data.fill_(.1)
             core.save_pretrained(root/'adapter')
-            (root/'adapter'/'firered_lora_metadata.json').write_text(json.dumps({'base_fingerprint':model_identity(base)}))
+            (root/'adapter'/'firered_lora_metadata.json').write_text(json.dumps({
+                'base_fingerprint':model_identity(base), 'recipe':{'options':{'profile':'backbone_dit'}}}))
             export_merged(base,root/'adapter',root/'config.json',root/'export')
             exported=load_file(str(root/'export'/'model.safetensors'))
             self.assertEqual(exported.keys(),original.keys())

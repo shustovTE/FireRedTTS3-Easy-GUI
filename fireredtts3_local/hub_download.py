@@ -101,7 +101,7 @@ def wait_seconds(seconds):
 
 
 def download_files(source, names, repo, revision, *, interval=2., max_retries=8,
-                   log=print, progress=None, authenticated=False, transport='http'):
+                   log=print, progress=None, authenticated=False, transport='http', repo_type='dataset'):
     """Download only missing/invalid files, one file at a time.
 
     Completed files are hashed locally before any Hub call. The normal Hub
@@ -117,6 +117,8 @@ def download_files(source, names, repo, revision, *, interval=2., max_retries=8,
         raise ValueError('Invalid download interval or retry budget')
     if transport not in {'http', 'xet'} or type(authenticated) is not bool:
         raise ValueError('Invalid Hub transport/authentication setting')
+    if repo_type not in {'dataset', 'model'}:
+        raise ValueError('Unsupported Hub repository type')
     source = Path(source).resolve()
     names = list(dict.fromkeys(names))
     for name in names:
@@ -147,7 +149,7 @@ def download_files(source, names, repo, revision, *, interval=2., max_retries=8,
                     try:
                         # Force replacement only for a present but unverified
                         # file; a missing final file keeps its partial download.
-                        hf_hub_download(repo, name, repo_type='dataset', revision=revision,
+                        hf_hub_download(repo, name, repo_type=repo_type, revision=revision,
                                         local_dir=source, force_download=local_target(source, name).is_file(),
                                         **({'token': True} if authenticated else {}))
                         if not verified_local(source, name, revision):

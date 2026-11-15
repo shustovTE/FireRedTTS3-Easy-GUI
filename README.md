@@ -397,6 +397,8 @@ For a larger YO stage, see [authenticated Parquet expansion](docs/YO_EXPANSION.m
 
 After expansion, use the [YO training stage guide](docs/YO_HALF_TRAINING.md) to audit the manifests, retain short Dialogs replay, and launch a resumable pilot followed by one complete pass over the new YO targets.
 
+To serve the adapted model, see [LoRA merging and Hugging Face publication](docs/MERGE_AND_PUBLISH.md): build a complete CKermit-compatible SGLang Omni package, verify merged tensors/tokenizer, and publish an explicit file manifest under the authenticated HF account.
+
 ### Training Length Mode
 
 Training uses one explicit unit at a time.
