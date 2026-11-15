@@ -143,7 +143,7 @@ def prepare_run_data(manifest, options, seed, *, include_adaptation_validation=F
         assert_disjoint(validation, adaptation, 'speaker')
         # Secondary validation may use known voices, but not the same words.
         from .dialogs_dataset import lexical_key
-        if {lexical_key(r['text']) for r in train} & {lexical_key(r['text']) for r in adaptation}:
+        if {lexical_key(r['text']) for r in train + replay} & {lexical_key(r['text']) for r in adaptation}:
             raise ValueError('Adaptation train/validation text leakage')
     result = (SpeakerPairs(train, *pair_args), SpeakerPairs(validation, *pair_args),
               SpeakerPairs(replay, *pair_args) if replay else None)

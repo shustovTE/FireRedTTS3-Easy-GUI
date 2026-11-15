@@ -395,6 +395,8 @@ For short neutral questions and replies, see [Dialogs preparation and training](
 
 For a larger YO stage, see [authenticated Parquet expansion](docs/YO_EXPANSION.md): select an additional half of the shards, verify and remove only the old raw files, resume extraction by shard, and preserve historical speaker holdouts.
 
+After expansion, use the [YO training stage guide](docs/YO_HALF_TRAINING.md) to audit the manifests, retain short Dialogs replay, and launch a resumable pilot followed by one complete pass over the new YO targets.
+
 ### Training Length Mode
 
 Training uses one explicit unit at a time.

@@ -79,6 +79,11 @@ class DialogsTrainingTests(unittest.TestCase):
         write_manifest(self.root/'bad.jsonl',rows)
         with self.assertRaisesRegex(ValueError,'text leakage'):
             prepare_run_data(self.train,replace(self.options,adaptation_validation_manifest=str(self.root/'bad.jsonl')),1234)
+        rows=load_manifest(self.domain)
+        rows[0]['text']=load_manifest(self.replay)[0]['text']
+        write_manifest(self.root/'bad.jsonl',rows)
+        with self.assertRaisesRegex(ValueError,'text leakage'):
+            prepare_run_data(self.train,replace(self.options,adaptation_validation_manifest=str(self.root/'bad.jsonl')),1234)
 
     def test_precompute_both_validations_and_exact_resumed_training(self):
         from fireredtts3_local.training import STOP_EVENT
