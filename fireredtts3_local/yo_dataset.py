@@ -137,7 +137,8 @@ def iter_records(paths):
 
 def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
               max_speaker_minutes=30.0, source_revision="", log=print,
-              segmentation="bounded"):
+              segmentation="bounded", *, import_state=None, finalize_pairs=True,
+              allow_empty=False, excluded_utterances=None):
     if not source_revision.strip():
         raise ValueError("Record the YO-CPT-ru source revision for reproducibility")
     if segmentation not in {"bounded", "complete-utterance"}:
@@ -150,9 +151,12 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
     if root.exists() and any(root.iterdir()):
         raise ValueError("Import output must be a new/empty directory")
     (root / "audio").mkdir(parents=True, exist_ok=True)
-    manifest, rejected, seconds = [], Counter(), Counter()
-    seen = set()
-    total = 0.0
+    state = import_state if import_state is not None else {}
+    manifest, rejected = [], Counter()
+    seconds = state.setdefault('seconds', Counter())
+    seen = state.setdefault('seen', set())
+    excluded_utterances = excluded_utterances or set()
+    total = state.get('total', 0.)
     for row, base in iter_records(paths):
         if total >= hours_budget:
             break
@@ -161,6 +165,8 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
             if utt in seen:
                 raise ValueError("duplicate_utterance")
             seen.add(utt)
+            if utt in excluded_utterances:
+                raise ValueError('previously_used_utterance')
             if row.get("lang") != "ru" or not math.isfinite(float(row["mos_score"])) or float(row["mos_score"]) < min_mos:
                 raise ValueError("language_or_quality")
             speaker = str(row.get("local_spk_id") or "")
@@ -223,12 +229,13 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
         speaker_hashes[item["speaker_id"]].add(item["audio_sha256"])
     kept = []
     for item in manifest:
-        if len(speaker_hashes[item["speaker_id"]]) < 2:
+        if finalize_pairs and len(speaker_hashes[item["speaker_id"]]) < 2:
             rejected["segments_without_distinct_reference"] += 1
             (root / item["audio"]).unlink()
         else:
             kept.append(item)
     manifest = kept
+    state['total'] = total
     total = sum(item["end"] - item["start"] for item in manifest)
     write_manifest(root / "manifest.jsonl", manifest)
     report = {"accepted_segments": len(manifest), "hours": total/3600, "local_speakers": len({r["speaker_id"] for r in manifest}),
@@ -242,6 +249,6 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
               "note": "Automatic filtering; inspect audio, text and speaker identities before training. Input order affects capped subsets."}
     (root / "import_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     log(json.dumps(report, ensure_ascii=False))
-    if not manifest:
+    if not manifest and not allow_empty:
         raise ValueError("No usable aligned segments; see import_report.json")
     return root / "manifest.jsonl"

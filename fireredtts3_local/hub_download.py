@@ -101,19 +101,22 @@ def wait_seconds(seconds):
 
 
 def download_files(source, names, repo, revision, *, interval=2., max_retries=8,
-                   log=print, progress=None):
-    """Download only missing/invalid files, one HTTP transfer at a time.
+                   log=print, progress=None, authenticated=False, transport='http'):
+    """Download only missing/invalid files, one file at a time.
 
     Completed files are hashed locally before any Hub call. The normal Hub
     downloader retains its .incomplete files and resumes interrupted transfers.
-    Xet is disabled only for this serial operation, avoiding per-file Xet-token
-    requests; HTTP rate limits still cause backoff, never an immediate fallback.
+    HTTP is the default for many small files. Large authenticated Parquet jobs
+    can explicitly use Xet. Both modes honor rate backoff. A stored token is
+    requested with token=True and never included in reports or log messages.
     """
     from huggingface_hub import constants, hf_hub_download
     if not re.fullmatch(r'[0-9a-f]{40}', revision):
         raise ValueError('Downloads require an immutable commit SHA')
     if not math.isfinite(interval) or interval < 0 or type(max_retries) is not int or not 0 <= max_retries <= 20:
         raise ValueError('Invalid download interval or retry budget')
+    if transport not in {'http', 'xet'} or type(authenticated) is not bool:
+        raise ValueError('Invalid Hub transport/authentication setting')
     source = Path(source).resolve()
     names = list(dict.fromkeys(names))
     for name in names:
@@ -125,9 +128,9 @@ def download_files(source, names, repo, revision, *, interval=2., max_retries=8,
             progress(dict(state))
     last_request = None
     old_xet = constants.HF_HUB_DISABLE_XET
-    constants.HF_HUB_DISABLE_XET = True
+    constants.HF_HUB_DISABLE_XET = transport == 'http'
     try:
-        log(f'[download] {len(names)} files; serial HTTP; interval={interval:g}s; verifying local cache')
+        log(f'[download] {len(names)} files; transport={transport}; interval={interval:g}s; verifying local cache')
         emit()
         for name in names:
             state.update(status='running', current_file=name, retry_wait_seconds=0.)
@@ -145,7 +148,8 @@ def download_files(source, names, repo, revision, *, interval=2., max_retries=8,
                         # Force replacement only for a present but unverified
                         # file; a missing final file keeps its partial download.
                         hf_hub_download(repo, name, repo_type='dataset', revision=revision,
-                                        local_dir=source, force_download=local_target(source, name).is_file())
+                                        local_dir=source, force_download=local_target(source, name).is_file(),
+                                        **({'token': True} if authenticated else {}))
                         if not verified_local(source, name, revision):
                             raise DownloadIntegrityError(f'Download failed commit/content verification: {name}')
                         break

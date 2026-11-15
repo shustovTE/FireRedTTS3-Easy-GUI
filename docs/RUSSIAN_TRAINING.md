@@ -60,6 +60,10 @@ uv sync --frozen --extra data --no-install-project
 
 ## Импорт YO-CPT-ru
 
+Для расширения после пилотов есть [отдельный процесс](YO_EXPANSION.md):
+авторизованная загрузка новой половины Parquet, проверяемое удаление старых
+исходников и возобновляемое извлечение целых реплик с историческими anchors.
+
 Скачайте выбранные Parquet shards из [YO-CPT-ru](https://huggingface.co/datasets/NCSpeech/YO-CPT-ru)
 с фиксированным commit SHA. Можно использовать `huggingface_hub.hf_hub_download`
 с `repo_type="dataset"`, `filename="data/ru000-000.parquet"`, `revision=SHA`.

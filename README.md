@@ -393,6 +393,8 @@ For whole punctuated utterances of unrestricted duration, use the separate [comp
 
 For short neutral questions and replies, see [Dialogs preparation and training](docs/DIALOGS_TRAINING.md): per-actor question/statement/random thirds, 30 training minutes plus additional session-disjoint validation, and the [Dialogs recipe](recipes/russian_dialogs_96gb.json) with YO replay and separate unseen-voice validation.
 
+For a larger YO stage, see [authenticated Parquet expansion](docs/YO_EXPANSION.md): select an additional half of the shards, verify and remove only the old raw files, resume extraction by shard, and preserve historical speaker holdouts.
+
 ### Training Length Mode
 
 Training uses one explicit unit at a time.

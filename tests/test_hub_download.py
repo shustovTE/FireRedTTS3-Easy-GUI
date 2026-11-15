@@ -53,6 +53,19 @@ class HubDownloadTests(unittest.TestCase):
         self.assertTrue(result['complete'])
         self.assertEqual(constants.HF_HUB_DISABLE_XET,old)
 
+    def test_large_shard_transport_uses_stored_auth_without_recording_token(self):
+        old=constants.HF_HUB_DISABLE_XET
+        def fetch(repo,name,**options):
+            self.assertIs(options['token'],True)
+            self.assertFalse(constants.HF_HUB_DISABLE_XET)
+            return self.receipt(name)
+        with patch('huggingface_hub.hf_hub_download',side_effect=fetch):
+            result=download_files(self.root,['data/shard.parquet'],REPO,REVISION,
+                authenticated=True,transport='xet',log=lambda _:None)
+        self.assertTrue(result['complete'])
+        self.assertNotIn('token',result)
+        self.assertEqual(constants.HF_HUB_DISABLE_XET,old)
+
     def test_429_waits_before_retry_and_next_file_using_http(self):
         events=[]
         first=True
