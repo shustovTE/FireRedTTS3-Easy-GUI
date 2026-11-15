@@ -57,7 +57,7 @@ def signal_levels(audio, sample_rate):
                 note="One-second unweighted RMS; pauses and phonemes affect levels. No audio normalization.")
 
 
-def run_native(root, release, base, seed=1234, threshold=.5):
+def run_native(root, release, base, seed=1234, threshold=.5, *, original_base=False):
     import os
     import soundfile as sf
     import torch
@@ -89,23 +89,34 @@ def run_native(root, release, base, seed=1234, threshold=.5):
     if audio.shape[1] != 1:
         raise ValueError("Expected the stored mono reference; do not change channels between backends")
     prompt = torch.from_numpy(audio.T.copy())
-    output = root / "native"
-    output.mkdir(exist_ok=False)
+    output = root / ("native-base" if original_base else "native")
     settings = dict(release_id=manifest["release_id"], reference_sha256=reference["reference_sha256"],
                     seed=seed, language="Russian", stop_threshold=threshold, n_timesteps=10,
                     inference_cfg=2.0, min_patches=6, max_patches=400, split_text=False,
                     text_normalization=False, attention="sdpa", torch_compile=False,
                     weights="exact merged core shards; original verified native tokenizer/RedAE/CAM++",
                     note="Same seed and weights do not imply identical RNG streams or numerical execution across backends.")
-    write_json(root / "comparison_settings.json", settings)
+    if original_base:
+        previous = json.loads((root / "comparison_settings.json").read_text())
+        for key in ("release_id", "reference_sha256", "seed", "language", "stop_threshold",
+                    "n_timesteps", "inference_cfg", "min_patches", "max_patches",
+                    "split_text", "text_normalization", "attention", "torch_compile"):
+            if settings[key] != previous[key]:
+                raise ValueError(f"Original-base control would change {key}")
+        settings.update(release_id=None, compared_release_id=manifest["release_id"],
+                        base_fingerprint=provenance["base_fingerprint"],
+                        weights="original pretrained base; no adapter or merged core")
+    output.mkdir(exist_ok=False)
+    write_json(output / "settings.json" if original_base else root / "comparison_settings.json", settings)
     os.environ["FIRERED_ATTN_IMPLEMENTATION"] = "sdpa"
     from .model_manager import ModelManager
     ModelManager._ensure_upstream_namespace()
     from fireredtts3.llm.fireredtts3_base import FireRedTTS3Base
     report = dict(complete=False, results=[])
     with tempfile.TemporaryDirectory(prefix="firered-native-view-") as temporary:
-        view = prepare_native_view(base, release, Path(temporary) / "model")
-        print("[native-compare] Loading merged weights through the upstream native generator...", flush=True)
+        view = base if original_base else prepare_native_view(base, release, Path(temporary) / "model")
+        kind = "original pretrained base (no LoRA)" if original_base else "merged weights"
+        print(f"[native-compare] Loading {kind} through the upstream native generator...", flush=True)
         tts = FireRedTTS3Base(str(view))
         try:
             for module in (tts.tts_core, tts.redae, tts.spk_extractor):
@@ -144,6 +155,32 @@ def run_native(root, release, base, seed=1234, threshold=.5):
         finally:
             del tts
             torch.cuda.empty_cache()
+
+
+def run_baseline(root, release, base):
+    """Repeat a completed comparison on its original base, keeping other inputs."""
+    if root is None:
+        candidates = [path.parent for path in Path("training/eval").glob("native-sglang-07-*/comparison.json")]
+        if not candidates:
+            raise ValueError("No completed native/SGLang comparison found; supply its directory")
+        root = max(candidates, key=lambda path: (path / "comparison.json").stat().st_mtime_ns)
+    root = Path(root).resolve()
+    previous = json.loads((root / "comparison_settings.json").read_text())
+    if not json.loads((root / "native/report.json").read_text())["complete"]:
+        raise ValueError("The adapted native comparison must be complete first")
+    print(f"[native-base] Reusing reference and texts from: {root}", flush=True)
+    run_native(root, release, base, previous["seed"], previous["stop_threshold"], original_base=True)
+    files = [root / "comparison_settings.json", root / "native-base/settings.json"]
+    for folder in ("native", "native-base"):
+        files.append(root / folder / "report.json")
+        for case in CASES:
+            files.extend(root / folder / f"{case}{suffix}"
+                         for suffix in (".wav", ".float.wav", ".raw_levels.json", ".stop_scores.json"))
+    archive_path = root / "native-base-audio.zip"
+    with zipfile.ZipFile(archive_path, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in files:
+            archive.write(path, path.relative_to(root))
+    print(f"[native-base] Original-base and adapted audio: {archive_path}", flush=True)
 
 
 def summarize(root):
@@ -204,10 +241,16 @@ def main():
     native.add_argument("--base", default="models/FireRedTTS3")
     native.add_argument("--seed", type=int, default=1234)
     native.add_argument("--stop-threshold", type=float, default=.5)
+    baseline = commands.add_parser("baseline", help="Original base, same inputs as the latest completed comparison")
+    baseline.add_argument("root", nargs="?", help="Comparison directory; default: latest completed run")
+    baseline.add_argument("--release", default="training/exports/FireRedTTS3-Base-Russian-20s-07")
+    baseline.add_argument("--base", default="models/FireRedTTS3")
     commands.add_parser("summarize").add_argument("root")
     args = parser.parse_args()
     if args.command == "native":
         run_native(args.root, args.release, args.base, args.seed, args.stop_threshold)
+    elif args.command == "baseline":
+        run_baseline(args.root, args.release, args.base)
     else:
         summarize(args.root)
 

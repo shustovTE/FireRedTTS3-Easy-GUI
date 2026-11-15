@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 from huggingface_hub.errors import RepositoryNotFoundError
@@ -139,6 +139,47 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(core.state_dict().keys(), expected.keys())
         for key, tensor in core.state_dict().items():
             torch.testing.assert_close(tensor, expected[key], rtol=0, atol=0)
+
+    def test_original_base_control_keeps_reference_settings_and_uses_unmerged_directory(self):
+        import soundfile as sf
+        from fireredtts3_local.native_comparison import run_native, run_baseline
+        import zipfile
+        self.build()
+        release = self.root / "release"
+        run = self.root / "comparison"
+        (run / "texts").mkdir(parents=True)
+        for case in ("cities", "timofey"):
+            (run / "texts" / f"{case}.txt").write_text("Тест.", encoding="utf-8")
+        for source, target in (("release_manifest.json", "deployed_manifest.json"),
+                               ("export_provenance.json", "deployed_provenance.json")):
+            shutil.copyfile(release / source, run / target)
+        sf.write(run / "reference.wav", torch.ones(480).numpy() * .1, 24000)
+        write_json(run / "reference.json", dict(reference_text="Референс.",
+                   reference_sha256=file_digest(run / "reference.wav")))
+        fake = MagicMock()
+        fake.generate.return_value = (torch.ones(1, 480) * .2, 24000)
+        with patch("torch.cuda.is_available", return_value=True), \
+             patch("torch.cuda.empty_cache"), \
+             patch("fireredtts3.llm.fireredtts3_base.FireRedTTS3Base", return_value=fake) as constructor:
+            run_native(run, release, self.base, seed=4321, threshold=.3)
+            original_settings = (run / "comparison_settings.json").read_bytes()
+            original_audio = (run / "native/cities.wav").read_bytes()
+            with patch("fireredtts3_local.native_comparison.prepare_native_view") as merge_view:
+                run_baseline(run, release, self.base)
+                merge_view.assert_not_called()
+            self.assertEqual(constructor.call_args.args, (str(self.base.resolve()),))
+        self.assertEqual((run / "comparison_settings.json").read_bytes(), original_settings)
+        self.assertEqual((run / "native/cities.wav").read_bytes(), original_audio)
+        control = json.loads((run / "native-base/settings.json").read_text())
+        self.assertIsNone(control["release_id"])
+        self.assertEqual(control["base_fingerprint"], model_identity(self.base))
+        for call in fake.generate.call_args_list:
+            self.assertEqual((call.kwargs["seed"], call.kwargs["stop_threshold"]), (4321, .3))
+            self.assertEqual(call.kwargs["prompt_text"], "Референс.")
+        with zipfile.ZipFile(run / "native-base-audio.zip") as archive:
+            names = archive.namelist()
+            self.assertEqual(len([name for name in names if name.endswith(".wav")]), 8)
+            self.assertFalse(any("reference" in name for name in names))
 
     def test_backbone_only_adapter_keeps_all_acoustic_and_speaker_tensors(self):
         from fireredtts3.llm.fireredtts3_base import FireRedTTS3BaseCore
