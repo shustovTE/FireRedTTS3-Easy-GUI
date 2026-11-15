@@ -124,6 +124,22 @@ class ReleaseTests(unittest.TestCase):
                 prepare_template(self.base, TEMPLATE_REPO, TEMPLATE_REVISION, self.root / "cache", lambda _: None)
             download.assert_not_called()
 
+    def test_native_comparison_loads_the_same_merged_tensors_with_native_config(self):
+        from fireredtts3_local.native_comparison import prepare_native_view
+        from fireredtts3.llm.fireredtts3_base import FireRedTTS3BaseCore
+        self.build()
+        view = prepare_native_view(self.base, self.root / "release", self.root / "native-view")
+        self.assertEqual((view / "fireredtts3_base/config.json").read_bytes(),
+                         (self.base / "fireredtts3_base/config.json").read_bytes())
+        self.assertTrue((view / "fireredtts3_base/model.safetensors").is_symlink())
+        core, loading = FireRedTTS3BaseCore.from_pretrained(view / "fireredtts3_base", output_loading_info=True)
+        self.assertFalse(loading["missing_keys"])
+        self.assertFalse(loading["unexpected_keys"])
+        expected = load_file(self.root / "release/model.safetensors")
+        self.assertEqual(core.state_dict().keys(), expected.keys())
+        for key, tensor in core.state_dict().items():
+            torch.testing.assert_close(tensor, expected[key], rtol=0, atol=0)
+
     def test_backbone_only_adapter_keeps_all_acoustic_and_speaker_tensors(self):
         from fireredtts3.llm.fireredtts3_base import FireRedTTS3BaseCore
         core = FireRedTTS3BaseCore.from_pretrained(self.base / "fireredtts3_base")

@@ -6,17 +6,35 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 diag_container="${1:-sglang-fire-tts-firered-tts3-1}"
 diag_voice="${2:-Dovbish_Anastasiia}"
 diag_text_file="${DIAG_TEXT_FILE:-}"
+diag_reference_dir="${DIAG_REFERENCE_DIR:-}"
 if [ -n "$diag_text_file" ] && [ ! -f "$diag_text_file" ]; then
   printf 'Text file not found: %s\n' "$diag_text_file" >&2
   exit 2
 fi
+if [ -n "$diag_reference_dir" ]; then
+  test -f "$diag_reference_dir/reference.wav"
+  test -f "$diag_reference_dir/reference.json"
+fi
 mkdir -p training/eval
-diag_output=$(mktemp -d "$PWD/training/eval/long-speech-XXXXXXXX")
-diag_remote="/tmp/$(basename "$diag_output")"
+if [ -n "${DIAG_OUTPUT_DIR:-}" ]; then
+  mkdir -p "$(dirname "$DIAG_OUTPUT_DIR")"
+  mkdir "$DIAG_OUTPUT_DIR"
+  diag_output=$(cd "$DIAG_OUTPUT_DIR" && pwd)
+else
+  diag_output=$(mktemp -d "$PWD/training/eval/long-speech-XXXXXXXX")
+fi
+diag_remote="/tmp/$(basename "$diag_output")-$$-$RANDOM"
 diag_remote_text=""
+diag_remote_reference=""
 if [ -n "$diag_text_file" ]; then
   diag_remote_text="$diag_remote.input.txt"
   docker cp "$diag_text_file" "$diag_container:$diag_remote_text"
+fi
+if [ -n "$diag_reference_dir" ]; then
+  diag_remote_reference="$diag_remote.reference"
+  docker exec "$diag_container" mkdir "$diag_remote_reference"
+  docker cp "$diag_reference_dir/reference.wav" "$diag_container:$diag_remote_reference/reference.wav"
+  docker cp "$diag_reference_dir/reference.json" "$diag_container:$diag_remote_reference/reference.json"
 fi
 diag_status=0
 
@@ -26,7 +44,9 @@ docker exec -i -e DIAG_OUTPUT="$diag_remote" -e DIAG_VOICE="$diag_voice" \
   -e DIAG_WHOLE_TEXT="${DIAG_WHOLE_TEXT:-0}" \
   -e DIAG_READY_TIMEOUT="${DIAG_READY_TIMEOUT:-1800}" \
   -e DIAG_INPUT_FILE="$diag_remote_text" \
+  -e DIAG_REFERENCE_DIR="$diag_remote_reference" \
   "$diag_container" /opt/sglang/bin/python3 -u - <<'PY' || diag_status=$?
+import base64
 import hashlib
 import json
 import os
@@ -87,6 +107,20 @@ settings = {
     "custom_text": bool(input_file),
     "note": "Sequential direct requests. Identical seeds do not guarantee identical audio across stream modes. No resampling, normalization or added silence.",
 }
+explicit_reference = None
+reference_dir = os.environ.get("DIAG_REFERENCE_DIR", "")
+if reference_dir:
+    reference_dir = Path(reference_dir)
+    metadata = json.loads((reference_dir / "reference.json").read_text(encoding="utf-8"))
+    reference_bytes = (reference_dir / "reference.wav").read_bytes()
+    digest = hashlib.sha256(reference_bytes).hexdigest()
+    if digest != metadata["reference_sha256"] or not metadata["reference_text"].strip():
+        raise ValueError("Reference checksum mismatch or missing reference transcript")
+    explicit_reference = {"ref_audio": "data:audio/wav;base64," + base64.b64encode(reference_bytes).decode("ascii"),
+                          "ref_text": metadata["reference_text"]}
+    settings.update(reference_sha256=digest, reference_mode="explicit frozen WAV/text")
+settings["generation"] = dict(n_timesteps=10, inference_cfg=2.0, stop_threshold=threshold,
+                              min_patches=6, max_patches=400)
 try:
     settings["runtime_commit"] = subprocess.check_output(
         ["git", "-C", "/opt/firered-omni", "rev-parse", "HEAD"],
@@ -125,10 +159,11 @@ while True:
             next_notice = time.monotonic() + 30
         time.sleep(5)
 
-with http.open(api + "/v1/audio/voices", timeout=30) as response:
-    voices = json.load(response)
-if voice not in voices.get("voices", []):
-    raise RuntimeError(f"Stored voice {voice!r} not found")
+if explicit_reference is None:
+    with http.open(api + "/v1/audio/voices", timeout=30) as response:
+        voices = json.load(response)
+    if voice not in voices.get("voices", []):
+        raise RuntimeError(f"Stored voice {voice!r} not found")
 
 def read_wav(path):
     with wave.open(str(path), "rb") as wav:
@@ -148,8 +183,11 @@ for case, text in cases:
             "model": "FireRedTTS3-Base", "voice": voice, "language": "Russian",
             "input": text, "seed": seed, "stream": stream, "stream_format": "audio",
             "response_format": "pcm" if stream else "wav",
-            "stage_params": {"talker": {"stop_threshold": threshold}},
+            "stage_params": {"talker": settings["generation"]},
         }
+        if explicit_reference is not None:
+            payload.pop("voice")
+            payload.update(explicit_reference, task_type="Base")
         save_json(name + ".request.json", payload)
         row = {"name": name, "characters": len(text)}
         started = time.monotonic()
