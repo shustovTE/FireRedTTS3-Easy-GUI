@@ -5,9 +5,19 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 diag_container="${1:-sglang-fire-tts-firered-tts3-1}"
 diag_voice="${2:-Dovbish_Anastasiia}"
+diag_text_file="${DIAG_TEXT_FILE:-}"
+if [ -n "$diag_text_file" ] && [ ! -f "$diag_text_file" ]; then
+  printf 'Text file not found: %s\n' "$diag_text_file" >&2
+  exit 2
+fi
 mkdir -p training/eval
 diag_output=$(mktemp -d "$PWD/training/eval/long-speech-XXXXXXXX")
 diag_remote="/tmp/$(basename "$diag_output")"
+diag_remote_text=""
+if [ -n "$diag_text_file" ]; then
+  diag_remote_text="$diag_remote.input.txt"
+  docker cp "$diag_text_file" "$diag_container:$diag_remote_text"
+fi
 diag_status=0
 
 docker exec -i -e DIAG_OUTPUT="$diag_remote" -e DIAG_VOICE="$diag_voice" \
@@ -15,6 +25,7 @@ docker exec -i -e DIAG_OUTPUT="$diag_remote" -e DIAG_VOICE="$diag_voice" \
   -e DIAG_STOP_THRESHOLD="${DIAG_STOP_THRESHOLD:-0.5}" \
   -e DIAG_WHOLE_TEXT="${DIAG_WHOLE_TEXT:-0}" \
   -e DIAG_READY_TIMEOUT="${DIAG_READY_TIMEOUT:-1800}" \
+  -e DIAG_INPUT_FILE="$diag_remote_text" \
   "$diag_container" /opt/sglang/bin/python3 -u - <<'PY' || diag_status=$?
 import hashlib
 import json
@@ -49,19 +60,31 @@ sentences = [
     "Он поможет определиться с деталями и составит точный расчёт.",
     "Когда вам было бы удобно встретиться?",
 ]
-original = " ".join(sentences)
+input_file = os.environ.get("DIAG_INPUT_FILE", "")
+if input_file:
+    # Preserve paragraph breaks, punctuation and wording in a single request.
+    # No guessed sentence segmentation for arbitrary user-supplied text.
+    original = Path(input_file).read_text(encoding="utf-8-sig").strip()
+    if not original or len(original) > 2000:
+        raise ValueError("Custom input must contain 1..2000 characters")
+    sentences = []
+    whole_text = "1"
+    cases = [("long", original)]
+else:
+    original = " ".join(sentences)
+    # Whole text requires lifting the runtime's 400-character guard first.
+    whole_text = os.environ.get("DIAG_WHOLE_TEXT", "0")
+    if whole_text not in {"0", "1"}:
+        raise ValueError("DIAG_WHOLE_TEXT must be 0 or 1")
+    cases = [("long", original if whole_text == "1" else " ".join(sentences[:3]))]
+    cases.extend((f"sentence-{i:02d}", text) for i, text in enumerate(sentences, 1))
+    assert len(original) == 470 and len(cases[0][1]) == (470 if whole_text == "1" else 371)
 (root / "original_text.txt").write_text(original + "\n", encoding="utf-8")
-# Whole text requires lifting the runtime's 400-character guard first.
-whole_text = os.environ.get("DIAG_WHOLE_TEXT", "0")
-if whole_text not in {"0", "1"}:
-    raise ValueError("DIAG_WHOLE_TEXT must be 0 or 1")
-cases = [("long", original if whole_text == "1" else " ".join(sentences[:3]))]
-cases.extend((f"sentence-{i:02d}", text) for i, text in enumerate(sentences, 1))
-assert len(original) == 470 and len(cases[0][1]) == (470 if whole_text == "1" else 371)
 settings = {
     "voice": voice, "seed": seed, "stop_threshold": threshold,
     "original_characters": len(original), "long_characters": len(cases[0][1]),
     "whole_text": whole_text == "1",
+    "custom_text": bool(input_file),
     "note": "Sequential direct requests. Identical seeds do not guarantee identical audio across stream modes. No resampling, normalization or added silence.",
 }
 try:
@@ -180,7 +203,7 @@ for case, text in cases:
         results.append(row)
         save_json("summary.json", results)
 
-if not any("error" in row for row in results):
+if sentences and not any("error" in row for row in results):
     for mode in ("full", "stream"):
         params = None
         audio = bytearray()
