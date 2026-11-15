@@ -166,8 +166,35 @@ def example_mean(values, owners, count):
     return sums / counts.clamp_min(1)
 
 
+def stop_diagnostics(logits, targets, owners, count):
+    """Teacher-forced endpoint metrics, averaged per utterance, not per frame.
+
+    These expose a missed terminal event hidden by many correct negatives.
+    They do not change the objective or prove free-running generation quality.
+    Early-stop rates respect the inference minimum of six generated patches.
+    """
+    probabilities = logits.detach().sigmoid()
+    terminal = targets.bool()
+    lengths = torch.bincount(owners, minlength=count)
+    offsets = lengths.cumsum(0) - lengths
+    positions = torch.arange(len(owners), device=owners.device) - offsets[owners]
+    eligible = ~terminal & (positions >= 6)
+    result = {
+        "stop_terminal_probability": probabilities[terminal].mean(),
+        "stop_terminal_bce": F.binary_cross_entropy_with_logits(
+            logits.detach()[terminal], targets[terminal]),
+    }
+    for threshold, label in ((.3, "03"), (.5, "05")):
+        result[f"stop_terminal_recall_{label}"] = (probabilities[terminal] >= threshold).float().mean()
+        early = probabilities.new_zeros(count).index_add(
+            0, owners, ((probabilities >= threshold) & eligible).float())
+        result[f"stop_early_any_{label}"] = (early > 0).float().mean()
+    return result
+
+
 def batch_flow_loss(tts, examples, patches_per_example=8, cfg_dropout=.1,
-                    stop_weight=.05, samples=None, generator=None, dit_chunk_size=0):
+                    stop_weight=.05, samples=None, generator=None, dit_chunk_size=0,
+                    include_stop_diagnostics=False):
     if not examples:
         raise ValueError("Empty training batch")
     core = tts.tts_core
@@ -219,5 +246,8 @@ def batch_flow_loss(tts, examples, patches_per_example=8, cfg_dropout=.1,
         preservation = preservation.index_copy(0, retained_tensor, keep)
     weights = flow.new_tensor([e.preservation_weight for e in examples])
     total = flow + stop_weight*stop_loss + weights*preservation
-    return total.mean(), {"loss": total.detach().mean(), "flow": flow.detach().mean(),
-                          "stop": stop_loss.detach().mean(), "preservation": preservation.detach().mean()}
+    metrics = {"loss": total.detach().mean(), "flow": flow.detach().mean(),
+               "stop": stop_loss.detach().mean(), "preservation": preservation.detach().mean()}
+    if include_stop_diagnostics:
+        metrics.update(stop_diagnostics(stop, targets, stop_owner, count))
+    return total.mean(), metrics

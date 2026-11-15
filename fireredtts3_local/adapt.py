@@ -22,6 +22,8 @@ def main():
     prepare.add_argument("--max-seconds", type=float, default=10.0)
     prepare.add_argument("--segmentation", choices=["bounded", "complete-utterance"], default="bounded",
                          help="complete-utterance: whole records ending in . ! ?, no ellipsis or duration cap")
+    prepare.add_argument("--tail-padding-seconds", type=float,
+                         help="Complete utterances: end after final aligned word + this margin (e.g. 0.2)")
     prepare.add_argument("--max-hours", type=float, default=50.0, help="Total accepted hours; 0 processes all supplied shards")
     prepare.add_argument("--max-speaker-minutes", type=float, default=30.0)
     dialogs = commands.add_parser('plan-dialogs', help='Plan neutral <=10s Dialogs thirds with extra session-disjoint validation')
@@ -94,7 +96,7 @@ def main():
         from .yo_dataset import import_yo
         import_yo(args.inputs, args.output, args.min_mos, args.max_seconds,
                   args.max_hours, args.max_speaker_minutes, args.source_revision,
-                  segmentation=args.segmentation)
+                  segmentation=args.segmentation, tail_padding_seconds=args.tail_padding_seconds)
     elif args.command == 'plan-dialogs':
         from .dialogs_dataset import plan_dialogs
         report = plan_dialogs(args.source, args.output, args.source_revision, args.max_seconds,

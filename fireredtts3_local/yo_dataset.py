@@ -60,9 +60,10 @@ def has_sentence_ending(text):
 
 
 def aligned_segments(row, max_seconds=10.0, min_seconds=1.5, pause_seconds=0.18,
-                     segmentation="bounded"):
+                     segmentation="bounded", tail_padding_seconds=None):
     if segmentation not in {"bounded", "complete-utterance"}:
         raise ValueError("Unknown segmentation mode")
+    validate_tail_padding(tail_padding_seconds, segmentation)
     alignment = parse_alignment(row["text_alignment"])
     expected = [words(w["word"])[0] for w in alignment]
     if words(row["text"]) != expected:
@@ -80,9 +81,11 @@ def aligned_segments(row, max_seconds=10.0, min_seconds=1.5, pause_seconds=0.18,
             raise ValueError("invalid_duration")
         if alignment[-1]["end"] > duration + 0.025:
             raise ValueError("alignment_outside_audio")
-        # Preserve the whole source waveform, pauses and text. No duration cap,
-        # no concatenation of separate utterances, and no invented sentence end.
-        return [(0.0, duration, text)]
+        # parse_alignment excludes pause markers. Only the final lexical word
+        # sets the optional tail boundary; internal pauses and text stay intact.
+        end = duration if tail_padding_seconds is None else min(
+            duration, alignment[-1]["end"] + tail_padding_seconds)
+        return [(0.0, end, text)]
     spans = list(re.finditer(r"\w+", text))
     boundaries = []
     for i, current in enumerate(alignment):
@@ -115,6 +118,12 @@ def aligned_segments(row, max_seconds=10.0, min_seconds=1.5, pause_seconds=0.18,
     return segments
 
 
+def validate_tail_padding(seconds, segmentation="complete-utterance"):
+    if seconds is not None and (segmentation != "complete-utterance"
+            or type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0):
+        raise ValueError("Tail padding requires complete-utterance and finite nonnegative seconds")
+
+
 def iter_records(paths):
     for raw in paths:
         path = Path(raw)
@@ -138,11 +147,12 @@ def iter_records(paths):
 def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
               max_speaker_minutes=30.0, source_revision="", log=print,
               segmentation="bounded", *, import_state=None, finalize_pairs=True,
-              allow_empty=False, excluded_utterances=None):
+              allow_empty=False, excluded_utterances=None, tail_padding_seconds=None):
     if not source_revision.strip():
         raise ValueError("Record the YO-CPT-ru source revision for reproducibility")
     if segmentation not in {"bounded", "complete-utterance"}:
         raise ValueError("Unknown segmentation mode")
+    validate_tail_padding(tail_padding_seconds, segmentation)
     if (not all(math.isfinite(x) for x in (min_mos, max_seconds, max_hours, max_speaker_minutes))
             or max_seconds <= 0 or max_hours < 0 or max_speaker_minutes <= 0):
         raise ValueError("Invalid import limits")
@@ -176,9 +186,11 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
             if (not math.isfinite(duration) or duration <= 0
                     or (segmentation == "bounded" and duration > 120)):
                 raise ValueError("invalid_duration")
-            if seconds[speaker] + duration > max_speaker_minutes * 60:
+            segments = aligned_segments(row, max_seconds, segmentation=segmentation,
+                                        tail_padding_seconds=tail_padding_seconds)
+            budget_duration = duration if tail_padding_seconds is None else sum(b-a for a,b,_ in segments)
+            if seconds[speaker] + budget_duration > max_speaker_minutes * 60:
                 raise ValueError("speaker_budget")
-            segments = aligned_segments(row, max_seconds, segmentation=segmentation)
             audio = row["audio"]
             if isinstance(audio, dict) and audio.get("bytes") is not None:
                 audio = io.BytesIO(audio["bytes"])
@@ -195,9 +207,15 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
             if max(s[1] for s in segments) > len(signal)/sr + 0.025:
                 raise ValueError("alignment_outside_audio")
             if segmentation == "complete-utterance":
-                # Record actual sample duration, including a small allowed
-                # metadata discrepancy. Never silently drop trailing samples.
-                segments = [(0.0, len(signal)/sr, segments[0][2])]
+                # Use real sample duration rather than metadata when clamping.
+                segments = aligned_segments(dict(row, duration=len(signal)/sr),
+                    segmentation=segmentation, tail_padding_seconds=tail_padding_seconds)
+                if tail_padding_seconds is not None:
+                    # Round upward so the safety margin is never shortened.
+                    end = min(len(signal), math.ceil(segments[0][1]*sr))/sr
+                    segments = [(0.0, end, segments[0][2])]
+                    if seconds[speaker] + end > max_speaker_minutes * 60:
+                        raise ValueError("speaker_budget")
         except (ValueError, KeyError, TypeError, RuntimeError) as exc:
             rejected[str(exc) if isinstance(exc, ValueError) else type(exc).__name__] += 1
             continue
@@ -242,6 +260,7 @@ def import_yo(paths, output, min_mos=4.0, max_seconds=10.0, max_hours=50.0,
               "rejections": dict(rejected), "source_revision": source_revision,
               "min_distillmos": min_mos,
               "segmentation": segmentation,
+              "tail_padding_seconds": tail_padding_seconds,
               "max_segment_seconds": max_seconds if segmentation == "bounded" else None,
               "max_hours": max_hours or None, "max_speaker_minutes": max_speaker_minutes,
               "duration_seconds": {"min": min((r['end']-r['start'] for r in manifest), default=0),

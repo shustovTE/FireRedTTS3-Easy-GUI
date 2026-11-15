@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import random
+import re
 import time
 
 import torch
@@ -54,8 +55,12 @@ class TrainingOptions:
     sampling_strategy: str = "speaker_balanced"
     batch_token_budget: int = 0
     dit_chunk_size: int = 0
+    expected_base_fingerprint: str = ""
 
     def validate(self):
+        if not isinstance(self.expected_base_fingerprint, str) or (self.expected_base_fingerprint
+                and not re.fullmatch(r"[0-9a-f]{64}", self.expected_base_fingerprint)):
+            raise ValueError("expected_base_fingerprint must be an empty string or a SHA256")
         for name, value in asdict(self).items():
             if isinstance(value, (int, float)) and not math.isfinite(value):
                 raise ValueError(f"{name} must be finite")
@@ -113,6 +118,10 @@ class TrainingOptions:
         if isinstance(value, str):
             value = json.loads(value) if value.strip() else {}
         return cls(**(value or {})).validate()
+
+    def check_base(self, fingerprint):
+        if self.expected_base_fingerprint and self.expected_base_fingerprint != fingerprint:
+            raise ValueError("Base fingerprint differs from the recipe; use the original unmerged base model")
 
 
 def require_training_hardware():
@@ -297,7 +306,8 @@ def validate_model(tts, cache, pairs, options, seed, *, all_targets=False):
                 validation_patches = options.validation_patches_per_example or options.patches_per_example
                 _, metrics = batch_flow_loss(tts, examples, validation_patches,
                                              0.0, options.stop_weight, generator=generator,
-                                             dit_chunk_size=options.dit_chunk_size)
+                                             dit_chunk_size=options.dit_chunk_size,
+                                             include_stop_diagnostics=True)
                 for key, value in metrics.items():
                     values[key] = values.get(key, 0.0) + float(value)*len(examples)
         return {key: value/len(sampled) for key, value in values.items()}
@@ -418,8 +428,9 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
     try:
         # Always start from the clean base, never an inference adapter left in memory.
         manager.unload(log)
-        tts = manager.load_base(log=log, attention_backend=opts.attention_backend, torch_compile=False)
         base_fingerprint = model_identity(MODEL_DIR)
+        opts.check_base(base_fingerprint)
+        tts = manager.load_base(log=log, attention_backend=opts.attention_backend, torch_compile=False)
         if state and state.get("base_fingerprint") != base_fingerprint:
             raise ValueError("The base weights/tokenizer have changed since this checkpoint")
         if initial and initial["base_fingerprint"] != base_fingerprint:
@@ -518,6 +529,10 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             with (out / "validation_metrics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"step": step, **metrics}) + "\n")
             log(f"[validation] step={step} loss={metrics['loss']:.6f} flow={metrics['flow']:.6f} stop={metrics['stop']:.6f}")
+            log(f"[stop-validation] terminal_recall@0.5={metrics['stop_terminal_recall_05']:.3f} "
+                f"early_any@0.5={metrics['stop_early_any_05']:.3f}; "
+                f"terminal_recall@0.3={metrics['stop_terminal_recall_03']:.3f} "
+                f"early_any@0.3={metrics['stop_early_any_03']:.3f} (teacher-forced)")
             selection_loss = metrics['loss']
             if adaptation:
                 adapted_metrics = validate_model(tts, cache, adaptation, opts, seed + 20000, all_targets=True)

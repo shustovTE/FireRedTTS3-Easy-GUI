@@ -213,6 +213,7 @@ def precompute_recipe(recipe_path, base, repair=False, log=print):
     rows = train.rows + validation.rows + (replay.rows if replay else []) + (adaptation.rows if adaptation else [])
     require_training_hardware()
     fingerprint = model_identity(base)
+    options.check_base(fingerprint)
     pipeline = load_feature_pipeline(base, attention_backend=options.attention_backend)
     previous = os.environ.get('FIRERED_ATTN_IMPLEMENTATION')
     try:

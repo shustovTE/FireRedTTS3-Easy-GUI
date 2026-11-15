@@ -15,6 +15,24 @@ from .training_run import (TrainingOptions, initial_adapter_info, prepare_run_da
 from .yo_expansion import checked_rows, write_json
 
 
+def clean_dialogs_holdout(train, validation, replay, original_holdout, max_prompt_seconds=None):
+    """Keep actor/session holdout independent of both training corpora."""
+    assert_disjoint(train + replay, original_holdout, "recording")
+    assert_disjoint(validation, original_holdout, "speaker")
+    training_texts = {lexical_key(r["text"]) for r in train + replay}
+    collisions = [r for r in original_holdout if lexical_key(r["text"]) in training_texts]
+    candidates = [r for r in original_holdout if lexical_key(r["text"]) not in training_texts]
+    groups = defaultdict(list)
+    for row in candidates:
+        groups[(row["speaker_id"], row["language"])].append(row)
+    holdout = [r for group in groups.values() for r in group
+               if any(SpeakerPairs.distinct(r, ref) for ref in group
+                      if max_prompt_seconds is None or ref["duration"] <= max_prompt_seconds)]
+    if not holdout or {r["speaker_id"] for r in holdout} != {r["speaker_id"] for r in original_holdout}:
+        raise ValueError("Too few independent Dialogs holdout pairs; prepare additional validation before training")
+    return holdout, collisions, len(candidates) - len(holdout)
+
+
 def prepare_stage(expansion, output, recipe_path="recipes/russian_yo_half_96gb.json"):
     """Audit on CPU, keep every YO target, filter only the secondary holdout.
 
@@ -48,20 +66,8 @@ def prepare_stage(expansion, output, recipe_path="recipes/russian_yo_half_96gb.j
     original_holdout = checked_rows(options.adaptation_validation_manifest)
     if not train or not validation or not replay or not original_holdout:
         raise ValueError("YO train/validation and Dialogs train/validation must be nonempty")
-    # A source/audio collision is an error, not something to hide by filtering.
-    assert_disjoint(train + replay, original_holdout, "recording")
-    assert_disjoint(validation, original_holdout, "speaker")
-    training_texts = {lexical_key(r["text"]) for r in train + replay}
-    collisions = [r for r in original_holdout if lexical_key(r["text"]) in training_texts]
-    candidates = [r for r in original_holdout if lexical_key(r["text"]) not in training_texts]
-    groups = defaultdict(list)
-    for row in candidates:
-        groups[(row["speaker_id"], row["language"])].append(row)
-    holdout = [r for group in groups.values() for r in group
-               if any(SpeakerPairs.distinct(r, ref) for ref in group
-                      if options.max_prompt_seconds is None or ref["duration"] <= options.max_prompt_seconds)]
-    if not holdout or {r["speaker_id"] for r in holdout} != {r["speaker_id"] for r in original_holdout}:
-        raise ValueError("Too few independent Dialogs holdout pairs; prepare additional validation before training")
+    holdout, collisions, without_reference = clean_dialogs_holdout(
+        train, validation, replay, original_holdout, options.max_prompt_seconds)
     initial = initial_adapter_info(config["initial_adapter"], config["rank"], config["alpha"],
                                    config["dropout"], options.profile)
     config["initial_adapter"] = initial["path"]
@@ -91,7 +97,7 @@ def prepare_stage(expansion, output, recipe_path="recipes/russian_yo_half_96gb.j
                 for name, data in zip(("train", "validation", "replay", "dialogs_validation"), datasets)
             },
             "dialogs_validation_excluded_text_matches": [r["utt_id"] for r in collisions],
-            "dialogs_validation_excluded_without_reference": len(candidates) - len(holdout),
+            "dialogs_validation_excluded_without_reference": without_reference,
             "primary_examples_per_full_update": primary,
             "replay_examples_per_full_update": effective - primary,
             "replay_draws_per_epoch": full * (effective - primary) + round(partial * (effective - primary) / primary),
