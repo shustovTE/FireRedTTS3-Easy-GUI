@@ -376,6 +376,8 @@ For separate DiT/conditioning-projection attribution and an identical-history
 training/native forward check, see the [acoustic diagnostic](docs/ACOUSTIC_DIAGNOSTICS.md).
 To check whether shorter generations omit words, compare whole texts with
 complete sentences using the [sentence/ASR diagnostic](docs/SENTENCE_DIAGNOSTICS.md).
+For whole-utterance codec reconstruction and real-versus-generated acoustic
+history controls, use the [codec/history diagnostic](docs/HISTORY_DIAGNOSTICS.md).
 
 For confirmed spontaneous Russian speech after the fresh Dialogs-only stage, see
 **[Common Voice Spontaneous training](docs/COMMON_VOICE_SPONTANEOUS.md)**: pinned

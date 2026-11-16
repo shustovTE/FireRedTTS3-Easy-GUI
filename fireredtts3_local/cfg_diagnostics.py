@@ -37,7 +37,8 @@ def runtime_identity():
     files = sorted((root/'fireredtts3_upstream').rglob('*.py'))
     files += [root/'fireredtts3_local'/name for name in
               ('cfg_diagnostics.py', 'component_diagnostics.py', 'sentence_diagnostics.py',
-               'native_comparison.py', 'training_parity.py', 'training_batch.py',
+               'native_comparison.py', 'history_diagnostics.py', 'history_probe.py',
+               'training_parity.py', 'training_batch.py',
                'training_monitor.py', 'model_manager.py', 'hybrid.py',
                'training_data.py', 'training_run.py', 'training_objective.py')]
     return dict(code={str(p.relative_to(root)): file_digest(p) for p in files},
@@ -113,6 +114,10 @@ def make_plan(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, steps=(50,143,286),
 
 
 def verify_plan(plan):
+    if plan['schema'] == 'native-codec-history-v1':
+        from .history_diagnostics import verify_plan as history_verify
+        history_verify(plan)
+        return
     if plan['schema'] == SCHEMA:
         current = make_plan(plan['run'], plan['output'], [s['step'] for s in plan['stages'][1:]],
                             plan['cfgs'], [r['id'] for r in plan['cases']])
@@ -385,7 +390,7 @@ def execute(plan, *, resume=False, manager=None, log=print):
 
 def launch(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, job_dir=DEFAULT_JOB, *, resume=False,
            steps=(50,143,286), cfgs=(0.,1.,2.), cases=DEFAULT_CASES, component_step=None, split_acoustic=False,
-           sentence_options=None):
+           sentence_options=None, history_options=None):
     import fcntl
     run,output,job=Path(run).resolve(),Path(output).resolve(),Path(job_dir).resolve()
     if job.exists():raise ValueError('Use a new job directory, including when resuming')
@@ -401,7 +406,12 @@ def launch(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, job_dir=DEFAULT_JOB, *, resum
     with lock_path.open('a+') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError as exc:raise ValueError('Training or a diagnostic already owns this source run') from exc
-        if sentence_options is not None:
+        if history_options is not None:
+            if sentence_options is not None or component_step is not None or split_acoustic:
+                raise ValueError('History and other diagnostic modes are mutually exclusive')
+            from .history_diagnostics import make_plan as history_plan
+            plan=history_plan(run,output,**history_options)
+        elif sentence_options is not None:
             if component_step is not None or split_acoustic:
                 raise ValueError('Sentence and component diagnostic modes are mutually exclusive')
             from .sentence_diagnostics import make_plan as sentence_plan
@@ -466,7 +476,11 @@ def main():
         if state['resume']:command.append('--resume')
         commands=[('diagnostics',command)]
         plan=json.loads((job/'plan.json').read_text())
-        if plan['schema']=='native-sentence-diagnostics-v1':
+        if plan['schema']=='native-codec-history-v1':
+            command[3]=__package__+'.history_diagnostics'
+            commands.append(('asr',[sys.executable,'-u','-m',__package__+'.history_diagnostics',
+                                    '_score',str(job/'plan.json')]))
+        elif plan['schema']=='native-sentence-diagnostics-v1':
             commands.append(('asr',[sys.executable,'-u','-m',__package__+'.sentence_diagnostics',
                                     '_score',str(job/'plan.json')]))
         try:return run_commands(job,state,commands,args['lock_fd'])
