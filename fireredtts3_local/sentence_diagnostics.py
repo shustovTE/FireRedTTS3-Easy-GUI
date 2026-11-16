@@ -60,6 +60,8 @@ def make_plan(run=shared.DEFAULT_RUN, output=DEFAULT_OUTPUT, step=143,
     if not 0 <= pause_seconds <= 1:
         raise ValueError('Sentence pause must be between zero and one second')
     plan = shared.make_plan(run, output, steps=(step,), cfgs=(2.,), cases=cases)
+    if plan['adapter_profile'] != 'hybrid':
+        raise ValueError('Sentence/component matrix requires the hybrid diagnostic run')
     control = json.loads(Path(plan['previous_reports']['0']['path']).read_text())
     ids = [row['id'] for row in control['results']]
     if len(ids) != len(set(ids)) or not set(cases) <= set(ids):

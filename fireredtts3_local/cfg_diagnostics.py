@@ -1,4 +1,4 @@
-"""Read-only native CFG/checkpoint matrix for the joint-10 acoustic regression."""
+"""Read-only native CFG/checkpoint matrix for hybrid and own-history experiments."""
 from __future__ import annotations
 
 import argparse
@@ -40,7 +40,7 @@ def runtime_identity():
                'native_comparison.py', 'history_diagnostics.py', 'history_probe.py',
                'training_parity.py', 'training_batch.py',
                'training_monitor.py', 'model_manager.py', 'hybrid.py',
-               'training_data.py', 'training_run.py', 'training_objective.py')]
+               'training_data.py', 'training_run.py', 'training_objective.py', 'training_rollout.py')]
     return dict(code={str(p.relative_to(root)): file_digest(p) for p in files},
                 packages={name: importlib.metadata.version(name) for name in
                           ('torch', 'torchaudio', 'transformers', 'peft', 'numpy', 'soundfile')},
@@ -52,7 +52,8 @@ def adapter_identity(path, step, recipe, base_fingerprint):
     metadata = json.loads((path/'firered_lora_metadata.json').read_text())
     if metadata.get('step') != step or metadata.get('recipe') != recipe:
         raise ValueError(f'Checkpoint step/recipe differs from the selected training run: {path}')
-    info = initial_adapter_info(path, recipe['rank'], recipe['alpha'], recipe['dropout'], 'hybrid')
+    info = initial_adapter_info(path, recipe['rank'], recipe['alpha'], recipe['dropout'],
+                                recipe['options']['profile'])
     if info['base_fingerprint'] != base_fingerprint:
         raise ValueError(f'Checkpoint base fingerprint mismatch: {path}')
     return info
@@ -70,8 +71,10 @@ def make_plan(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, steps=(50,143,286),
             or not cases or len(set(cases)) != len(cases)):
         raise ValueError('Require unique positive checkpoint steps, nonnegative finite CFG values and case IDs')
     recipe = json.loads((run/'recipe.json').read_text())
-    if recipe['options']['profile'] != 'hybrid' or recipe.get('initial_adapter_fingerprint'):
-        raise ValueError('Expected the fresh-base joint hybrid run')
+    profile = recipe['options']['profile']
+    own_history = profile == 'backbone' and recipe['options'].get('rollout') is not None
+    if (profile != 'hybrid' and not own_history) or recipe.get('initial_adapter_fingerprint'):
+        raise ValueError('Expected a fresh-base hybrid or backbone own-history run')
     base_fingerprint = recipe['options']['expected_base_fingerprint']
     if not base_fingerprint:
         raise ValueError('Training run must pin the original base')
@@ -88,6 +91,12 @@ def make_plan(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, steps=(50,143,286),
     for step in steps:
         choices = [run/f'checkpoint-step-{step:06d}', run/f'adapter-step-{step:06d}']
         adapter = next((p for p in choices if p.is_dir()), None)
+        if adapter is None and (run/'firered_lora_metadata.json').is_file():
+            # A stopped pilot saves its exact last step at the run root, even
+            # between periodic checkpoints. Never substitute a different step.
+            latest = json.loads((run/'firered_lora_metadata.json').read_text())
+            if latest.get('step') == step:
+                adapter = run
         if adapter is None:
             raise ValueError(f'Missing saved checkpoint for step {step}; do not substitute best-validation')
         info = adapter_identity(adapter, step, recipe, base_fingerprint)
@@ -101,7 +110,8 @@ def make_plan(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, steps=(50,143,286),
         path = Path(summary['report']).resolve()
         report = json.loads(path.read_text())
         if (not report.get('complete') or report['fingerprint'] != benchmark_fingerprint
-                or report['settings'] != SETTINGS or report['step'] != summary['step']):
+                or report['settings'] != SETTINGS or report['step'] != summary['step']
+                or report.get('nonoverlapping_windows', False) != own_history):
             raise ValueError('Previous generation report has inconsistent provenance/settings')
         previous[str(summary['step'])] = dict(path=str(path), sha256=file_digest(path))
     if '0' not in previous:
@@ -110,6 +120,7 @@ def make_plan(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, steps=(50,143,286),
                 base_fingerprint=base_fingerprint, recipe_sha256=file_digest(run/'recipe.json'),
                 benchmark_fingerprint=benchmark_fingerprint, cases=rows, stages=stages,
                 cfgs=[float(c) for c in cfgs], settings=SETTINGS, previous_reports=previous,
+                adapter_profile=profile, nonoverlapping_windows=own_history,
                 runtime=runtime_identity(), total_cases=len(stages)*len(cfgs)*len(rows))
 
 
@@ -146,10 +157,12 @@ def require_cuda():
         raise RuntimeError('Run this diagnostic on the CUDA host with the original base and checkpoints')
 
 
-def latent_summary(result):
+def latent_summary(result, nonoverlapping_windows=False):
     # The first PatchEncoder input is the reference, not generated speech.
     latents = result['latent_levels'][1:]
     n = min(len(latents), max(1, round(10*len(latents)/result['seconds'])))
+    if nonoverlapping_windows:
+        n = min(n, max(1, len(latents)//3))
     def average(values):
         return sum(values)/len(values) if values else None
     first = average([r['rms'] for r in latents[:n]])
@@ -319,7 +332,8 @@ def execute(plan, *, resume=False, manager=None, log=print):
                 tts=manager.load_base(attention_backend='sdpa',torch_compile=False,log=log)
                 try:
                     if stage['adapter']:
-                        validate_adapter_targets(tts.tts_core,stage['targets'],adapter_targets(tts.tts_core,'hybrid'))
+                        validate_adapter_targets(tts.tts_core,stage['targets'],adapter_targets(
+                            tts.tts_core,plan.get('adapter_profile','hybrid')))
                         manager._attach_adapter(tts,stage['adapter'],log)
                     component_audit = None
                     if 'active_components' in stage:
@@ -345,6 +359,11 @@ def execute(plan, *, resume=False, manager=None, log=print):
                             log(f"[training-parity] {key}: passed={metrics['training_parity']['passed']}")
                         else:
                             samples,rate,metrics=generate_case(tts,row,settings,trace_flow=True)
+                        if plan.get('nonoverlapping_windows'):
+                            from .history_probe import levels
+                            measured = levels(samples, rate)
+                            for field in ('end_minus_start_rms_db', 'rms_window_seconds'):
+                                metrics[field] = measured[field]
                         # Indexed filenames keep arbitrary benchmark IDs out of paths.
                         name=f"case-{plan['cases'].index(row):02d}"
                         folder=output/stage['name']/f'cfg-{cfg:g}';folder.mkdir(parents=True,exist_ok=True)
@@ -356,7 +375,7 @@ def execute(plan, *, resume=False, manager=None, log=print):
                             temporary.replace(path)
                         result=dict(key=key,stage=stage['name'],step=stage['step'],cfg=cfg,id=row['id'],seed=row['seed'],
                             text=row['text'],settings={**plan['settings'],'inference_cfg':cfg},**metrics,
-                            **latent_summary(metrics),pcm_gain=gain,
+                            **latent_summary(metrics,plan.get('nonoverlapping_windows',False)),pcm_gain=gain,
                             audio=str(paths[1].relative_to(output)),float_audio=str(paths[0].relative_to(output)),
                             artifacts={str(p.relative_to(output)):file_digest(p) for p in paths})
                         for field in ('source_case_id', 'mode', 'sentence_index', 'comparison_id'):

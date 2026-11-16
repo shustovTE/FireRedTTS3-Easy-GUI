@@ -51,6 +51,8 @@ SPLIT_VARIANTS = (
 def make_plan(run=shared.DEFAULT_RUN, output=DEFAULT_OUTPUT, step=143, cases=shared.DEFAULT_CASES,
               *, split_acoustic=False):
     plan = shared.make_plan(run, output, steps=(step,), cfgs=(2.,), cases=cases)
+    if plan['adapter_profile'] != 'hybrid':
+        raise ValueError('Component ablation requires a hybrid adapter with trained dense modules')
     if str(step) not in plan['previous_reports']:
         raise ValueError('The selected checkpoint needs a previous generation report for the all-components control')
     # Both controls must have every requested case; a missing comparison cannot
