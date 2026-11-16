@@ -378,6 +378,10 @@ To check whether shorter generations omit words, compare whole texts with
 complete sentences using the [sentence/ASR diagnostic](docs/SENTENCE_DIAGNOSTICS.md).
 For whole-utterance codec reconstruction and real-versus-generated acoustic
 history controls, use the [codec/history diagnostic](docs/HISTORY_DIAGNOSTICS.md).
+For the subsequent fresh-base experiment on the same Dialogs + Spontaneous data,
+see **[rollout-aware backbone LoRA](docs/ROLLOUT_FROM_BASE.md)**: short detached
+own-history windows, clean recorded targets, frozen acoustics, and unsplit
+generation checks. This is an experimental objective, not a proven artifact fix.
 
 For confirmed spontaneous Russian speech after the fresh Dialogs-only stage, see
 **[Common Voice Spontaneous training](docs/COMMON_VOICE_SPONTANEOUS.md)**: pinned

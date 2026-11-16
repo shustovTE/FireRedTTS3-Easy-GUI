@@ -30,28 +30,35 @@ def describe(rows):
                 speakers=len({r['speaker_id'] for r in rows}), fingerprint=dataset_fingerprint(rows))
 
 
-def validate_recipe(config):
+def validate_recipe(config, *, mode='hybrid'):
+    if mode not in {'hybrid', 'rollout'}:
+        raise ValueError('Unknown joint experiment')
     opts = TrainingOptions.parse(config['options'])
     if (config.get('initial_adapter') or config.get('resume_checkpoint')
-            or config['length_mode'] != 'Epochs' or opts.profile != 'hybrid'
+            or config['length_mode'] != 'Epochs' or opts.profile != ('backbone' if mode == 'rollout' else 'hybrid')
             or opts.sampling_strategy != 'coverage' or opts.replay_manifest or opts.replay_ratio
             or opts.validation_scope != 'recording' or not opts.validation_all_targets
             or opts.max_target_seconds != 30 or opts.max_prompt_seconds != 30
             or opts.precision_policy != 'native' or not opts.expected_base_fingerprint
             or not opts.generation_benchmark):
-        raise ValueError('Require fresh pinned base, hybrid/native, union coverage, both holdouts and generation benchmark')
+        raise ValueError('Require fresh pinned base, declared profile/native, union coverage, both holdouts and generation benchmark')
+    if (mode == 'rollout') != (opts.rollout is not None):
+        raise ValueError('Rollout options must match the selected experiment')
+    if mode == 'rollout' and (config['dropout'] != 0 or opts.preservation_weight <= 0):
+        raise ValueError('Rollout requires dropout=0 and clean-history preservation')
     return opts
 
 
-def audit(output=DEFAULT_OUTPUT):
+def audit(output=DEFAULT_OUTPUT, *, mode='hybrid'):
     output = Path(output).resolve()
     report = json.loads((output/'report.json').read_text())
-    if report.get('schema') != SCHEMA or not report.get('complete'):
+    schema = 'russian-joint-rollout-v1' if mode == 'rollout' else SCHEMA
+    if report.get('schema') != schema or not report.get('complete'):
         raise ValueError('Complete joint preparation first')
     if file_digest(output/'recipe.json') != report['recipe_sha256']:
         raise ValueError('Prepared joint recipe changed')
     config = json.loads((output/'recipe.json').read_text())
-    opts = validate_recipe(config)
+    opts = validate_recipe(config, mode=mode)
     train, validation, replay, adaptation = prepare_run_data(config['manifest_path'], opts, config['seed'],
                                                             include_adaptation_validation=True)
     if replay or adaptation is None:
@@ -70,10 +77,10 @@ def audit(output=DEFAULT_OUTPUT):
 
 def prepare(dialogs='training/datasets/dialogs-base-08',
             spontaneous='training/datasets/cv-spontaneous-09', output=DEFAULT_OUTPUT,
-            recipe=DEFAULT_RECIPE):
+            recipe=DEFAULT_RECIPE, *, mode='hybrid'):
     dialogs, spontaneous, output = map(lambda p:Path(p).resolve(), (dialogs,spontaneous,output))
     config = json.loads(Path(recipe).read_text())
-    opts = validate_recipe(config)
+    opts = validate_recipe(config, mode=mode)
     run = Path(config['output_dir']).resolve()
     if output.exists() or (run.exists() and any(run.iterdir())):
         raise ValueError('Joint preparation/run must be new; use audit or resume existing work')
@@ -128,7 +135,8 @@ def prepare(dialogs='training/datasets/dialogs-base-08',
                 generation_benchmark=str(output/'benchmark.jsonl'),cache_dir=str(Path(opts.cache_dir).resolve()))
             write_json(staging/'recipe.json',config)
             steps=math.ceil(len(train)/(opts.batch_size*config['gradient_accumulation']))
-            report=dict(schema=SCHEMA,complete=True,initialization='original base; fresh hybrid; no previous adapter',
+            report=dict(schema='russian-joint-rollout-v1' if mode == 'rollout' else SCHEMA,
+                complete=True,initialization=f'original base; fresh {mode}; no previous adapter',
                 sources=dict(dialogs=str(dialogs),spontaneous=str(spontaneous)),
                 source_reports=dict(dialogs=file_digest(dialogs/'report.json'),spontaneous=file_digest(spontaneous/'report.json')),
                 datasets={name:describe(pairs.rows) for name,pairs in
@@ -141,17 +149,16 @@ def prepare(dialogs='training/datasets/dialogs-base-08',
                 recipe=str(output/'recipe.json'),recipe_sha256=file_digest(staging/'recipe.json'))
             write_json(staging/'report.json',report)
             staging.rename(output)
-    return audit(output)
+    return audit(output, mode=mode)
 
 
-def resume_recipe(job, output):
+def resume_recipe(job, output, *, mode='hybrid'):
     from .training_job import read_status
     job=Path(job).resolve();state=read_status(job)
     if state['active'] or state['status'] not in {'completed','stopped'}:
         raise ValueError('Wait for the pilot to finish before creating a resume recipe')
     config=json.loads((job/'recipe.json').read_text())
-    if config['options']['profile'] != 'hybrid' or config.get('initial_adapter'):
-        raise ValueError('Expected a fresh-base hybrid job')
+    validate_recipe({**config, 'resume_checkpoint': None}, mode=mode)
     run=Path(config['output_dir']).resolve()
     if not (run/'trainer_state.pt').is_file():
         raise ValueError('Pilot has no saved trainer state')

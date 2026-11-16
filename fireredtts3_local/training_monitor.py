@@ -118,7 +118,8 @@ def generate_case(tts, row, settings=None, *, trace_flow=False):
     return samples, rate, result
 
 
-def monitor(tts, benchmark, output, step, expected_fingerprint, offloaded=False, log=print):
+def monitor(tts, benchmark, output, step, expected_fingerprint, offloaded=False, log=print,
+            *, nonoverlapping_windows=False):
     from .training_batch import set_training
     rows, digest = load_benchmark(benchmark)
     if digest != expected_fingerprint:
@@ -128,11 +129,14 @@ def monitor(tts, benchmark, output, step, expected_fingerprint, offloaded=False,
     baseline = json.loads(baseline_path.read_text()) if step else None
     if baseline and baseline['fingerprint'] != digest:
         raise ValueError('Generation baseline fingerprint mismatch')
+    if baseline and baseline.get('nonoverlapping_windows', False) != nonoverlapping_windows:
+        raise ValueError('Generation level measurement changed since baseline')
     before = {r['id']: r for r in baseline['results']} if baseline else {}
     root = output / 'generation'
     root.mkdir(exist_ok=True)
     folder = Path(tempfile.mkdtemp(prefix=f'step-{step:06d}-', dir=root))
-    report = dict(step=step, fingerprint=digest, settings=SETTINGS, complete=False, results=[])
+    report = dict(step=step, fingerprint=digest, settings=SETTINGS, complete=False, results=[],
+                  nonoverlapping_windows=nonoverlapping_windows)
     core = tts.tts_core
     was_training = core.training
     try:
@@ -142,6 +146,14 @@ def monitor(tts, benchmark, output, step, expected_fingerprint, offloaded=False,
             tts.spk_extractor.to(tts.device)
         for i, row in enumerate(rows):
             samples, rate, levels = generate_case(tts, row)
+            if nonoverlapping_windows:
+                from .history_probe import levels as history_levels
+                # Legacy monitor windows overlapped on <20s speech, and were
+                # identical on <=10s speech. New runs use disjoint first/last
+                # thirds (each capped at 10s), including short questions.
+                measured = history_levels(samples, rate)
+                for key in ('end_minus_start_rms_db', 'rms_window_seconds'):
+                    levels[key] = measured[key]
             audio = f'case-{i:05d}'
             sf.write(folder / f'{audio}.float.wav', samples, rate, subtype='FLOAT')
             gain = min(1., .98 / max(levels['peak'], 1e-12))

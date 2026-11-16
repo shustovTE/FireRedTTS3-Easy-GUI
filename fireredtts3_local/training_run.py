@@ -63,6 +63,7 @@ class TrainingOptions:
     stop_lr_scale: float = 1.0
     keep_checkpoint_every: int = 0
     generation_benchmark: str = ""
+    rollout: dict | None = None
 
     def validate(self):
         if not isinstance(self.expected_base_fingerprint, str) or (self.expected_base_fingerprint
@@ -83,6 +84,13 @@ class TrainingOptions:
             raise ValueError("Detached stop loss requires a trainable hybrid stop head")
         if not isinstance(self.generation_benchmark, str):
             raise ValueError("generation_benchmark must be a path string")
+        if self.rollout is not None:
+            from .training_rollout import RolloutOptions
+            if not isinstance(self.rollout, dict):
+                raise ValueError('rollout must be an options object or null')
+            self.rollout = asdict(RolloutOptions.parse(self.rollout))
+            if self.profile != 'backbone' or self.precision_policy != 'native':
+                raise ValueError('Own-history rollout currently requires backbone LoRA and native precision')
         if self.validation_scope not in {"speaker", "recording"}:
             raise ValueError("validation_scope must be speaker or recording")
         if self.attention_backend not in {"sdpa", "flash_attention_2"}:
@@ -398,6 +406,8 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         raise ValueError("Rank, alpha, lengths, accumulation and save interval must be positive")
     if not 0 <= dropout < 1 or learning_rate <= 0 or not math.isfinite(learning_rate):
         raise ValueError("Invalid dropout/learning rate")
+    if opts.rollout is not None and (initial_adapter or dropout != 0):
+        raise ValueError('Own-history experiment requires fresh base and dropout=0; resume is supported')
     if length_mode not in {"Steps", "Epochs"}:
         raise ValueError("length_mode must be Steps or Epochs")
     if opts.sampling_strategy in {"coverage", "coverage_replay"} and length_mode != "Epochs":
@@ -427,6 +437,12 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
     if opts.generation_benchmark:
         from .training_monitor import load_benchmark
         _, recipe['generation_benchmark_fingerprint'] = load_benchmark(opts.generation_benchmark)
+    if opts.rollout is not None:
+        from .training_rollout import SCHEMA as rollout_schema
+        # Do not silently resume a different implementation of the new objective.
+        recipe['rollout_implementation'] = dict(schema=rollout_schema, files={name: file_digest(
+            Path(__file__).parent/name) for name in
+            ('training_rollout.py', 'training_batch.py', 'training_objective.py', 'training_run.py')})
     initial = initial_adapter_info(initial_adapter, rank, alpha, dropout, opts.profile) if initial_adapter else None
     if initial:
         recipe["initial_adapter_fingerprint"] = initial["fingerprint"]
@@ -496,6 +512,9 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         log(f"[training] trainable={sum(p.numel() for _, p in named):,}; "
             f"full_modules={list(dense_targets(opts.profile))}; precision={opts.precision_policy}; "
             f"stop_loss={opts.stop_loss_mode}")
+        if opts.rollout is not None:
+            log(f"[rollout] {rollout_schema}: {json.dumps(opts.rollout)}; "
+                "short anchored own-history; clean recorded targets; frozen acoustic modules")
         optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01)
         warmup = max(1, min(100, int(total * 0.05)))
         def schedule(step):
@@ -598,7 +617,8 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             if opts.generation_benchmark:
                 from .training_monitor import monitor
                 generation = monitor(tts, opts.generation_benchmark, out, step,
-                                     recipe['generation_benchmark_fingerprint'], opts.offload_frozen_encoders, log)
+                                     recipe['generation_benchmark_fingerprint'], opts.offload_frozen_encoders, log,
+                                     **({'nonoverlapping_windows': True} if opts.rollout is not None else {}))
                 generation_ok = generation['passed']
                 metadata['generation_guard'] = generation
             if (generation_ok and selection_loss < best) or step == 0:
@@ -662,6 +682,17 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite training loss at step {step}")
                 (loss*len(examples)).backward()
+                if opts.rollout is not None:
+                    from .training_rollout import rollout_loss
+                    extra, rollout_metrics = rollout_loss(tts, examples, opts.rollout, step,
+                                                         dit_chunk_size=opts.dit_chunk_size)
+                    if not torch.isfinite(extra):
+                        raise FloatingPointError(f'Non-finite rollout loss at step {step}')
+                    if extra.requires_grad:
+                        (extra*len(examples)).backward()
+                    metrics['teacher_forced_loss'] = metrics['loss']
+                    metrics['loss'] = metrics['loss'] + extra.detach()
+                    metrics.update(rollout_metrics)
                 used += len(examples)
                 target_seconds += sum(target['duration'] for _, _, _, target, _ in loaded)
                 for key, value in metrics.items():
@@ -701,6 +732,14 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], step)
             message = f"[training] step={step}/{total} loss={metrics_sum['loss']/used:.6f} {elapsed:.2f}s/step {used/elapsed:.2f} examples/s"
             log(message)
+            if opts.rollout is not None:
+                row = {key: value/used for key, value in metrics_sum.items()}
+                with (out/'rollout_metrics.jsonl').open('a') as stream:
+                    stream.write(json.dumps(dict(step=step, **row), allow_nan=False)+'\n')
+                log(f"[rollout] horizon={row['rollout_horizon']:.0f} "
+                    f"accepted={row['rollout_accepted_fraction']:.1%} "
+                    f"stop_rejected={row['rollout_stop_rejected_fraction']:.1%} "
+                    f"flow={row['rollout_flow']:.6f} added_loss={row['rollout_contribution']:.6f}")
             if opts.sampling_strategy in {"coverage", "coverage_replay"} and step % steps_per_epoch == 0:
                 coverage = {"epoch": step//steps_per_epoch, "step": step, "targets": len(train.rows),
                             "target_hours": sum(row['duration'] for row in train.rows)/3600}
