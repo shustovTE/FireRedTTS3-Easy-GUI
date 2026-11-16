@@ -36,7 +36,8 @@ def runtime_identity():
     root = Path(__file__).resolve().parent.parent
     files = sorted((root/'fireredtts3_upstream').rglob('*.py'))
     files += [root/'fireredtts3_local'/name for name in
-              ('cfg_diagnostics.py', 'component_diagnostics.py', 'training_parity.py', 'training_batch.py',
+              ('cfg_diagnostics.py', 'component_diagnostics.py', 'sentence_diagnostics.py',
+               'native_comparison.py', 'training_parity.py', 'training_batch.py',
                'training_monitor.py', 'model_manager.py', 'hybrid.py',
                'training_data.py', 'training_run.py', 'training_objective.py')]
     return dict(code={str(p.relative_to(root)): file_digest(p) for p in files},
@@ -115,6 +116,11 @@ def verify_plan(plan):
     if plan['schema'] == SCHEMA:
         current = make_plan(plan['run'], plan['output'], [s['step'] for s in plan['stages'][1:]],
                             plan['cfgs'], [r['id'] for r in plan['cases']])
+    elif plan['schema'] == 'native-sentence-diagnostics-v1':
+        from .sentence_diagnostics import make_plan as sentence_plan
+        current = sentence_plan(plan['run'], plan['output'], plan['source_step'],
+                                [r['id'] for r in plan['original_cases']],
+                                plan['asr_model'], plan['pause_seconds'])
     else:
         from .component_diagnostics import SCHEMA as COMPONENT_SCHEMA, SPLIT_SCHEMA, make_plan as component_plan
         if plan['schema'] not in (COMPONENT_SCHEMA, SPLIT_SCHEMA):
@@ -169,7 +175,8 @@ def annotate(results, plan):
         # Partial components intentionally differ from their source checkpoint.
         # Only the base and complete-checkpoint controls reproduce old results.
         previous_step = row.get('comparison_step', row['step'])
-        previous = old.get((previous_step, row['id'])) if row['cfg']==2. else None
+        previous_id = row.get('comparison_id', row['id'])
+        previous = old.get((previous_step, previous_id)) if row['cfg']==2. else None
         row['previous_monitor'] = None if previous is None else dict(
             seconds_delta=row['seconds']-previous['seconds'],
             rms_drift_delta_db=row['end_minus_start_rms_db']-previous['end_minus_start_rms_db'],
@@ -347,6 +354,9 @@ def execute(plan, *, resume=False, manager=None, log=print):
                             **latent_summary(metrics),pcm_gain=gain,
                             audio=str(paths[1].relative_to(output)),float_audio=str(paths[0].relative_to(output)),
                             artifacts={str(p.relative_to(output)):file_digest(p) for p in paths})
+                        for field in ('source_case_id', 'mode', 'sentence_index', 'comparison_id'):
+                            if field in row:
+                                result[field] = row[field]
                         if component_audit is not None:
                             result.update(active_components=stage['active_components'],component_audit=component_audit,
                                           comparison_step=stage['comparison_step'])
@@ -360,8 +370,11 @@ def execute(plan, *, resume=False, manager=None, log=print):
                     manager.unload(log)
             report=persist(output,plan,results)
             if report['complete']:
-                package_results(output,results)
-                log(f'[cfg-diagnostics] Complete: {output}/summary.md and diagnostics-*.zip')
+                if 'original_cases' in plan:
+                    log('[cfg-diagnostics] Generation complete; sentence assembly and CPU ASR follow')
+                else:
+                    package_results(output,results)
+                    log(f'[cfg-diagnostics] Complete: {output}/summary.md and diagnostics-*.zip')
             else:
                 log(f"[cfg-diagnostics] Paused after {len(results)}/{plan['total_cases']} cases; resume with the same inputs")
             return report
@@ -371,7 +384,8 @@ def execute(plan, *, resume=False, manager=None, log=print):
 
 
 def launch(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, job_dir=DEFAULT_JOB, *, resume=False,
-           steps=(50,143,286), cfgs=(0.,1.,2.), cases=DEFAULT_CASES, component_step=None, split_acoustic=False):
+           steps=(50,143,286), cfgs=(0.,1.,2.), cases=DEFAULT_CASES, component_step=None, split_acoustic=False,
+           sentence_options=None):
     import fcntl
     run,output,job=Path(run).resolve(),Path(output).resolve(),Path(job_dir).resolve()
     if job.exists():raise ValueError('Use a new job directory, including when resuming')
@@ -387,7 +401,12 @@ def launch(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, job_dir=DEFAULT_JOB, *, resum
     with lock_path.open('a+') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError as exc:raise ValueError('Training or a diagnostic already owns this source run') from exc
-        if component_step is None:
+        if sentence_options is not None:
+            if component_step is not None or split_acoustic:
+                raise ValueError('Sentence and component diagnostic modes are mutually exclusive')
+            from .sentence_diagnostics import make_plan as sentence_plan
+            plan=sentence_plan(run,output,cases=cases,**sentence_options)
+        elif component_step is None:
             plan=make_plan(run,output,steps,cfgs,cases)
         else:
             from .component_diagnostics import make_plan as component_plan
@@ -445,7 +464,12 @@ def main():
         os.chdir(state['cwd'])
         command=[sys.executable,'-u','-m',__package__+'.cfg_diagnostics','_run',str(job/'plan.json')]
         if state['resume']:command.append('--resume')
-        try:return run_commands(job,state,[('diagnostics',command)],args['lock_fd'])
+        commands=[('diagnostics',command)]
+        plan=json.loads((job/'plan.json').read_text())
+        if plan['schema']=='native-sentence-diagnostics-v1':
+            commands.append(('asr',[sys.executable,'-u','-m',__package__+'.sentence_diagnostics',
+                                    '_score',str(job/'plan.json')]))
+        try:return run_commands(job,state,commands,args['lock_fd'])
         finally:os.close(args['lock_fd'])
     else:
         plan=json.loads(Path(args['plan']).read_text())
