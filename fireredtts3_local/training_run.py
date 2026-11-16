@@ -506,7 +506,7 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         metadata = {"experimental": True, "recipe": recipe, "base_model": "FireRedTeam/FireRedTTS3", "base_fingerprint": base_fingerprint,
                     "selection_metric": "held-out flow + stop loss; NOT a guarantee of voice similarity"}
         if adaptation:
-            metadata['selection_metric'] = 'Mean of unseen-speaker and adaptation recording/text holdout flow + stop losses; NOT a guarantee of voice similarity'
+            metadata['selection_metric'] = 'Mean of primary and secondary holdout flow + stop losses; primary separation follows validation_scope; NOT a guarantee of voice similarity'
         if initial:
             metadata["initial_adapter"] = {key: initial[key] for key in ("path", "fingerprint")}
 

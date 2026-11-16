@@ -363,6 +363,11 @@ Prepared datasets and project metadata are kept separate from the original sourc
 
 Russian adaptation now includes speaker-aware data preparation, held-out validation, scoped LoRA, replay, base-model preservation and full-core export. See **[the Russian training guide](docs/RUSSIAN_TRAINING.md)** and **[the example recipe](recipes/russian_backbone.json)**. Existing manifests require explicit `speaker_id`; audio is no longer silently cropped.
 
+For confirmed spontaneous Russian speech after the fresh Dialogs-only stage, see
+**[Common Voice Spontaneous training](docs/COMMON_VOICE_SPONTANEOUS.md)**: pinned
+download, whole recordings up to 30 seconds, preserved transcribed disfluencies,
+per-speaker thirds, extra validation, original Dialogs replay and detached jobs.
+
 For RTX PRO 6000 Blackwell 96 GB, start with [the batched/precomputed recipe](recipes/russian_blackwell_96gb.json). `adapt precompute` caches RedAE, CAM++ and frozen PatchEncoder features; `batch_size` controls actual batched backbone/DiT execution. Effective pairs per update = `batch_size × gradient_accumulation`. The guide includes a resumable 30-step timing run; GPU throughput and quality still require measurement.
 
 ![tab4](assets/tab4.png)
