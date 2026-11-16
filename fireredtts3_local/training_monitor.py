@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import time
 
 import numpy as np
 import soundfile as sf
@@ -38,7 +39,7 @@ def load_benchmark(path):
     return result, digest
 
 
-def measure(samples, rate, scores):
+def measure(samples, rate, scores, stop_threshold=.5):
     levels = signal_levels(samples, rate)
     n = min(10 * rate, len(samples))
     def rms(values):
@@ -46,7 +47,7 @@ def measure(samples, rate, scores):
     levels['end_minus_start_rms_db'] = rms(samples[-n:]) - rms(samples[:n])
     if not scores:
         raise RuntimeError('Generation monitor did not observe the stop head')
-    stopped = len(scores) > 6 and scores[-1] >= SETTINGS['stop_threshold']
+    stopped = len(scores) > 6 and scores[-1] >= stop_threshold
     levels.update(finish_reason='stop' if stopped else 'max_patches',
                   generated_patches=len(scores) - int(stopped))
     return levels
@@ -63,8 +64,61 @@ def failures(current, baseline=None):
     return reasons
 
 
-def monitor(tts, benchmark, output, step, expected_fingerprint, offloaded=False, log=print):
+def generate_case(tts, row, settings=None, *, trace_flow=False):
+    """Observe one native generation without changing its RNG, inputs or outputs."""
     from .training_run import isolated_rng
+    settings = dict(SETTINGS if settings is None else settings)
+    core = tts.tts_core
+    reference, sr = torchaudio.load(row['reference_audio'])
+    scores, latents, flows, hooks = [], [], [], []
+    hooks.append(core.stop_head.register_forward_hook(lambda _m, _a, value:
+        scores.append(float(value.detach().float().sigmoid().flatten()[-1]))))
+
+    def observe(_module, args):
+        value = args[0].detach().float()
+        latents.append(dict(frames=value.shape[1], rms=float(value.square().mean().sqrt()),
+                            peak=float(value.abs().max())))
+
+    hooks.append(core.patch_encoder.register_forward_pre_hook(observe))
+    if trace_flow:
+        def observe_flow(_module, _args, value):
+            v = value.detach().float()[:, -core.patch_size:]
+            cfg = settings['inference_cfg']
+            if len(v) != (2 if cfg > 0 else 1):
+                raise ValueError('Unexpected native CFG branch layout')
+            conditional = v[0]
+            unconditional = v[1] if cfg > 0 else None
+            guided = (1 + cfg)*conditional - cfg*unconditional if cfg > 0 else conditional
+            rms = lambda x: float(x.square().mean().sqrt())
+            flows.append(dict(conditional_rms=rms(conditional), guided_rms=rms(guided),
+                unconditional_rms=rms(unconditional) if unconditional is not None else None,
+                difference_rms=rms(conditional-unconditional) if unconditional is not None else None))
+        hooks.append(core.dit.register_forward_hook(observe_flow))
+    started = time.monotonic()
+    try:
+        with isolated_rng(row['seed']), torch.inference_mode():
+            wav, rate = tts.generate(language=row['language'], prompt_text=plain_text(row['reference_text']),
+                prompt_audio=reference, prompt_audio_sr=sr, text=plain_text(row['text']),
+                seed=row['seed'], **settings)
+    finally:
+        for hook in hooks:
+            hook.remove()
+    if wav.ndim != 2 or wav.shape[0] != 1:
+        raise ValueError('Expected native mono waveform')
+    samples = wav[0].detach().float().cpu().numpy()
+    result = dict(**measure(samples, rate, scores, settings['stop_threshold']),
+                  stop_scores=scores, latent_levels=latents, elapsed_seconds=time.monotonic()-started)
+    if trace_flow:
+        n = settings['n_timesteps']
+        if len(flows) != n*result['generated_patches'] or len(latents) != result['generated_patches']+1:
+            raise ValueError('Native generation trace differs from expected patch/ODE-step counts')
+        result['flow_by_patch'] = [dict(patch=start//n,
+            **{key: sum(r[key] for r in flows[start:start+n])/n if flows[start][key] is not None else None
+               for key in flows[start]}) for start in range(0, len(flows), n)]
+    return samples, rate, result
+
+
+def monitor(tts, benchmark, output, step, expected_fingerprint, offloaded=False, log=print):
     from .training_batch import set_training
     rows, digest = load_benchmark(benchmark)
     if digest != expected_fingerprint:
@@ -87,32 +141,13 @@ def monitor(tts, benchmark, output, step, expected_fingerprint, offloaded=False,
             tts.redae.to(tts.device)
             tts.spk_extractor.to(tts.device)
         for i, row in enumerate(rows):
-            reference, sr = torchaudio.load(row['reference_audio'])
-            scores, latents = [], []
-            hook = core.stop_head.register_forward_hook(lambda _m, _a, value:
-                scores.append(float(value.detach().float().sigmoid().flatten()[-1])))
-            def observe(_module, args):
-                value = args[0].detach().float()
-                latents.append(dict(frames=value.shape[1], rms=float(value.square().mean().sqrt()),
-                                    peak=float(value.abs().max())))
-            latent_hook = core.patch_encoder.register_forward_pre_hook(observe)
-            try:
-                with isolated_rng(row['seed']), torch.inference_mode():
-                    wav, rate = tts.generate(language=row['language'], prompt_text=plain_text(row['reference_text']),
-                        prompt_audio=reference, prompt_audio_sr=sr, text=plain_text(row['text']),
-                        seed=row['seed'], **SETTINGS)
-            finally:
-                hook.remove()
-                latent_hook.remove()
-            samples = wav.detach().float().cpu().flatten().numpy()
-            levels = measure(samples, rate, scores)
+            samples, rate, levels = generate_case(tts, row)
             audio = f'case-{i:05d}'
             sf.write(folder / f'{audio}.float.wav', samples, rate, subtype='FLOAT')
             gain = min(1., .98 / max(levels['peak'], 1e-12))
             sf.write(folder / f'{audio}.wav', samples * gain, rate, subtype='PCM_16')
             result = dict(id=row['id'], seed=row['seed'], **levels, pcm_gain=gain,
-                          float_audio=f'{audio}.float.wav', audio=f'{audio}.wav',
-                          stop_scores=scores, latent_levels=latents)
+                          float_audio=f'{audio}.float.wav', audio=f'{audio}.wav')
             result['failures'] = failures(result, before.get(row['id']))
             report['results'].append(result)
             log(f"[generation] step={step} id={row['id']} seconds={levels['seconds']:.2f} "

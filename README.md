@@ -367,6 +367,8 @@ For a fresh-base joint experiment on the already prepared Dialogs and confirmed
 Common Voice recordings, see **[joint hybrid training](docs/JOINT_HYBRID_FROM_BASE.md)**:
 backbone LoRA plus full DiT/conditioning/stop-head updates, native precision,
 separate holdouts, resumable jobs and free-running generation regression checks.
+For a failed long-speech check, use the [native CFG/checkpoint diagnostic matrix](docs/CFG_DIAGNOSTICS.md)
+to compare the original base and saved intermediate weights without further training.
 
 For confirmed spontaneous Russian speech after the fresh Dialogs-only stage, see
 **[Common Voice Spontaneous training](docs/COMMON_VOICE_SPONTANEOUS.md)**: pinned
