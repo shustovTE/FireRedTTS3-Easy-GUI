@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import socket
+import ssl
 import tarfile
 import tempfile
 import urllib.error
@@ -19,6 +21,48 @@ FILENAME = "common-voice-spontaneous-speech-5-0-russ-883d3f86.tar.gz"
 ARCHIVE_SHA256 = "aa0910f5fef7f24afccf5bca075995f0b7a970d96da72626c80507d629d05a6f"
 ARCHIVE_BYTES = 93031233
 DEFAULT_ARCHIVE = f"training/raw/common-voice-sps-5-ru/{FILENAME}"
+USER_AGENT = "FireRedTTS3-Easy-GUI/0.1.1"
+
+
+def safe_failure(phase, error):
+    """Diagnose transport/status failures without reflecting tokens or signed URLs."""
+    if isinstance(error, urllib.error.HTTPError):
+        content_type = error.headers.get("Content-Type", "") if error.headers else ""
+        kind = "JSON" if "json" in content_type else "HTML" if "html" in content_type else "non-JSON"
+        cloudflare_code = None
+        try:
+            payload = json.loads(error.read(4096))
+            if isinstance(payload, dict) and payload.get("cloudflare_error") is True:
+                code = payload.get("error_code")
+                if type(code) is int and 1000 <= code <= 9999:
+                    cloudflare_code = code
+        except Exception:
+            pass
+        finally:
+            error.close()
+        if cloudflare_code == 1010:
+            hint = "Cloudflare 1010 rejected the client signature before API authentication; update the downloader/User-Agent."
+        else:
+            hint = {
+                401: "Authentication was rejected; verify the Mozilla API key (not an HF token).",
+                403: "Access was denied; this can be a request filter or account/dataset access restriction, not necessarily an invalid key.",
+                429: "Rate limited; wait before retrying.",
+            }.get(error.code, "The service returned an HTTP error; retry later for 5xx responses.")
+        return RuntimeError(f"{phase}: HTTP {error.code}, response={kind}. {hint} Response bodies, credentials and signed URLs are omitted.")
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        detail = "TLS certificate verification failed; check system time and CA certificates"
+    elif isinstance(reason, ssl.SSLError):
+        detail = "TLS connection failed"
+    elif isinstance(reason, socket.gaierror):
+        detail = "DNS lookup failed"
+    elif isinstance(reason, TimeoutError):
+        detail = "request timed out"
+    elif isinstance(error, json.JSONDecodeError):
+        detail = "expected JSON but received an invalid/non-JSON response"
+    else:
+        detail = f"request failed ({type(error).__name__})"
+    return RuntimeError(f"{phase}: {detail}. Credentials and signed URLs are omitted.")
 
 
 def verify_archive(path):
@@ -52,12 +96,13 @@ def download(archive=DEFAULT_ARCHIVE, log=print):
         request = urllib.request.Request(
             f"https://mozilladatacollective.com/api/datasets/{DATASET_ID}/download",
             data=b"{}", method="POST",
-            headers={"Authorization": "Bearer " + key.strip(), "Content-Type": "application/json"})
+            headers={"Authorization": "Bearer " + key.strip(), "Content-Type": "application/json",
+                     "Accept": "application/json", "User-Agent": USER_AGENT})
         try:
             with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response:
                 url = json.load(response).get("downloadUrl")
-        except Exception:
-            raise RuntimeError("Mozilla download API failed; check account access/API key and retry. Credentials and response URLs were not logged.") from None
+        except Exception as exc:
+            raise safe_failure("Mozilla download API", exc) from None
         finally:
             del request, key
         if not isinstance(url, str) or not url.startswith("https://"):
@@ -66,7 +111,8 @@ def download(archive=DEFAULT_ARCHIVE, log=print):
             candidate = Path(temporary) / FILENAME
             try:
                 # Separate request: the bearer token is NOT sent to storage.
-                with urllib.request.urlopen(url, timeout=90) as response, candidate.open("wb") as out:
+                request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(request, timeout=90) as response, candidate.open("wb") as out:
                     received = 0
                     while block := response.read(4 * 1024 * 1024):
                         received += len(block)
@@ -74,8 +120,8 @@ def download(archive=DEFAULT_ARCHIVE, log=print):
                             raise ValueError("Oversized archive")
                         out.write(block)
                         log(f"[common-voice] Downloaded {received / 1024**2:.1f} MiB")
-            except Exception:
-                raise RuntimeError("Common Voice storage download failed; rerun download. No partial archive was installed.") from None
+            except Exception as exc:
+                raise safe_failure("Common Voice storage download (no partial archive installed)", exc) from None
             verify_archive(candidate)
             candidate.replace(archive)
     return archive

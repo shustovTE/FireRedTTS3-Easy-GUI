@@ -4,6 +4,8 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import socket
+import ssl
 import tarfile
 import tempfile
 import unittest
@@ -59,7 +61,12 @@ class DownloadTests(unittest.TestCase):
             fetch.download(out, log=logs.append)
             request = opener.return_value.open.call_args.args[0]
             self.assertEqual(request.get_header("Authorization"), "Bearer fixture-secret")
-            self.assertEqual(storage.call_args.args, (storage_url,))
+            self.assertEqual(request.get_header("User-agent"), fetch.USER_AGENT)
+            self.assertEqual(request.get_header("Accept"), "application/json")
+            storage_request = storage.call_args.args[0]
+            self.assertEqual(storage_request.full_url, storage_url)
+            self.assertEqual(storage_request.get_header("User-agent"), fetch.USER_AGENT)
+            self.assertIsNone(storage_request.get_header("Authorization"))
             fetch.download(out, log=logs.append)
             self.assertEqual(storage.call_count, 1)
         self.assertNotIn("fixture-secret", "\n".join(logs))
@@ -80,6 +87,46 @@ class DownloadTests(unittest.TestCase):
         self.assertNotIn("private", str(caught.exception))
         self.assertFalse(out.exists())
         self.assertIsNone(fetch.NoRedirect().redirect_request(None, None, 302, "", {}, "https://elsewhere"))
+
+    def test_http_errors_distinguish_cloudflare_from_auth_without_reflecting_secrets(self):
+        for status, body, expected in (
+            (403, {"cloudflare_error": True, "error_code": 1010}, "Cloudflare 1010"),
+            (401, {}, "Authentication was rejected"),
+            (403, {}, "not necessarily an invalid key"),
+            (429, {}, "Rate limited"),
+            (503, {}, "5xx"),
+        ):
+            body.update(error="fixture-secret", downloadUrl="https://storage.example/?secret-signature")
+            error = fetch.urllib.error.HTTPError("https://api.example/?secret-signature", status,
+                "fixture-secret", {"Content-Type": "application/json"}, io.BytesIO(json.dumps(body).encode()))
+            result = str(fetch.safe_failure("Mozilla download API", error))
+            self.assertIn(f"HTTP {status}", result)
+            self.assertIn(expected, result)
+            self.assertNotIn("fixture-secret", result)
+            self.assertNotIn("secret-signature", result)
+
+    def test_network_and_invalid_json_errors_are_actionable_without_raw_exception_text(self):
+        for error, expected in (
+            (fetch.urllib.error.URLError(ssl.SSLCertVerificationError("secret-signature")), "TLS certificate"),
+            (fetch.urllib.error.URLError(socket.gaierror("secret-signature")), "DNS lookup"),
+            (TimeoutError("secret-signature"), "timed out"),
+            (json.JSONDecodeError("secret-signature", "", 0), "non-JSON"),
+        ):
+            result = str(fetch.safe_failure("Mozilla download API", error))
+            self.assertIn(expected, result)
+            self.assertNotIn("secret-signature", result)
+
+    def test_api_failure_is_not_relabelled_as_invalid_key_and_does_not_start_storage(self):
+        error = fetch.urllib.error.HTTPError("https://api.example", 403, "Forbidden",
+            {"Content-Type": "application/json"}, io.BytesIO(b'{"cloudflare_error":true,"error_code":1010}'))
+        with patch.dict("os.environ", MOZILLA_DATA_COLLECTIVE_API_KEY="fixture-secret"), \
+             patch.object(fetch.urllib.request, "build_opener") as opener, \
+             patch.object(fetch.urllib.request, "urlopen") as storage:
+            opener.return_value.open.side_effect = error
+            with self.assertRaisesRegex(RuntimeError, "HTTP 403.*Cloudflare 1010"):
+                fetch.download(self.root / "not-created.tar.gz")
+            storage.assert_not_called()
+        self.assertFalse((self.root / "not-created.tar.gz").exists())
 
     def test_extraction_rejects_links_traversal_and_wrong_root(self):
         for name, symlink in ((fetch.CORPUS + "/../../escape", False), ("/absolute", False),
