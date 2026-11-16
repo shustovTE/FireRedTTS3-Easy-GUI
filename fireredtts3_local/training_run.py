@@ -17,7 +17,7 @@ import torchaudio
 
 from .training_data import (SpeakerPairs, assert_disjoint, dataset_fingerprint,
                             model_identity, file_digest, load_manifest, split_manifest, write_manifest)
-from .training_objective import adapter_targets, validate_adapter_targets
+from .training_objective import adapter_targets, validate_adapter_targets, dense_targets
 from .training_features import BatchFeatures, BatchRequest, FeatureCache
 from .training_batch import Example, batch_flow_loss, set_training
 
@@ -57,6 +57,12 @@ class TrainingOptions:
     batch_token_budget: int = 0
     dit_chunk_size: int = 0
     expected_base_fingerprint: str = ""
+    precision_policy: str = "legacy_bf16"
+    stop_loss_mode: str = "mean"
+    stop_gradient_to_backbone: bool = True
+    stop_lr_scale: float = 1.0
+    keep_checkpoint_every: int = 0
+    generation_benchmark: str = ""
 
     def validate(self):
         if not isinstance(self.expected_base_fingerprint, str) or (self.expected_base_fingerprint
@@ -65,8 +71,18 @@ class TrainingOptions:
         for name, value in asdict(self).items():
             if isinstance(value, (int, float)) and not math.isfinite(value):
                 raise ValueError(f"{name} must be finite")
-        if self.profile not in {"backbone", "backbone_dit"}:
-            raise ValueError("profile must be backbone or backbone_dit")
+        if self.profile not in {"backbone", "backbone_dit", "hybrid"}:
+            raise ValueError("profile must be backbone, backbone_dit or hybrid")
+        if self.precision_policy not in {"legacy_bf16", "native"}:
+            raise ValueError("Unknown precision policy")
+        if self.stop_loss_mode not in {"mean", "balanced"}:
+            raise ValueError("Unknown stop loss mode")
+        if type(self.stop_gradient_to_backbone) is not bool or self.stop_lr_scale <= 0:
+            raise ValueError("Invalid stop gradient/LR policy")
+        if not self.stop_gradient_to_backbone and self.profile != "hybrid":
+            raise ValueError("Detached stop loss requires a trainable hybrid stop head")
+        if not isinstance(self.generation_benchmark, str):
+            raise ValueError("generation_benchmark must be a path string")
         if self.validation_scope not in {"speaker", "recording"}:
             raise ValueError("validation_scope must be speaker or recording")
         if self.attention_backend not in {"sdpa", "flash_attention_2"}:
@@ -88,7 +104,7 @@ class TrainingOptions:
         for name in ("validation_pairs", "batch_size", "validation_batch_size", "prefetch_batches"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
-        for name in ("loader_workers", "patience", "batch_token_budget", "dit_chunk_size"):
+        for name in ("loader_workers", "patience", "batch_token_budget", "dit_chunk_size", "keep_checkpoint_every"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
         for name in ("gradient_checkpointing", "require_precomputed_features", "offload_frozen_encoders", "bucket_by_length", "validation_all_targets"):
@@ -174,7 +190,7 @@ def isolated_rng(seed):
         random.setstate(state)
 
 
-def to_examples(tts, loaded):
+def to_examples(tts, loaded, precision_policy="legacy_bf16"):
     texts = [f"<|{target['language']}|><|sot|>{prompt['text']}{target['text']}<|eot|>"
              for _, _, prompt, target, _ in loaded]
     if hasattr(tts, "text_tokenizer"):
@@ -194,7 +210,8 @@ def to_examples(tts, loaded):
     def move(data, key):
         tensor = data[key]
         if id(tensor) not in transferred:
-            dtype = torch.bfloat16 if key == 'patch_embeddings' and torch.device(tts.device).type == 'cuda' else tensor.dtype
+            dtype = (torch.bfloat16 if precision_policy == 'legacy_bf16' and key == 'patch_embeddings'
+                     and torch.device(tts.device).type == 'cuda' else tensor.dtype)
             transferred[id(tensor)] = tensor.to(tts.device, dtype=dtype, non_blocking=True)
         return transferred[id(tensor)]
     return [Example(token, move(pa, 'latents'), move(ta, 'latents'), move(pa, 'speaker'), keep,
@@ -303,12 +320,14 @@ def validate_model(tts, cache, pairs, options, seed, *, all_targets=False):
             requests = (BatchRequest(batch) for batch in bounded_batches(
                 sampled, options.validation_batch_size, options.batch_token_budget))
             for _, loaded in loader.iterate(requests):
-                examples = to_examples(tts, loaded)
+                examples = to_examples(tts, loaded, options.precision_policy)
                 validation_patches = options.validation_patches_per_example or options.patches_per_example
                 _, metrics = batch_flow_loss(tts, examples, validation_patches,
                                              0.0, options.stop_weight, generator=generator,
                                              dit_chunk_size=options.dit_chunk_size,
-                                             include_stop_diagnostics=True)
+                                             include_stop_diagnostics=True, precision_policy=options.precision_policy,
+                                             stop_loss_mode=options.stop_loss_mode,
+                                             stop_gradient_to_backbone=options.stop_gradient_to_backbone)
                 for key, value in metrics.items():
                     values[key] = values.get(key, 0.0) + float(value)*len(examples)
         return {key: value/len(sampled) for key, value in values.items()}
@@ -338,9 +357,12 @@ def initial_adapter_info(path, rank, alpha, dropout, profile):
     if any(config.get(key) != value for key, value in expected.items()):
         raise ValueError("initial_adapter rank/alpha/dropout/type differ from the new stage")
     if any(config.get(key) for key in ("rank_pattern", "alpha_pattern", "use_dora", "use_rslora",
-                                       "lora_bias", "modules_to_save", "exclude_modules", "layers_to_transform",
+                                       "lora_bias", "exclude_modules", "layers_to_transform",
                                        "target_parameters", "trainable_token_indices", "fan_in_fan_out")):
         raise ValueError("Unsupported initial_adapter configuration")
+    stored_dense = config.get("modules_to_save") or []
+    if not isinstance(stored_dense, list) or set(stored_dense) != set(dense_targets(profile)):
+        raise ValueError("initial_adapter dense modules differ from the declared profile")
     if config.get("layers_to_transform") is not None:
         # Layer zero is a real restriction despite being falsey. Suffix resolution
         # below is valid only when PEFT has no additional layer filter.
@@ -366,7 +388,7 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
                enable_eval_audio=False, eval_text="Проверяем произношение и естественность русской речи.",
                eval_reference_audio=None, eval_reference_transcript="", eval_language="Russian",
                options=None, initial_adapter=None):
-    from peft import LoraConfig, PeftModel, get_peft_model
+    from peft import LoraConfig
     from torch.utils.tensorboard import SummaryWriter
     from .training import STOP_EVENT
     from .paths import MODEL_DIR
@@ -402,6 +424,9 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
     }
     if adaptation:
         recipe['adaptation_validation_fingerprint'] = dataset_fingerprint(adaptation.rows)
+    if opts.generation_benchmark:
+        from .training_monitor import load_benchmark
+        _, recipe['generation_benchmark_fingerprint'] = load_benchmark(opts.generation_benchmark)
     initial = initial_adapter_info(initial_adapter, rank, alpha, dropout, opts.profile) if initial_adapter else None
     if initial:
         recipe["initial_adapter_fingerprint"] = initial["fingerprint"]
@@ -444,24 +469,33 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
         if initial:
             validate_adapter_targets(core, initial["targets"], targets)
         if resume:
-            core = PeftModel.from_pretrained(core, str(resume), is_trainable=True)
+            from .hybrid import load_adapter
+            core = load_adapter(core, resume, is_trainable=True)
         elif initial:
-            core = PeftModel.from_pretrained(core, initial["path"], is_trainable=True)
+            from .hybrid import load_adapter
+            core = load_adapter(core, initial["path"], is_trainable=True)
             log(f"[training] New stage from {initial['path']}; optimizer, scheduler and stage step start fresh.")
         else:
-            core = get_peft_model(core, LoraConfig(r=rank, lora_alpha=alpha, lora_dropout=dropout,
-                                                 target_modules=targets, bias="none"))
+            from .hybrid import create_adapter
+            core = create_adapter(core, LoraConfig(r=rank, lora_alpha=alpha, lora_dropout=dropout,
+                                                 target_modules=targets, bias="none",
+                                                 modules_to_save=list(dense_targets(opts.profile)) or None))
         tts.tts_core = core
         if opts.gradient_checkpointing:
             core.backbone_llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        named = [(n, p) for n, p in core.named_parameters() if p.requires_grad]
-        if not named or any("lora_" not in n for n, _ in named):
-            raise RuntimeError("Expected only LoRA parameters to be trainable")
+        from .hybrid import check_trainable
+        named = check_trainable(core, opts.profile)
         acoustic = [p for n, p in named if ".dit." in n or ".dit_head." in n]
-        backbone = [p for n, p in named if ".dit." not in n and ".dit_head." not in n]
+        stop_parameters = [p for n, p in named if ".stop_head." in n]
+        backbone = [p for n, p in named if all(x not in n for x in (".dit.", ".dit_head.", ".stop_head."))]
         groups = [{"params": backbone, "lr": learning_rate}]
         if acoustic:
             groups.append({"params": acoustic, "lr": learning_rate * opts.dit_lr_scale})
+        if stop_parameters:
+            groups.append({"params": stop_parameters, "lr": learning_rate * opts.stop_lr_scale})
+        log(f"[training] trainable={sum(p.numel() for _, p in named):,}; "
+            f"full_modules={list(dense_targets(opts.profile))}; precision={opts.precision_policy}; "
+            f"stop_loss={opts.stop_loss_mode}")
         optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01)
         warmup = max(1, min(100, int(total * 0.05)))
         def schedule(step):
@@ -471,7 +505,8 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * fraction))
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
         set_training(core)
-        cache = FeatureCache(tts, opts.cache_dir or None, base_fingerprint, opts.require_precomputed_features)
+        cache = FeatureCache(tts, opts.cache_dir or None, base_fingerprint, opts.require_precomputed_features,
+                             opts.precision_policy)
         if opts.require_precomputed_features:
             cache.require_all(train.rows + validation.rows + (replay.rows if replay else []) + (adaptation.rows if adaptation else []))
         if opts.offload_frozen_encoders:
@@ -507,18 +542,24 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
                     "selection_metric": "held-out flow + stop loss; NOT a guarantee of voice similarity"}
         if adaptation:
             metadata['selection_metric'] = 'Mean of primary and secondary holdout flow + stop losses; primary separation follows validation_scope; NOT a guarantee of voice similarity'
+        if opts.generation_benchmark:
+            metadata['selection_metric'] += '; candidate must also pass the free-running regression guard; step 0 is the fallback'
         if initial:
             metadata["initial_adapter"] = {key: initial[key] for key in ("path", "fingerprint")}
 
-        def save(path):
+        def save(path, trainer=True):
             path.mkdir(parents=True, exist_ok=True)
             core.save_pretrained(str(path))
-            torch.save({"recipe": recipe, "base_fingerprint": base_fingerprint, "step": step, "optimizer": optimizer.state_dict(),
+            if trainer:
+                torch.save({"recipe": recipe, "base_fingerprint": base_fingerprint, "step": step, "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(), "sampler_rng": rng.getstate(),
                         "python_rng": random.getstate(), "torch_rng": torch.get_rng_state(),
                         "cuda_rng": torch.cuda.get_rng_state_all(), "best_validation": best,
-                        "bad_validations": bad}, path / "trainer_state.pt")
-            (path / "firered_lora_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+                            "bad_validations": bad}, path / "trainer_state.pt")
+            saved_metadata = {**metadata, "step": step}
+            if 'generation_guard' in saved_metadata:
+                saved_metadata['generation_checked_at_this_step'] = saved_metadata['generation_guard']['step'] == step
+            (path / "firered_lora_metadata.json").write_text(json.dumps(saved_metadata, indent=2), encoding="utf-8")
 
         def evaluate():
             nonlocal best, bad
@@ -547,10 +588,20 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
                     stream.write(json.dumps({'step': step, 'targets': len(adaptation.rows), **adapted_metrics})+'\n')
                 selection_loss = (metrics['loss'] + adapted_metrics['loss'])/2
                 with (out/'selection_metrics.jsonl').open('a', encoding='utf-8') as stream:
-                    stream.write(json.dumps({'step': step, 'unseen_voice_loss': metrics['loss'],
-                                             'adaptation_loss': adapted_metrics['loss'], 'loss': selection_loss})+'\n')
+                    selection = {'step': step, 'primary_loss': metrics['loss'], 'primary_scope': opts.validation_scope,
+                                 'adaptation_loss': adapted_metrics['loss'], 'loss': selection_loss}
+                    if opts.validation_scope == 'speaker':
+                        selection['unseen_voice_loss'] = metrics['loss']
+                    stream.write(json.dumps(selection)+'\n')
                 log(f"[adaptation-validation] step={step} loss={adapted_metrics['loss']:.6f}; selection_loss={selection_loss:.6f}")
-            if selection_loss < best:
+            generation_ok = True
+            if opts.generation_benchmark:
+                from .training_monitor import monitor
+                generation = monitor(tts, opts.generation_benchmark, out, step,
+                                     recipe['generation_benchmark_fingerprint'], opts.offload_frozen_encoders, log)
+                generation_ok = generation['passed']
+                metadata['generation_guard'] = generation
+            if (generation_ok and selection_loss < best) or step == 0:
                 best, bad = selection_loss, 0
                 save(out / "best-validation")
             else:
@@ -601,11 +652,13 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             while True:
                 waiting = time.perf_counter()
                 request, loaded = next(batches)
-                examples = to_examples(tts, loaded)
+                examples = to_examples(tts, loaded, opts.precision_policy)
                 data_seconds += time.perf_counter()-waiting
                 loss, metrics = batch_flow_loss(tts, examples, opts.patches_per_example,
                                                 opts.cfg_dropout, opts.stop_weight,
-                                                dit_chunk_size=opts.dit_chunk_size)
+                                                dit_chunk_size=opts.dit_chunk_size, precision_policy=opts.precision_policy,
+                                                stop_loss_mode=opts.stop_loss_mode,
+                                                stop_gradient_to_backbone=opts.stop_gradient_to_backbone)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite training loss at step {step}")
                 (loss*len(examples)).backward()
@@ -619,6 +672,14 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
             for _, parameter in named:
                 if parameter.grad is not None:
                     parameter.grad.div_(used)
+            if opts.profile == 'hybrid':
+                group_metrics = []
+                for group in optimizer.param_groups:
+                    norms = [p.grad.detach().float().norm() for p in group['params'] if p.grad is not None]
+                    group_metrics.append({'lr': group['lr'], 'grad_norm': float(torch.stack(norms).norm()) if norms else 0.})
+                with (out / 'optimizer_metrics.jsonl').open('a') as stream:
+                    stream.write(json.dumps(dict(step=step+1, groups=dict(zip(
+                        ('backbone', 'acoustic', 'stop'), group_metrics)))) + '\n')
             norm = torch.nn.utils.clip_grad_norm_([p for _, p in named], 0.5, error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
@@ -651,6 +712,8 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
                 log(f"[coverage] epoch={coverage['epoch']}/{training_epochs} targets={coverage['targets']} target_hours={coverage['target_hours']:.2f}")
             if progress_cb:
                 progress_cb(step, total, message)
+            if opts.keep_checkpoint_every and step % opts.keep_checkpoint_every == 0:
+                save(out / f'adapter-step-{step:06d}', trainer=False)
             due_save = (step % save_every == 0 if length_mode == "Steps"
                         else step % (save_every * steps_per_epoch) == 0)
             validation_interval = steps_per_epoch if opts.validate_every == "epoch" else opts.validate_every
@@ -660,7 +723,7 @@ def train_lora(manager, manifest_path, output_dir, rank=16, alpha=32, dropout=0.
                     save(out / f"checkpoint-step-{step:06d}")
                     preview()
                 if opts.patience and bad >= opts.patience:
-                    log("[training] Early stopping: validation loss has not improved")
+                    log("[training] Early stopping: no eligible validation improvement")
                     break
         save(out)
         log("[training] Compare best-validation and baseline on unseen voices before deployment.")

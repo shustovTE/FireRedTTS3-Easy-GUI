@@ -84,8 +84,8 @@ class ModelManager:
         path = Path(adapter_path)
         if not path.exists():
             raise FileNotFoundError(f"LoRA adapter not found: {path}")
-        from peft import PeftModel
-        model.tts_core = PeftModel.from_pretrained(model.tts_core, str(path), is_trainable=False)
+        from .hybrid import load_adapter
+        model.tts_core = load_adapter(model.tts_core, path)
         model.tts_core.eval()
         log(f"[adapter] Loaded FireRedTTS3 Base LoRA: {path}")
         return model

@@ -363,6 +363,11 @@ Prepared datasets and project metadata are kept separate from the original sourc
 
 Russian adaptation now includes speaker-aware data preparation, held-out validation, scoped LoRA, replay, base-model preservation and full-core export. See **[the Russian training guide](docs/RUSSIAN_TRAINING.md)** and **[the example recipe](recipes/russian_backbone.json)**. Existing manifests require explicit `speaker_id`; audio is no longer silently cropped.
 
+For a fresh-base joint experiment on the already prepared Dialogs and confirmed
+Common Voice recordings, see **[joint hybrid training](docs/JOINT_HYBRID_FROM_BASE.md)**:
+backbone LoRA plus full DiT/conditioning/stop-head updates, native precision,
+separate holdouts, resumable jobs and free-running generation regression checks.
+
 For confirmed spontaneous Russian speech after the fresh Dialogs-only stage, see
 **[Common Voice Spontaneous training](docs/COMMON_VOICE_SPONTANEOUS.md)**: pinned
 download, whole recordings up to 30 seconds, preserved transcribed disfluencies,

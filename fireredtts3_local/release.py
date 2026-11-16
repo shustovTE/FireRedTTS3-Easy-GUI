@@ -122,7 +122,7 @@ tags:
 
 # FireRedTTS3-Base — Russian adaptation
 
-This is a full FP32 checkpoint with the supplied Russian LoRA merged into the
+This is a full FP32 checkpoint with the supplied Russian adaptation merged into the
 FireRedTTS3 Base core. No separate adapter is needed for serving. The package
 includes the tokenizer, RedAE and CAM++ assets required for zero-shot cloning.
 
@@ -165,7 +165,8 @@ Original model: [FireRedTeam/FireRedTTS3](https://huggingface.co/FireRedTeam/Fir
 Packaging: CKermit / SGLang Omni. The original Apache-2.0 license is included in
 `LICENSE`; upstream attribution and usage guidance are retained in
 `UPSTREAM_MODEL_CARD.md`. This package contains modified model weights.
-The LoRA profile is `{provenance['profile']}`. Training audio, reference recordings,
+The adaptation profile is `{provenance['profile']}`. Fully trained modules included
+in the merge: `{provenance.get('dense_modules', [])}`. Training audio, reference recordings,
 optimizer state and authentication credentials are not part of this release.
 """
     if evaluation is not None:

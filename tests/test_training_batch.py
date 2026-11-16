@@ -169,7 +169,7 @@ class BatchMathTests(unittest.TestCase):
             embeddings = patch_embeddings(self.core, self.examples)
         cached = [replace(e, **{key:value.float() for key,value in emb.items()})
                   for e,emb in zip(self.examples,embeddings)]
-        with patch('fireredtts3_local.training_batch.autocast', side_effect=amp):
+        with patch('fireredtts3_local.training_objective.autocast', side_effect=amp):
             online, _ = batch_flow_loss(self.tts,self.examples,samples=self.samples)
             actual, _ = batch_flow_loss(self.tts,cached,samples=self.samples)
         torch.testing.assert_close(actual,online,rtol=0,atol=0)

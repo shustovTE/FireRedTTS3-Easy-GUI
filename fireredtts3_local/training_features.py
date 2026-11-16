@@ -22,16 +22,23 @@ from .training_data import file_digest, model_identity
 class FeatureCache:
     VERSION = 'redae-campp-patches-v2'
 
-    def __init__(self, tts, root=None, model_fingerprint='', read_only=False):
+    def __init__(self, tts, root=None, model_fingerprint='', read_only=False,
+                 precision_policy='legacy_bf16'):
         self.tts = tts
         self.read_only = read_only
         self.device = torch.device(tts.device)
+        self.precision_policy = precision_policy
         self.spec = {'version': self.VERSION, 'model': model_fingerprint,
                      'precision': 'cuda-bfloat16' if self.device.type == 'cuda' else 'cpu-float32',
                      'torch': str(torch.__version__),
                      'attention': os.environ.get('FIRERED_ATTN_IMPLEMENTATION', 'sdpa')}
+        if precision_policy == 'native':
+            self.spec.update(version='redae-campp-patches-native-v3',
+                             patch_precision='float32', core_precision='native')
+        elif precision_policy != 'legacy_bf16':
+            raise ValueError('Unknown feature precision policy')
         signature = hashlib.sha256(json.dumps(self.spec, sort_keys=True).encode()).hexdigest()
-        self.root = Path(root) / self.VERSION / signature if root else None
+        self.root = Path(root) / self.spec['version'] / signature if root else None
         if self.root and not model_fingerprint:
             raise ValueError('Disk features require a model fingerprint')
         if read_only and self.root is None:
@@ -83,7 +90,7 @@ class FeatureCache:
             raise ValueError(f'{len(missing)} missing feature files; first {missing[:3]}. Run adapt precompute with this recipe before training.')
 
     def encode(self, row):
-        from .training_objective import autocast
+        from .training_objective import precision_context
         if self.read_only:
             raise RuntimeError('Audio encoding is forbidden in precomputed training mode')
         if file_digest(row['audio']) != row['audio_sha256']:
@@ -100,7 +107,7 @@ class FeatureCache:
             audio = self.tts.redae.pad_to_multiple_of(audio, self.tts.redae.downsample_rate*self.tts.tts_core.patch_size).to(self.device)
             latents = self.tts.redae.encode(audio, self.tts.redae.sample_rate).float()
             speaker = self.tts.spk_extractor(audio, self.tts.redae.sample_rate).float()
-            with autocast(self.device):
+            with precision_context(self.device, self.precision_policy):
                 patches = encoder(latents)
         payload = {'spec': self.spec, 'audio_sha256': row['audio_sha256'],
                    'latents': latents.float().cpu().clone(), 'speaker': speaker.float().cpu().clone(),
@@ -130,8 +137,9 @@ class FeatureCache:
         return data['latents'].to(self.device), data['speaker'].to(self.device)
 
 
-def precompute_features(tts, rows, cache_dir, fingerprint, repair=False, log=print):
-    cache = FeatureCache(tts, cache_dir, fingerprint)
+def precompute_features(tts, rows, cache_dir, fingerprint, repair=False, log=print,
+                        precision_policy='legacy_bf16'):
+    cache = FeatureCache(tts, cache_dir, fingerprint, precision_policy=precision_policy)
     unique = {row['audio_sha256']: row for row in rows}
     report = {'spec': cache.spec, 'unique_audio': len(unique), 'encoded': 0, 'reused': 0, 'complete': False}
     started = time.perf_counter()
@@ -218,7 +226,8 @@ def precompute_recipe(recipe_path, base, repair=False, log=print):
     previous = os.environ.get('FIRERED_ATTN_IMPLEMENTATION')
     try:
         os.environ['FIRERED_ATTN_IMPLEMENTATION'] = options.attention_backend
-        return precompute_features(pipeline, rows, options.cache_dir, fingerprint, repair, log)
+        return precompute_features(pipeline, rows, options.cache_dir, fingerprint, repair, log,
+                                   options.precision_policy)
     finally:
         if previous is None:
             os.environ.pop('FIRERED_ATTN_IMPLEMENTATION', None)

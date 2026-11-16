@@ -51,10 +51,9 @@ def validate_export_config(core, template):
 
 
 def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, log=print):
-    from peft import PeftModel
     from safetensors import safe_open
     from .model_manager import ModelManager
-    from .training_objective import adapter_targets, validate_adapter_targets
+    from .training_objective import adapter_targets, validate_adapter_targets, dense_targets
     from .training_run import initial_adapter_info
     ModelManager._ensure_upstream_namespace()
     from fireredtts3.llm.fireredtts3_base import FireRedTTS3BaseCore
@@ -95,8 +94,16 @@ def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, l
     validate_adapter_targets(core, initial["targets"], targets)
     expected = {k: tuple(v.shape) for k, v in core.state_dict().items()}
     original = {k: tensor_digest(v) for k, v in core.state_dict().items()}
-    model = PeftModel.from_pretrained(core, str(adapter))
+    from .hybrid import load_adapter
+    model = load_adapter(core, adapter)
     model.eval()
+    # Full modules are independently serialized by PEFT. Check their exact
+    # tensors after merge as well as the existing LoRA forward probes.
+    dense = dense_targets(profile)
+    dense_expected = {f'{name}.{key}': tensor_digest(value)
+                      for name in dense
+                      for key, value in model.get_base_model().get_submodule(name)
+                          .modules_to_save['default'].state_dict().items()}
     # Real PEFT forwards before merging, not just a second implementation of B@A.
     generator = torch.Generator(device="cpu").manual_seed(1234)
     probes = {}
@@ -117,8 +124,11 @@ def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, l
             torch.testing.assert_close(after, before, rtol=1e-4, atol=1e-5)
             errors.append(float((after - before).abs().max()))
     final = {k: tensor_digest(v) for k, v in merged.state_dict().items()}
+    if any(final.get(key) != value for key, value in dense_expected.items()):
+        raise ValueError("Merge changed or lost trained dense-module tensors")
     changed = {key for key in original if original[key] != final[key]}
-    if changed - {name + ".weight" for name in targets}:
+    allowed = {name + ".weight" for name in targets} | set(dense_expected)
+    if changed - allowed:
         raise ValueError("Merge changed weights outside the declared LoRA target modules")
     provenance = {"base": str(base.resolve()), "adapter": str(adapter.resolve()),
                   "sglang_config_sha256": file_digest(sglang_config), "base_fingerprint": metadata["base_fingerprint"],
@@ -126,6 +136,7 @@ def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, l
                   "adapter_fingerprint": initial["fingerprint"], "profile": profile,
                   "changed_tensors": len(changed), "layer_probes": len(probes),
                   "layer_probe_max_abs_error": max(errors, default=0.0),
+                  "dense_modules": list(dense), "dense_tensors_verified": len(dense_expected),
                   "unchanged_tensors_verified": len(original) - len(changed),
                   "merge_dtype": "float32", "saved_tensor_hashes_verified": True,
                   "sglang_runtime_validated": False,

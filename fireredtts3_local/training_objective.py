@@ -18,10 +18,24 @@ def autocast(device):
     return torch.autocast("cuda", dtype=torch.bfloat16) if torch.device(device).type == "cuda" else contextlib.nullcontext()
 
 
+def precision_context(device, policy="legacy_bf16"):
+    if policy == "native":
+        return torch.autocast(torch.device(device).type, enabled=False)
+    if policy != "legacy_bf16":
+        raise ValueError("Unknown core precision policy")
+    return autocast(device)
+
+
+def dense_targets(profile):
+    """PEFT keeps frozen originals for the teacher and saves trained full modules."""
+    return ("dit", "dit_head", "stop_head") if profile == "hybrid" else ()
+
+
 def adapter_targets(core, profile: str):
     profiles = {
         "backbone": ("backbone_llm.",),
         "backbone_dit": ("backbone_llm.", "dit.", "dit_head"),
+        "hybrid": ("backbone_llm.",),
     }
     if profile not in profiles:
         raise ValueError(f"Unknown adaptation profile: {profile}")

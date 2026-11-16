@@ -5,13 +5,14 @@ Padded positions never enter patch selection, acoustic history or loss reduction
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
 
-from .training_objective import autocast
+from .training_objective import autocast, precision_context
 
 
 @dataclass
@@ -80,7 +81,8 @@ def patch_embeddings(core, examples):
     return result
 
 
-def batch_conditioning(core, examples, samples, embeddings):
+def batch_conditioning(core, examples, samples, embeddings, precision_policy="legacy_bf16",
+                       stop_gradient_to_backbone=True):
     """One backbone forward; gather ONLY sampled DiT conditions and valid stops."""
     device = examples[0].target.device
     token_counts = [e.tokens.numel() for e in examples]
@@ -100,8 +102,11 @@ def batch_conditioning(core, examples, samples, embeddings):
     inputs = pad_sequence(sequences, batch_first=True)
     positions = torch.arange(inputs.shape[1], device=device)[None].expand(len(examples), -1)
     mask = positions < lengths[:, None]
-    hidden = core.backbone_llm(inputs_embeds=inputs, attention_mask=mask,
-                               position_ids=positions, use_cache=False).last_hidden_state
+    # Native inference autocasts only the backbone; outer context is already
+    # configured by the caller for the legacy path.
+    with autocast(device) if precision_policy == "native" else contextlib.nullcontext():
+        hidden = core.backbone_llm(inputs_embeds=inputs, attention_mask=mask,
+                                  position_ids=positions, use_cache=False).last_hidden_state
     patch_owners = torch.cat([torch.full_like(sample.indices, i) for i, sample in enumerate(samples)])
     patch_indices = torch.cat([s.indices for s in samples])
     first = torch.tensor(first_states, device=device)
@@ -115,7 +120,10 @@ def batch_conditioning(core, examples, samples, embeddings):
     stop_owners = torch.repeat_interleave(torch.arange(len(examples), device=device),
                                          torch.tensor([n+1 for n in target_counts], device=device))
     stop_indices = torch.cat([torch.arange(n+1, device=device) for n in target_counts])
-    stop_logits = core.stop_head(hidden[stop_owners, first[stop_owners] + stop_indices]).float().flatten()
+    stop_hidden = hidden[stop_owners, first[stop_owners] + stop_indices]
+    if not stop_gradient_to_backbone:
+        stop_hidden = stop_hidden.detach()
+    stop_logits = core.stop_head(stop_hidden).float().flatten()
     counts = torch.tensor(target_counts, device=device)
     stop_targets = (stop_indices == counts[stop_owners]).float()
     return conditions, spk_dit[patch_owners], stop_logits, stop_targets, stop_owners, patch_owners
@@ -166,6 +174,17 @@ def example_mean(values, owners, count):
     return sums / counts.clamp_min(1)
 
 
+def reduce_stop_loss(logits, targets, owners, count, mode="mean"):
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    if mode == "mean":
+        return example_mean(bce, owners, count)
+    if mode != "balanced":
+        raise ValueError("Unknown stop loss reduction")
+    end = targets.bool()
+    return .5 * (example_mean(bce[end], owners[end], count)
+                 + example_mean(bce[~end], owners[~end], count))
+
+
 def stop_diagnostics(logits, targets, owners, count):
     """Teacher-forced endpoint metrics, averaged per utterance, not per frame.
 
@@ -194,7 +213,8 @@ def stop_diagnostics(logits, targets, owners, count):
 
 def batch_flow_loss(tts, examples, patches_per_example=8, cfg_dropout=.1,
                     stop_weight=.05, samples=None, generator=None, dit_chunk_size=0,
-                    include_stop_diagnostics=False):
+                    include_stop_diagnostics=False, precision_policy="legacy_bf16",
+                    stop_loss_mode="mean", stop_gradient_to_backbone=True):
     if not examples:
         raise ValueError("Empty training batch")
     core = tts.tts_core
@@ -208,7 +228,7 @@ def batch_flow_loss(tts, examples, patches_per_example=8, cfg_dropout=.1,
         raise ValueError("Precomputed patch embeddings require a frozen PatchEncoder")
     if frozen_patches:
         core.patch_encoder.eval()
-    with autocast(device):
+    with precision_context(device, precision_policy):
         embeddings = patch_embeddings(core, examples)
     tensors = flow_inputs(core, examples, samples)
     teacher = None
@@ -219,21 +239,23 @@ def batch_flow_loss(tts, examples, patches_per_example=8, cfg_dropout=.1,
         was_training = core.training
         try:
             core.eval()
-            with torch.no_grad(), core.disable_adapter(), autocast(device):
+            with torch.no_grad(), core.disable_adapter(), precision_context(device, precision_policy):
                 subset = [examples[i] for i in retained]
                 subset_samples = [samples[i] for i in retained]
                 subset_embeds = [{k: v.detach() for k, v in embeddings[i].items()} for i in retained]
-                cond, spk, stop, _, stop_owner, patch_owner = batch_conditioning(core, subset, subset_samples, subset_embeds)
+                cond, spk, stop, _, stop_owner, patch_owner = batch_conditioning(
+                    core, subset, subset_samples, subset_embeds, precision_policy, stop_gradient_to_backbone)
                 pred = predict(core, cond, spk, flow_inputs(core, subset, subset_samples), dit_chunk_size)
                 teacher = pred, stop, stop_owner, patch_owner
         finally:
             set_training(core, was_training)
-    with autocast(device):
-        cond, spk, stop, targets, stop_owner, patch_owner = batch_conditioning(core, examples, samples, embeddings)
+    with precision_context(device, precision_policy):
+        cond, spk, stop, targets, stop_owner, patch_owner = batch_conditioning(
+            core, examples, samples, embeddings, precision_policy, stop_gradient_to_backbone)
         pred = predict(core, cond, spk, tensors, dit_chunk_size)
     count = len(examples)
     flow = example_mean((pred-(tensors[0]-tensors[2]).float()).square().mean((1, 2)), patch_owner, count)
-    stop_loss = example_mean(F.binary_cross_entropy_with_logits(stop, targets, reduction="none"), stop_owner, count)
+    stop_loss = reduce_stop_loss(stop, targets, stop_owner, count, stop_loss_mode)
     preservation = flow.new_zeros(count)
     if teacher is not None:
         teacher_pred, teacher_stop, teacher_stop_owner, teacher_patch_owner = teacher
