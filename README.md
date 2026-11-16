@@ -369,6 +369,9 @@ backbone LoRA plus full DiT/conditioning/stop-head updates, native precision,
 separate holdouts, resumable jobs and free-running generation regression checks.
 For a failed long-speech check, use the [native CFG/checkpoint diagnostic matrix](docs/CFG_DIAGNOSTICS.md)
 to compare the original base and saved intermediate weights without further training.
+The [component ablation diagnostic](docs/COMPONENT_DIAGNOSTICS.md) then compares
+all eight combinations of backbone LoRA, dense acoustics and the stop head at a
+fixed CFG, with original-base and full-checkpoint reproduction controls.
 
 For confirmed spontaneous Russian speech after the fresh Dialogs-only stage, see
 **[Common Voice Spontaneous training](docs/COMMON_VOICE_SPONTANEOUS.md)**: pinned

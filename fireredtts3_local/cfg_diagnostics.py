@@ -36,7 +36,7 @@ def runtime_identity():
     root = Path(__file__).resolve().parent.parent
     files = sorted((root/'fireredtts3_upstream').rglob('*.py'))
     files += [root/'fireredtts3_local'/name for name in
-              ('cfg_diagnostics.py', 'training_monitor.py', 'model_manager.py', 'hybrid.py',
+              ('cfg_diagnostics.py', 'component_diagnostics.py', 'training_monitor.py', 'model_manager.py', 'hybrid.py',
                'training_data.py', 'training_run.py', 'training_objective.py')]
     return dict(code={str(p.relative_to(root)): file_digest(p) for p in files},
                 packages={name: importlib.metadata.version(name) for name in
@@ -111,8 +111,15 @@ def make_plan(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, steps=(50,143,286),
 
 
 def verify_plan(plan):
-    current = make_plan(plan['run'], plan['output'], [s['step'] for s in plan['stages'][1:]],
-                        plan['cfgs'], [r['id'] for r in plan['cases']])
+    if plan['schema'] == SCHEMA:
+        current = make_plan(plan['run'], plan['output'], [s['step'] for s in plan['stages'][1:]],
+                            plan['cfgs'], [r['id'] for r in plan['cases']])
+    else:
+        from .component_diagnostics import SCHEMA as COMPONENT_SCHEMA, make_plan as component_plan
+        if plan['schema'] != COMPONENT_SCHEMA:
+            raise ValueError('Unknown diagnostic schema')
+        current = component_plan(plan['run'], plan['output'], plan['ablation_step'],
+                                 [r['id'] for r in plan['cases']])
     if current != plan:
         raise ValueError('Weights, benchmark, training reports or runtime changed; use a new diagnostic output')
 
@@ -154,7 +161,10 @@ def annotate(results, plan):
         row['failures'] = failures(row, reference)
         row['rms_drift_delta_vs_base_same_cfg'] = (
             row['end_minus_start_rms_db']-reference['end_minus_start_rms_db'] if reference else None)
-        previous = old.get((row['step'], row['id'])) if row['cfg']==2. else None
+        # Partial components intentionally differ from their source checkpoint.
+        # Only the base and complete-checkpoint controls reproduce old results.
+        previous_step = row.get('comparison_step', row['step'])
+        previous = old.get((previous_step, row['id'])) if row['cfg']==2. else None
         row['previous_monitor'] = None if previous is None else dict(
             seconds_delta=row['seconds']-previous['seconds'],
             rms_drift_delta_db=row['end_minus_start_rms_db']-previous['end_minus_start_rms_db'],
@@ -166,12 +176,20 @@ def annotate(results, plan):
 
 def persist(output, plan, results):
     annotate(results, plan)
-    report = dict(schema=SCHEMA, plan_sha256=signature(plan), complete=len(results)==plan['total_cases'],
+    report = dict(schema=plan['schema'], plan_sha256=signature(plan), complete=len(results)==plan['total_cases'],
                   completed_cases=len(results), total_cases=plan['total_cases'], results=results,
                   note='Native inference only. No weights updated. No ASR or speaker-similarity scoring; '
                        'duration, RMS and engineering checks do not certify pronunciation or timbre.')
+    if 'ablation_step' in plan:
+        report['ablation_step'] = plan['ablation_step']
+        report['component_definitions'] = plan['component_definitions']
+        report['reproduction_controls_complete'] = all(any(
+            r['stage']==stage and r['id']==case['id'] and r.get('previous_monitor') is not None
+            for r in results) for stage in ('base','all') for case in plan['cases'])
+        report['reproduction_review_required'] = any(
+            r.get('previous_monitor') and r['previous_monitor']['reproduction_review_required'] for r in results)
     write_json(output/'report.json', report)
-    columns = ('stage','step','cfg','id','seed','seconds','finish_reason','end_minus_start_rms_db',
+    columns = ('stage','step','active_components','cfg','id','seed','seconds','finish_reason','end_minus_start_rms_db',
                'rms_drift_delta_vs_base_same_cfg','fraction_at_or_above_full_scale','peak',
                'first_latent_rms','last_latent_rms','latent_rms_ratio','pcm_gain','failures','audio')
     temporary = output/'summary.csv.tmp'
@@ -179,7 +197,8 @@ def persist(output, plan, results):
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction='ignore')
         writer.writeheader(); writer.writerows(results)
     temporary.replace(output/'summary.csv')
-    lines = ['# Native CFG diagnostics', '', f"Completed {len(results)}/{plan['total_cases']} cases.", '',
+    title = 'Native component diagnostics' if 'ablation_step' in plan else 'Native CFG diagnostics'
+    lines = ['# '+title, '', f"Completed {len(results)}/{plan['total_cases']} cases.", '',
              '| Weights | CFG | Case | Seconds | Finish | RMS drift dB | Δ vs base, same CFG | Outside ±1 % | Checks |',
              '|---|---:|---|---:|---|---:|---:|---:|---|']
     for r in results:
@@ -193,6 +212,13 @@ def persist(output, plan, results):
               'Listening copies use fixed gain only when needed; inspect raw float WAV/metrics for level comparisons.',
               'Fewer seconds or no flags do not prove that all words were spoken. ASR is not run.',
               'Check previous_monitor in report.json: materially different CFG=2 reproduction needs investigation.']
+    if 'ablation_step' in plan:
+        lines += ['', f"All trained components come from checkpoint {plan['ablation_step']}.",
+                  'backbone = backbone LoRA; acoustic = full DiT + dit_head; stop = full stop_head.',
+                  'Unselected components use original base weights. RedAE, speaker extraction/projections and PatchEncoder are unchanged.',
+                  'base and all are reproduction controls; partial variants are not expected to match the full checkpoint.',
+                  'If either control differs materially from its prior report, investigate reproducibility before attributing a cause.',
+                  'Mixed components were not trained independently. Their interactions can change generation; no automatic culprit or winner is selected.']
     (output/'summary.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
     return report
 
@@ -271,6 +297,15 @@ def execute(plan, *, resume=False, manager=None, log=print):
                     if stage['adapter']:
                         validate_adapter_targets(tts.tts_core,stage['targets'],adapter_targets(tts.tts_core,'hybrid'))
                         manager._attach_adapter(tts,stage['adapter'],log)
+                    component_audit = None
+                    if 'active_components' in stage:
+                        from .component_diagnostics import select_components
+                        if stage['adapter']:
+                            component_audit = select_components(tts.tts_core,stage['active_components'])
+                        elif stage['active_components']:
+                            raise ValueError('Trained components require an adapter')
+                        else:
+                            component_audit = dict(active_components=[], original_base=True)
                     for module in (tts.tts_core,tts.redae,tts.spk_extractor):
                         module.eval();module.requires_grad_(False)
                     for cfg,row in pending:
@@ -294,6 +329,9 @@ def execute(plan, *, resume=False, manager=None, log=print):
                             **latent_summary(metrics),pcm_gain=gain,
                             audio=str(paths[1].relative_to(output)),float_audio=str(paths[0].relative_to(output)),
                             artifacts={str(p.relative_to(output)):file_digest(p) for p in paths})
+                        if component_audit is not None:
+                            result.update(active_components=stage['active_components'],component_audit=component_audit,
+                                          comparison_step=stage['comparison_step'])
                         results.append(result);done.add(key)
                         persist(output,plan,results)
                         log(f"[cfg-diagnostics] {key}: {metrics['seconds']:.2f}s; {metrics['finish_reason']}; "
@@ -315,7 +353,7 @@ def execute(plan, *, resume=False, manager=None, log=print):
 
 
 def launch(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, job_dir=DEFAULT_JOB, *, resume=False,
-           steps=(50,143,286), cfgs=(0.,1.,2.), cases=DEFAULT_CASES):
+           steps=(50,143,286), cfgs=(0.,1.,2.), cases=DEFAULT_CASES, component_step=None):
     import fcntl
     run,output,job=Path(run).resolve(),Path(output).resolve(),Path(job_dir).resolve()
     if job.exists():raise ValueError('Use a new job directory, including when resuming')
@@ -331,7 +369,11 @@ def launch(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, job_dir=DEFAULT_JOB, *, resum
     with lock_path.open('a+') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError as exc:raise ValueError('Training or a diagnostic already owns this source run') from exc
-        plan=make_plan(run,output,steps,cfgs,cases)
+        if component_step is None:
+            plan=make_plan(run,output,steps,cfgs,cases)
+        else:
+            from .component_diagnostics import make_plan as component_plan
+            plan=component_plan(run,output,component_step,cases)
         if resume and json.loads((output/'plan.json').read_text())!=plan:
             raise ValueError('Resume inputs or runtime changed; use a new output')
         job.mkdir(parents=True,exist_ok=False)

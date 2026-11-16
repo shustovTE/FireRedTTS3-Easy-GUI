@@ -1,5 +1,8 @@
 # Диагностика регрессии joint-10: CFG и ранние checkpoint
 
+Для следующего этапа — разделения влияния backbone LoRA, DiT/dit_head и stop_head
+при фиксированном CFG — есть [матрица компонентов checkpoint 143](COMPONENT_DIAGNOSTICS.md).
+
 Эта команда выполняет **только нативную генерацию**, без обучения, слияния,
 публикации или изменения работающего SGLang. Она использует существующие
 checkpoint и benchmark прогона `russian-joint-base-10`.
