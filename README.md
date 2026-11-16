@@ -361,6 +361,13 @@ Prepared datasets and project metadata are kept separate from the original sourc
 
 ## 🧬 LoRA Training
 
+**Research status (2026-11-17):** the joint/hybrid and sampled-history experiments
+have not resolved long-utterance omissions or acoustic drift. Read the
+**[training strategy review](docs/TRAINING_STRATEGY_REVIEW_2026_11.md)** before
+starting another run. It separates verified findings from hypotheses and proposes
+controlled comparisons with complete-text generation checks. Historical recipes
+remain available for reproducibility; they are not validated artifact fixes.
+
 Russian adaptation now includes speaker-aware data preparation, held-out validation, scoped LoRA, replay, base-model preservation and full-core export. See **[the Russian training guide](docs/RUSSIAN_TRAINING.md)** and **[the example recipe](recipes/russian_backbone.json)**. Existing manifests require explicit `speaker_id`; audio is no longer silently cropped.
 
 For a fresh-base joint experiment on the already prepared Dialogs and confirmed
