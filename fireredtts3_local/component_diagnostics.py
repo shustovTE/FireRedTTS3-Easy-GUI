@@ -10,6 +10,9 @@ from . import cfg_diagnostics as shared
 DEFAULT_OUTPUT = 'training/eval/joint-10-component-diagnostics'
 DEFAULT_JOB = 'training/jobs/joint-10-components'
 SCHEMA = 'native-component-diagnostics-v1'
+SPLIT_SCHEMA = 'native-acoustic-components-v1'
+SPLIT_OUTPUT = 'training/eval/joint-10-acoustic-diagnostics'
+SPLIT_JOB = 'training/jobs/joint-10-acoustic'
 COMPONENTS = ('backbone', 'acoustic', 'stop')
 DEFINITIONS = {
     'backbone': 'Trained backbone_llm LoRA; disabled uses the original backbone weights.',
@@ -26,9 +29,27 @@ VARIANTS = (
     ('backbone_stop', ('backbone', 'stop')),
     ('acoustic_stop', ('acoustic', 'stop')),
 )
+SPLIT_DEFINITIONS = {
+    'backbone': DEFINITIONS['backbone'],
+    'dit': 'Trained full DiT; disabled uses the original base DiT.',
+    'projection': 'Trained dit_head conditioning projection; disabled uses the original dit_head.',
+    'stop': 'Trained stop_head only in the all-components reproduction control; original in the eight-way matrix.',
+}
+SPLIT_VARIANTS = (
+    ('base', ()),
+    ('all', ('backbone', 'dit', 'projection', 'stop')),
+    ('backbone_dit_projection', ('backbone', 'dit', 'projection')),
+    ('backbone_only', ('backbone',)),
+    ('dit_only', ('dit',)),
+    ('projection_only', ('projection',)),
+    ('backbone_dit', ('backbone', 'dit')),
+    ('backbone_projection', ('backbone', 'projection')),
+    ('dit_projection', ('dit', 'projection')),
+)
 
 
-def make_plan(run=shared.DEFAULT_RUN, output=DEFAULT_OUTPUT, step=143, cases=shared.DEFAULT_CASES):
+def make_plan(run=shared.DEFAULT_RUN, output=DEFAULT_OUTPUT, step=143, cases=shared.DEFAULT_CASES,
+              *, split_acoustic=False):
     plan = shared.make_plan(run, output, steps=(step,), cfgs=(2.,), cases=cases)
     if str(step) not in plan['previous_reports']:
         raise ValueError('The selected checkpoint needs a previous generation report for the all-components control')
@@ -40,11 +61,15 @@ def make_plan(run=shared.DEFAULT_RUN, output=DEFAULT_OUTPUT, step=143, cases=sha
         if len(ids) != len(set(ids)) or not set(cases) <= set(ids):
             raise ValueError(f'Previous control report at step {control} has missing or duplicate cases')
     base, trained = plan['stages']
-    plan.update(schema=SCHEMA, ablation_step=step, component_definitions=DEFINITIONS,
+    variants = SPLIT_VARIANTS if split_acoustic else VARIANTS
+    plan.update(schema=SPLIT_SCHEMA if split_acoustic else SCHEMA, ablation_step=step,
+                component_definitions=SPLIT_DEFINITIONS if split_acoustic else DEFINITIONS,
                 stages=[dict(base if name == 'base' else trained,
                              name=name, active_components=list(active),
                              comparison_step=0 if name == 'base' else step if name == 'all' else None)
-                        for name, active in VARIANTS], total_cases=len(VARIANTS)*len(cases))
+                        for name, active in variants], total_cases=len(variants)*len(cases))
+    if split_acoustic:
+        plan['training_parity'] = True
     return plan
 
 
@@ -59,9 +84,15 @@ def select_components(core, active):
     from peft.tuners.lora.layer import LoraLayer
     from peft.utils.other import ModulesToSaveWrapper
 
-    if len(set(active)) != len(active) or set(active) - set(COMPONENTS):
-        raise ValueError('Select unique components from backbone, acoustic, stop')
-    active = [name for name in COMPONENTS if name in active]
+    order = ('backbone', 'acoustic', 'dit', 'projection', 'stop')
+    if len(set(active)) != len(active) or set(active) - set(order):
+        raise ValueError('Select unique components from backbone, acoustic, dit, projection, stop')
+    if 'acoustic' in active and {'dit', 'projection'} & set(active):
+        raise ValueError('Select acoustic as a group or dit/projection separately')
+    active = [name for name in order if name in active]
+    enabled_dense = {'dit': 'dit' in active or 'acoustic' in active,
+                     'dit_head': 'projection' in active or 'acoustic' in active,
+                     'stop_head': 'stop' in active}
     if not isinstance(core, PeftModel) or set(core.peft_config) != {'default'}:
         raise ValueError('Component diagnostics require one unmerged default hybrid adapter')
     base = core.get_base_model()
@@ -85,11 +116,11 @@ def select_components(core, active):
     for layer in lora.values():
         layer.enable_adapters('backbone' in active)
     for name, layer in dense.items():
-        layer.enable_adapters(('stop' if name == 'stop_head' else 'acoustic') in active)
+        layer.enable_adapters(enabled_dense[name])
     core.eval()
     core.requires_grad_(False)
     if (any(layer.disable_adapters != ('backbone' not in active) for layer in lora.values())
-            or any(layer.disable_adapters != (('stop' if name == 'stop_head' else 'acoustic') not in active)
+            or any(layer.disable_adapters == enabled_dense[name]
                    for name, layer in dense.items())):
         raise RuntimeError('PEFT did not apply the requested component routing')
     return dict(active_components=active, backbone_lora_layers=len(lora),
@@ -101,10 +132,12 @@ def select_components(core, active):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    start = commands.add_parser('start', help='Run eight component variants in a detached job')
+    start = commands.add_parser('start', help='Run component variants in a detached job')
     start.add_argument('--run', default=shared.DEFAULT_RUN)
-    start.add_argument('--output', default=DEFAULT_OUTPUT)
-    start.add_argument('--job-dir', default=DEFAULT_JOB)
+    start.add_argument('--output')
+    start.add_argument('--job-dir')
+    start.add_argument('--split-acoustic', action='store_true',
+                       help='Separate DiT and dit_head: eight variants with base stop, plus full control; forward parity audit')
     start.add_argument('--resume', action='store_true')
     start.add_argument('--step', type=int, default=143)
     start.add_argument('--cases', nargs='+', default=shared.DEFAULT_CASES)
@@ -117,6 +150,8 @@ def main():
     command = args.pop('command')
     if command == 'start':
         step = args.pop('step')
+        args['output'] = args['output'] or (SPLIT_OUTPUT if args['split_acoustic'] else DEFAULT_OUTPUT)
+        args['job_dir'] = args['job_dir'] or (SPLIT_JOB if args['split_acoustic'] else DEFAULT_JOB)
         result = shared.launch(**args, component_step=step)
     elif command == 'summary':
         print((Path(args['output'])/'summary.md').read_text())

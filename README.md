@@ -372,6 +372,8 @@ to compare the original base and saved intermediate weights without further trai
 The [component ablation diagnostic](docs/COMPONENT_DIAGNOSTICS.md) then compares
 all eight combinations of backbone LoRA, dense acoustics and the stop head at a
 fixed CFG, with original-base and full-checkpoint reproduction controls.
+For separate DiT/conditioning-projection attribution and an identical-history
+training/native forward check, see the [acoustic diagnostic](docs/ACOUSTIC_DIAGNOSTICS.md).
 
 For confirmed spontaneous Russian speech after the fresh Dialogs-only stage, see
 **[Common Voice Spontaneous training](docs/COMMON_VOICE_SPONTANEOUS.md)**: pinned

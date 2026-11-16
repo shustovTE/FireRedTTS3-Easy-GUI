@@ -57,7 +57,8 @@ class ComponentRoutingTests(unittest.TestCase):
                         delta = layer.lora_B['default'].weight @ layer.lora_A['default'].weight
                         result.get_submodule(name).weight.add_(delta*layer.scaling['default'])
             for name in ('dit', 'dit_head', 'stop_head'):
-                if ('stop' if name == 'stop_head' else 'acoustic') in active:
+                component = {'dit': 'dit', 'dit_head': 'projection', 'stop_head': 'stop'}[name]
+                if component in active or (name != 'stop_head' and 'acoustic' in active):
                     getattr(result, name).load_state_dict(
                         getattr(self.model, name).modules_to_save['default'].state_dict())
         return result.eval()
@@ -90,6 +91,20 @@ class ComponentRoutingTests(unittest.TestCase):
         np.testing.assert_array_equal(restored, full)
         for name, value in self.model.state_dict().items():
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+    def test_split_dit_projection_variants_match_explicit_weights(self):
+        for name, active in diag.SPLIT_VARIANTS:
+            with self.subTest(variant=name):
+                audit = diag.select_components(self.model, active)
+                expected_core = self.independent_core(active)
+                actual, _, metrics = generate_case(fixtures.TinyPipeline(self.model), self.row)
+                expected, _, expected_metrics = generate_case(fixtures.TinyPipeline(expected_core), self.row)
+                np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=3e-4)
+                np.testing.assert_allclose(metrics['stop_scores'], expected_metrics['stop_scores'], atol=2e-6)
+                if name != 'all':
+                    self.assertEqual(audit['dense_modules']['stop_head'], 'original_base')
+        with self.assertRaisesRegex(ValueError, 'as a group'):
+            diag.select_components(self.model, ['acoustic', 'dit'])
 
     def test_reject_invalid_structure_before_switching(self):
         for active in (['unknown'], ['stop', 'stop']):
@@ -188,6 +203,30 @@ class ComponentMatrixTests(unittest.TestCase):
         self.assertEqual(launch.call_args.kwargs['component_step'], 143)
         self.assertNotIn('step', launch.call_args.kwargs)
         self.assertEqual(launch.call_args.kwargs['job_dir'], diag.DEFAULT_JOB)
+
+    def test_split_matrix_parity_report_and_cli(self):
+        f = self.fixture
+        plan = diag.make_plan(f.run, f.output, split_acoustic=True)
+        self.assertEqual(plan['schema'], diag.SPLIT_SCHEMA)
+        self.assertEqual(plan['total_cases'], 18)
+        self.assertTrue(plan['training_parity'])
+        report = shared.execute(plan, manager=fixtures.FakeManager(f.original), log=lambda _: None)
+        self.assertTrue(report['complete'])
+        self.assertFalse(report['parity_review_required'])
+        self.assertFalse(report['reproduction_review_required'])
+        self.assertTrue(report['reproduction_controls_complete'])
+        self.assertTrue(all(r['training_parity_passed'] for r in report['results']))
+        before = {p: file_digest(p) for p in f.output.rglob('*.wav')}
+        resumed = shared.execute(plan, resume=True, manager=fixtures.FakeManager(f.original), log=lambda _: None)
+        self.assertEqual(report, resumed)
+        for p, digest in before.items():
+            self.assertEqual(file_digest(p), digest)
+        with patch.object(sys, 'argv', ['component_diagnostics', 'start', '--split-acoustic']), \
+             patch.object(shared, 'launch', return_value={}) as launch, patch('builtins.print'):
+            diag.main()
+        self.assertTrue(launch.call_args.kwargs['split_acoustic'])
+        self.assertEqual(launch.call_args.kwargs['output'], diag.SPLIT_OUTPUT)
+        self.assertEqual(launch.call_args.kwargs['job_dir'], diag.SPLIT_JOB)
 
 
 if __name__ == '__main__':

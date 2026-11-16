@@ -36,7 +36,8 @@ def runtime_identity():
     root = Path(__file__).resolve().parent.parent
     files = sorted((root/'fireredtts3_upstream').rglob('*.py'))
     files += [root/'fireredtts3_local'/name for name in
-              ('cfg_diagnostics.py', 'component_diagnostics.py', 'training_monitor.py', 'model_manager.py', 'hybrid.py',
+              ('cfg_diagnostics.py', 'component_diagnostics.py', 'training_parity.py', 'training_batch.py',
+               'training_monitor.py', 'model_manager.py', 'hybrid.py',
                'training_data.py', 'training_run.py', 'training_objective.py')]
     return dict(code={str(p.relative_to(root)): file_digest(p) for p in files},
                 packages={name: importlib.metadata.version(name) for name in
@@ -115,11 +116,11 @@ def verify_plan(plan):
         current = make_plan(plan['run'], plan['output'], [s['step'] for s in plan['stages'][1:]],
                             plan['cfgs'], [r['id'] for r in plan['cases']])
     else:
-        from .component_diagnostics import SCHEMA as COMPONENT_SCHEMA, make_plan as component_plan
-        if plan['schema'] != COMPONENT_SCHEMA:
+        from .component_diagnostics import SCHEMA as COMPONENT_SCHEMA, SPLIT_SCHEMA, make_plan as component_plan
+        if plan['schema'] not in (COMPONENT_SCHEMA, SPLIT_SCHEMA):
             raise ValueError('Unknown diagnostic schema')
         current = component_plan(plan['run'], plan['output'], plan['ablation_step'],
-                                 [r['id'] for r in plan['cases']])
+                                 [r['id'] for r in plan['cases']], split_acoustic=plan['schema']==SPLIT_SCHEMA)
     if current != plan:
         raise ValueError('Weights, benchmark, training reports or runtime changed; use a new diagnostic output')
 
@@ -159,6 +160,10 @@ def annotate(results, plan):
     for row in results:
         reference = baseline.get((row['cfg'], row['id']))
         row['failures'] = failures(row, reference)
+        if 'training_parity' in row:
+            row['training_parity_passed'] = row['training_parity']['passed']
+            if not row['training_parity_passed']:
+                row['failures'].append('training_forward_mismatch')
         row['rms_drift_delta_vs_base_same_cfg'] = (
             row['end_minus_start_rms_db']-reference['end_minus_start_rms_db'] if reference else None)
         # Partial components intentionally differ from their source checkpoint.
@@ -188,10 +193,12 @@ def persist(output, plan, results):
             for r in results) for stage in ('base','all') for case in plan['cases'])
         report['reproduction_review_required'] = any(
             r.get('previous_monitor') and r['previous_monitor']['reproduction_review_required'] for r in results)
+    if plan.get('training_parity'):
+        report['parity_review_required'] = any(not r['training_parity']['passed'] for r in results)
     write_json(output/'report.json', report)
     columns = ('stage','step','active_components','cfg','id','seed','seconds','finish_reason','end_minus_start_rms_db',
                'rms_drift_delta_vs_base_same_cfg','fraction_at_or_above_full_scale','peak',
-               'first_latent_rms','last_latent_rms','latent_rms_ratio','pcm_gain','failures','audio')
+               'first_latent_rms','last_latent_rms','latent_rms_ratio','pcm_gain','training_parity_passed','failures','audio')
     temporary = output/'summary.csv.tmp'
     with temporary.open('w', newline='', encoding='utf-8') as stream:
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction='ignore')
@@ -214,11 +221,16 @@ def persist(output, plan, results):
               'Check previous_monitor in report.json: materially different CFG=2 reproduction needs investigation.']
     if 'ablation_step' in plan:
         lines += ['', f"All trained components come from checkpoint {plan['ablation_step']}.",
-                  'backbone = backbone LoRA; acoustic = full DiT + dit_head; stop = full stop_head.',
+                  *[f'{name}: {definition}' for name, definition in plan['component_definitions'].items()],
                   'Unselected components use original base weights. RedAE, speaker extraction/projections and PatchEncoder are unchanged.',
                   'base and all are reproduction controls; partial variants are not expected to match the full checkpoint.',
                   'If either control differs materially from its prior report, investigate reproducibility before attributing a cause.',
                   'Mixed components were not trained independently. Their interactions can change generation; no automatic culprit or winner is selected.']
+    if plan.get('training_parity'):
+        lines += ['', f"Forward parity review required: {report['parity_review_required']}.",
+                  'Each case replays its first/last four generated patches through the training forward on identical history at flow t=0.',
+                  'Inspect training_parity.checks per case. BF16 full-sequence vs cache uses diagnostic tolerances, not exact equality.',
+                  'Parity does not validate the training objective, gradients or free-running robustness.']
     (output/'summary.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
     return report
 
@@ -314,7 +326,13 @@ def execute(plan, *, resume=False, manager=None, log=print):
                         log(f"[cfg-diagnostics] {len(results)+1}/{plan['total_cases']} {key}")
                         if file_digest(row['reference_audio']) != row['reference_sha256']:
                             raise ValueError('Reference audio changed during diagnostic')
-                        samples,rate,metrics=generate_case(tts,row,{**plan['settings'],'inference_cfg':cfg},trace_flow=True)
+                        settings={**plan['settings'],'inference_cfg':cfg}
+                        if plan.get('training_parity'):
+                            from .training_parity import generate_with_parity
+                            samples,rate,metrics=generate_with_parity(tts,row,settings,generate_case)
+                            log(f"[training-parity] {key}: passed={metrics['training_parity']['passed']}")
+                        else:
+                            samples,rate,metrics=generate_case(tts,row,settings,trace_flow=True)
                         # Indexed filenames keep arbitrary benchmark IDs out of paths.
                         name=f"case-{plan['cases'].index(row):02d}"
                         folder=output/stage['name']/f'cfg-{cfg:g}';folder.mkdir(parents=True,exist_ok=True)
@@ -353,7 +371,7 @@ def execute(plan, *, resume=False, manager=None, log=print):
 
 
 def launch(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, job_dir=DEFAULT_JOB, *, resume=False,
-           steps=(50,143,286), cfgs=(0.,1.,2.), cases=DEFAULT_CASES, component_step=None):
+           steps=(50,143,286), cfgs=(0.,1.,2.), cases=DEFAULT_CASES, component_step=None, split_acoustic=False):
     import fcntl
     run,output,job=Path(run).resolve(),Path(output).resolve(),Path(job_dir).resolve()
     if job.exists():raise ValueError('Use a new job directory, including when resuming')
@@ -373,7 +391,7 @@ def launch(run=DEFAULT_RUN, output=DEFAULT_OUTPUT, job_dir=DEFAULT_JOB, *, resum
             plan=make_plan(run,output,steps,cfgs,cases)
         else:
             from .component_diagnostics import make_plan as component_plan
-            plan=component_plan(run,output,component_step,cases)
+            plan=component_plan(run,output,component_step,cases,split_acoustic=split_acoustic)
         if resume and json.loads((output/'plan.json').read_text())!=plan:
             raise ValueError('Resume inputs or runtime changed; use a new output')
         job.mkdir(parents=True,exist_ok=False)
