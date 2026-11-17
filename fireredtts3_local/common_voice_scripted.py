@@ -28,6 +28,7 @@ import soundfile as sf
 
 from .common_voice_download import NoRedirect, USER_AGENT, safe_failure
 from .training_data import dataset_fingerprint, file_digest, plain_text, write_manifest
+from .workspace_paths import local_path
 
 DATASET_ID = "cmu5x45pn00dao107j4o9w2yv"
 CORPUS = "cv-corpus-27.0-2026-09-11/ru"
@@ -623,7 +624,7 @@ def prepare(archive=DEFAULT_ARCHIVE, output=DEFAULT_OUTPUT, *, seed=1234,
 
 
 def audit(output=DEFAULT_OUTPUT):
-    output = Path(output).resolve()
+    output = local_path(output).resolve()
     report = json.loads((output / "report.json").read_text())
     if report.get("schema") != SCHEMA or not report.get("complete") or report.get("archive_sha256") != ARCHIVE_SHA256:
         raise ValueError("Expected complete pinned Scripted 27 preparation")
@@ -640,7 +641,7 @@ def audit(output=DEFAULT_OUTPUT):
         if dataset_fingerprint(rows) != report["datasets"][name]["fingerprint"]:
             raise ValueError("Prepared manifest changed")
         for row in rows:
-            path = Path(row["audio"])
+            path = local_path(row["audio"])
             if not path.resolve().is_relative_to(output / "audio") or not path.is_file() or path.is_symlink():
                 raise ValueError("Prepared audio path changed")
             if file_digest(path) != row["audio_sha256"] or abs(sf.info(path).duration - row["duration"]) > 1e-6:

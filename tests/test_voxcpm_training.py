@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -10,6 +11,7 @@ from unittest.mock import patch
 import wave
 
 from fireredtts3_local import voxcpm_training as vt
+from fireredtts3_local import workspace_paths
 
 
 class VoxCPMTrainingTests(unittest.TestCase):
@@ -154,6 +156,107 @@ class VoxCPMTrainingTests(unittest.TestCase):
         with patch.object(vt, "run_checked", side_effect=results):
             with self.assertRaisesRegex(ValueError, "tracked changes"):
                 vt.verify_source(self.source)
+
+    def _move_workspace(self):
+        """Actually rename the fixture tree; do not leave a compatibility link."""
+        legacy = self.root
+        interpreter = legacy / "venv/bin/python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.symlink_to(sys.executable)
+        recipe_path, _ = self._build(python=interpreter)
+        originals = {str(path.relative_to(legacy)): path.read_bytes() for path in (
+            recipe_path, recipe_path.with_suffix(".audit.json"), self.dataset / "train.jsonl",
+            self.dataset / "validation.jsonl", self.dataset / "report.json")}
+        audio_hashes = {str(path): vt.digest(path) for path in self.dataset.glob("*.wav")}
+        moved = legacy.with_name(legacy.name + "-moved")
+        legacy.rename(moved)
+        self.addCleanup(shutil.rmtree, moved, True)
+        self.assertFalse(legacy.exists())
+        self.assertFalse(legacy.is_symlink())
+        for name, value in (("LEGACY_ROOT", legacy), ("WORKSPACE_ROOT", moved)):
+            mocked = patch.object(workspace_paths, name, value)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        mocked = patch.object(vt, "ROOT", moved)
+        mocked.start()
+        self.addCleanup(mocked.stop)
+
+        def audit_audio(dataset):
+            self.assertEqual(Path(dataset), moved / "dataset")
+            for path, expected in audio_hashes.items():
+                if vt.digest(path) != expected:
+                    raise ValueError("Prepared audio changed after preparation")
+            return self.report
+
+        return legacy, moved, recipe_path, originals, audit_audio
+
+    @unittest.skipUnless(os.name == "posix", "Workspace relocation / venv symlink")
+    def test_moved_recipe_launches_physical_manifest_views_without_mutating_originals(self):
+        legacy, moved, recipe_path, originals, audit_audio = self._move_workspace()
+        with patch.object(vt, "verify_source", return_value=moved / "source"), \
+                patch.object(vt, "prepared_audit", side_effect=audit_audio):
+            recipe, audit = vt.verify_recipe(recipe_path)
+            self.assertEqual(recipe["pretrained_path"], str(moved / "model"))
+            self.assertEqual(recipe["save_path"], str(moved / "output"))
+            self.assertEqual(audit["source"], str(moved / "source"))
+            self.assertEqual(audit["python"], str(moved / "venv/bin/python"))
+            self.assertTrue(Path(audit["python"]).is_file())
+            self.assertNotEqual(audit["python"], str(Path(audit["python"]).resolve()))
+            for field in ("train_manifest", "val_manifest"):
+                view = Path(recipe[field])
+                self.assertTrue(view.is_relative_to(moved / ".runtime/voxcpm-manifests"))
+                self.assertEqual(audit["manifests"][str(view)], vt.digest(view))
+                for row in map(json.loads, view.read_text().splitlines()):
+                    for audio_field in ("audio", "ref_audio"):
+                        self.assertTrue(Path(row[audio_field]).is_file())
+                        self.assertTrue(Path(row[audio_field]).is_relative_to(moved))
+            with patch.object(vt.subprocess, "Popen") as process:
+                process.return_value.pid = 123
+                started = vt.launch(recipe_path, legacy / "fresh-job", pilot_steps=2)
+            job = Path(started["job_dir"])
+            self.assertEqual(job, moved / "fresh-job")
+            copied, copied_audit = vt.verify_recipe(job / "recipe.yaml", job / "recipe.audit.json")
+            self.assertEqual(copied["train_manifest"], recipe["train_manifest"])
+            self.assertEqual(copied["save_path"], str(moved / "output-pilot-2"))
+            self.assertEqual(copied_audit["python"], str(moved / "venv/bin/python"))
+            self.assertEqual(process.call_args.kwargs["cwd"], moved)
+        for relative, expected in originals.items():
+            self.assertEqual((moved / relative).read_bytes(), expected)
+        self.assertFalse(legacy.exists())
+
+    @unittest.skipUnless(os.name == "posix", "Workspace relocation / venv symlink")
+    def test_moved_recipe_still_rejects_modified_manifest_and_audio(self):
+        _, moved, recipe_path, originals, audit_audio = self._move_workspace()
+        with patch.object(vt, "verify_source", return_value=moved / "source"), \
+                patch.object(vt, "prepared_audit", side_effect=audit_audio):
+            manifest = moved / "dataset/train.jsonl"
+            manifest.write_bytes(manifest.read_bytes() + b"\n")
+            with self.assertRaisesRegex(ValueError, "manifests changed"):
+                vt.verify_recipe(recipe_path)
+            manifest.write_bytes(originals["dataset/train.jsonl"])
+            audio = moved / "dataset/one.wav"
+            audio.write_bytes(audio.read_bytes() + b"changed")
+            with self.assertRaisesRegex(ValueError, "audio changed"):
+                vt.verify_recipe(recipe_path)
+
+    @unittest.skipUnless(os.name == "posix", "Workspace relocation / venv symlink")
+    def test_moved_prepared_dataset_builds_new_recipe_with_bound_runtime_views(self):
+        legacy, moved, _, originals, audit_audio = self._move_workspace()
+        with patch.object(vt, "verify_source", return_value=moved / "source"), \
+                patch.object(vt, "prepared_audit", side_effect=audit_audio), \
+                patch.object(vt, "tokenizer_for", return_value=list):
+            result = vt.build_recipe(legacy / "dataset", legacy / "new-recipe.yaml",
+                                     legacy / "new-output", source=legacy / "source", model=legacy / "model",
+                                     python=legacy / "venv/bin/python", epochs=1)
+            recipe, audit = vt.verify_recipe(result["recipe"])
+        self.assertEqual(result["recipe"], str(moved / "new-recipe.yaml"))
+        self.assertEqual(recipe["save_path"], str(moved / "new-output"))
+        self.assertTrue(result["all_targets_fit"])
+        self.assertEqual(audit["python"], str(moved / "venv/bin/python"))
+        for field in ("train_manifest", "val_manifest"):
+            self.assertEqual(audit["manifests"][recipe[field]], vt.digest(recipe[field]))
+        for relative, expected in originals.items():
+            self.assertEqual((moved / relative).read_bytes(), expected)
 
     def test_setup_does_not_replace_an_unrelated_source_directory(self):
         (self.source / "keep.txt").write_text("existing user file")

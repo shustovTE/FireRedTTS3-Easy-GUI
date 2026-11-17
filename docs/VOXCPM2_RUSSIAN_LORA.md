@@ -80,15 +80,11 @@ cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 ```
 
-Если каталог перенесён из `/home/firered-tuning`, один раз восстановите доступ
-по старым абсолютным путям, не меняя manifests и их контрольные хэши:
-
-```bash
-python3 scripts/relocate_workspace.py --old-root /home/firered-tuning
-```
-
-Подробности: [перенос рабочего каталога](WORKSPACE_RELOCATION.md). Готовые
-VAD-аудио и скачанные модели повторно создавать не нужно.
+После переноса используйте только новый каталог; симлинк не нужен. Старые пути
+в сохранённых manifests и рецептах VoxCPM преобразуются при чтении, а исходные
+файлы и их контрольные хэши остаются прежними. Для официального trainer при
+необходимости создаются рабочие manifests с актуальными путями.
+Подробности: [работа из нового каталога](WORKSPACE_RELOCATION.md).
 
 ```bash
 test -s training/datasets/dialogs-base-08/train.jsonl
@@ -109,6 +105,8 @@ cd /opt/firered-tuning
 
 Команда использует установленный `uv`, создаёт `.venv-voxcpm2`, устанавливает
 PyTorch 2.8/cu128, официальный VoxCPM и Silero 6.2.3, скачивает исходные веса.
+После переноса повторите `setup`, чтобы обновить editable install VoxCPM на
+новый каталог. Уже скачанные файлы модели будут использованы повторно.
 Прежняя `.venv` FireRed не изменяется. Для этого workflow закреплён
 `datasets==3.6.0`: официальный loader читает WAV через SoundFile/librosa,
 а native VoxCPM2 использует librosa для reference. Setup проверяет реальное

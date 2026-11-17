@@ -14,6 +14,7 @@ from fireredtts3_local.voxcpm_eval import (_attach_adapter, adapter_info, evalua
                                           generate_case, load_benchmark)
 from fireredtts3_local.voxcpm_training import (MODEL_FILES, MODEL_ID, MODEL_MARKER,
                                               MODEL_REVISION, digest)
+from fireredtts3_local import workspace_paths
 
 
 class FakeNative(torch.nn.Module):
@@ -71,6 +72,31 @@ class EvaluationTests(unittest.TestCase):
         with patch("fireredtts3_local.voxcpm_eval.verify_source", return_value=self.source), \
              patch("fireredtts3_local.voxcpm_eval._load_model", return_value=tts):
             return evaluate(self.benchmark, self.model, output, source=self.source, **kwargs)
+
+    def test_moved_benchmark_and_adapter_work_without_old_directory_or_link(self):
+        self.row["reference_audio"] = str(self.root / "reference.wav")
+        self.benchmark.write_text(json.dumps(self.row, ensure_ascii=False) + "\n")
+        original = self.benchmark.read_bytes()
+        adapter = self.root / "adapter"
+        adapter.mkdir()
+        (adapter / "lora_config.json").write_text(json.dumps({
+            "base_model": str(self.model), "lora_config": {"r": 32}}))
+        (adapter / "lora_weights.safetensors").write_bytes(b"fixture")
+        with tempfile.TemporaryDirectory() as destination:
+            moved = Path(destination) / "project"
+            self.root.rename(moved)
+            try:
+                with patch.object(workspace_paths, "LEGACY_ROOT", self.root), \
+                     patch.object(workspace_paths, "WORKSPACE_ROOT", moved):
+                    row = load_benchmark(self.benchmark)[0]
+                    self.assertEqual(row["reference_audio"], str(moved / "reference.wav"))
+                    info = adapter_info(adapter, moved / "model")
+                    self.assertEqual(info["path"], str(moved / "adapter"))
+                    self.assertEqual((moved / "benchmark.jsonl").read_bytes(), original)
+                    self.assertFalse(self.root.exists())
+                    self.assertFalse(self.root.is_symlink())
+            finally:
+                moved.rename(self.root)
 
     def test_native_call_is_unsplit_combined_clone_single_attempt_exact_text_seed(self):
         tts = FakeNative()

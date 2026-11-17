@@ -16,6 +16,7 @@ import numpy as np
 import soundfile as sf
 
 from .native_comparison import signal_levels
+from .workspace_paths import local_path
 from .voxcpm_training import (DEFAULT_MODEL, DEFAULT_SOURCE, MODEL_ID, MODEL_MARKER,
                               MODEL_REVISION, SOURCE_COMMIT, digest, verify_model,
                               verify_source, write_json)
@@ -27,7 +28,7 @@ def _text_hash(text):
 
 def load_benchmark(path, seed=None):
     """Keep exact strings; resolve references relative to the benchmark file."""
-    path = Path(path).resolve(strict=True)
+    path = local_path(path).resolve(strict=True)
     rows, ids = [], set()
     for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         if not line.strip():
@@ -42,7 +43,7 @@ def load_benchmark(path, seed=None):
         chosen_seed = row.get("seed", 1234) if seed is None else seed
         if type(chosen_seed) is not int or not 0 <= chosen_seed < 2**32:
             raise ValueError("Generation seed must be an integer in 0..2**32-1")
-        reference = Path(row["reference_audio"])
+        reference = local_path(row["reference_audio"])
         reference = (reference if reference.is_absolute() else path.parent / reference).resolve(strict=True)
         audio, sr = sf.read(reference, dtype="float32", always_2d=True)
         if audio.shape[1] != 1 or not len(audio) or sr <= 0 or not np.isfinite(audio).all():
@@ -60,13 +61,13 @@ def load_benchmark(path, seed=None):
 def adapter_info(adapter, model):
     if adapter is None:
         return None
-    path = Path(adapter).resolve(strict=True)
+    path = local_path(adapter).resolve(strict=True)
     config_path = path / "lora_config.json"
     info = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(info.get("lora_config"), dict) or not info["lora_config"]:
         raise ValueError("Expected an official checkpoint directory with lora_config.json")
     declared = info.get("base_model")
-    if not isinstance(declared, str) or (declared != MODEL_ID and Path(declared).resolve() != model):
+    if not isinstance(declared, str) or (declared != MODEL_ID and local_path(declared).resolve() != model):
         raise ValueError("Adapter declares a different base model; use the checkpoint trained on this pinned base")
     weights = next((path / name for name in ("lora_weights.safetensors", "lora_weights.ckpt")
                     if (path / name).is_file()), None)
@@ -175,11 +176,11 @@ def evaluate(benchmark, model, output, adapter=None, *, source=DEFAULT_SOURCE,
         raise ValueError("max_steps must be >=4 and steps must be >=1")
     if isinstance(cfg, bool) or not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or cfg < 0:
         raise ValueError("CFG must be finite and nonnegative")
-    benchmark, model, output = (Path(p).resolve() for p in (benchmark, model, output))
+    benchmark, model, output = (local_path(p).resolve() for p in (benchmark, model, output))
     if output.exists():
         raise FileExistsError(f"Evaluation output exists; use a new directory: {output}")
     rows = load_benchmark(benchmark, seed)
-    source = verify_source(source)
+    source = verify_source(local_path(source))
     verify_model(model)
     receipt = json.loads((model / MODEL_MARKER).read_text(encoding="utf-8"))
     adapter = adapter_info(adapter, model)
@@ -238,7 +239,7 @@ def main():
     parser.add_argument("--steps", type=int, default=10, help="Flow solver steps per audio patch")
     args = parser.parse_args()
     result = evaluate(**vars(args))
-    print(json.dumps({"report": str(Path(args.output).resolve() / "report.json"),
+    print(json.dumps({"report": str(local_path(args.output).resolve() / "report.json"),
                       "complete": result["complete"], "execution_failures": result["execution_failures"]}, indent=2))
     if result["execution_failures"]:
         raise SystemExit(1)

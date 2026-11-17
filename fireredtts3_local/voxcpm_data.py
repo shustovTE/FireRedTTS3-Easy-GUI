@@ -19,6 +19,7 @@ from filelock import FileLock
 import soundfile as sf
 
 from .training_data import dataset_fingerprint, file_digest, plain_text
+from .workspace_paths import local_path, recorded_path
 
 SCHEMA = "voxcpm2-ru-data-v1"
 DEFAULT_OUTPUT = "training/datasets/voxcpm2-ru"
@@ -166,40 +167,24 @@ def _describe(rows):
     }
 
 
-def _recorded_path(path, namespace):
-    """Express a verified physical path through an existing relocation alias.
-
-    Old reports keep their byte-for-byte path identity after a whole workspace
-    move. Only an actual symlink ancestor can supply that namespace; this never
-    guesses another filename or changes the file whose contents are audited.
-    """
-    actual = Path(path).resolve()
-    namespace = Path(namespace)
-    for ancestor in (namespace, *namespace.parents):
-        if ancestor.is_symlink():
-            physical = ancestor.resolve()
-            if actual.is_relative_to(physical):
-                return ancestor / actual.relative_to(physical)
-    return actual
-
-
 def _load_sources(paths, *, recorded_namespace=False):
     """Validate source reports and audio without importing any FireRed models."""
     records, signatures, cache = {}, {}, {}
     for dataset, root in paths.items():
-        report_path = root / "report.json"
+        location = local_path(root).resolve()
+        report_path = location / "report.json"
         report = _json(report_path)
         if report.get("schema") != SOURCE_SCHEMAS[dataset] or report.get("complete") is not True:
             raise ValueError(f"Require complete original {dataset} preparation ({SOURCE_SCHEMAS[dataset]})")
         signature = {"path": str(root), "report_sha256": file_digest(report_path), "manifests": {}}
         if "recipe_sha256" in report:
-            actual = file_digest(root / "recipe.json")
+            actual = file_digest(location / "recipe.json")
             if actual != report["recipe_sha256"]:
                 raise ValueError(f"Source {dataset} recipe changed")
             signature["recipe_sha256"] = actual
         records[dataset] = {}
         for split in SPLITS:
-            manifest = root / f"{split}.jsonl"
+            manifest = location / f"{split}.jsonl"
             rows = _read_rows(manifest)
             expected = report.get("datasets", {}).get(split, {}).get("fingerprint")
             if not expected or dataset_fingerprint(rows) != expected:
@@ -219,7 +204,8 @@ def _load_sources(paths, *, recorded_namespace=False):
                 if row.get("language", "Russian") not in {"Russian", "ru"}:
                     raise ValueError(f"Expected Russian source: {row['utt_id']}")
                 audio = Path(row["audio"])
-                audio = (audio if audio.is_absolute() else root / audio).resolve()
+                logical_audio = audio if audio.is_absolute() else root / audio
+                audio = local_path(logical_audio).resolve()
                 if audio not in cache:
                     pcm, info = _pcm_info(audio)
                     if info.channels != 1 or not info.frames or not math.isfinite(info.duration):
@@ -237,7 +223,7 @@ def _load_sources(paths, *, recorded_namespace=False):
                     if (duration > maximum + 1e-6 or row.get("start", 0) != 0
                             or row.get("dialogs_tail_review") or row.get("tail_trim")):
                         raise ValueError(f"Require original unreviewed {dataset} selection: {row['utt_id']}")
-                identity_path = _recorded_path(audio, root) if recorded_namespace else audio
+                identity_path = recorded_path(audio, root) if recorded_namespace else audio
                 checked.append({**row, "audio": str(identity_path), "duration": duration,
                                 "audio_sha256": digest, "_source_pcm_sha256": pcm,
                                 "_source_samples": frames, "_source_sample_rate": rate,
@@ -343,9 +329,9 @@ def _new_detector():
 
 
 def _check_output_location(output, roots):
-    output = Path(output).resolve()
+    output = local_path(output).resolve()
     for source in roots:
-        source = Path(source).resolve()
+        source = local_path(source).resolve()
         if output == source or output.is_relative_to(source) or source.is_relative_to(output):
             raise ValueError("Prepared output must be separate from all source selections")
 
@@ -355,9 +341,9 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
             scripted="training/datasets/cv-scripted-27", output=DEFAULT_OUTPUT,
             *, detector=None, log=print):
     """Trim every selected target, reserve holdouts, then pair inside each split."""
-    paths = {name: Path(path).resolve() for name, path in
+    paths = {name: local_path(path).resolve() for name, path in
              (("dialogs", dialogs), ("spontaneous", spontaneous), ("scripted", scripted))}
-    output = Path(output).resolve()
+    output = local_path(output).resolve()
     _check_output_location(output, paths.values())
     policy = {"padding_seconds": PADDING_SECONDS,
               "reference_preferred_seconds": PREFERRED_REFERENCE_SECONDS,
@@ -365,10 +351,9 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
               "validation_order": VALIDATION_ORDER}
     if output.exists():
         existing = audit(output)
-        # The immutable report may name the old workspace through its retained
-        # compatibility symlink. Audit already rechecks every source/hash in
-        # that namespace; compare actual locations to the caller's new paths.
-        same_sources = {name: Path(spec["path"]).resolve()
+        # Keep immutable recorded identities while checking all actual files
+        # at the current workspace. No old directory or symlink is required.
+        same_sources = {name: local_path(spec["path"]).resolve()
                         for name, spec in existing["sources"].items()} == paths
         if (not same_sources or existing["policy"] != policy
                 or (detector is not None and existing["vad"] != dict(getattr(detector, "metadata", {})))):
@@ -532,7 +517,7 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
 
 def audit(output=DEFAULT_OUTPUT):
     """Verify inputs, derivative hashes, references and union-level split leakage."""
-    output = Path(output).resolve()
+    output = local_path(output).resolve()
     report = _json(output / "report.json")
     if report.get("schema") != SCHEMA or report.get("complete") is not True:
         raise ValueError("Require a complete VoxCPM preparation")
@@ -588,7 +573,7 @@ def audit(output=DEFAULT_OUTPUT):
             for field, expected_hash, expected_pcm, duration in (
                     ("audio", meta["audio_sha256"], meta["pcm_sha256"], row["duration"]),
                     ("ref_audio", meta["ref_sha256"], meta["ref_pcm_sha256"], row["ref_duration"])):
-                path = Path(row[field]).resolve()
+                path = local_path(row[field]).resolve()
                 if not path.is_relative_to(output / "audio"):
                     raise ValueError("Prepared audio must remain inside its output")
                 if path not in audio_cache:
@@ -605,7 +590,7 @@ def audit(output=DEFAULT_OUTPUT):
             decoded_source = SimpleNamespace(frames=original["_source_samples"],
                                              samplerate=original["_source_sample_rate"])
             _validate_trim(trim, decoded_source,
-                           audio_cache[Path(meta["audio"]).resolve()][1], report["vad"])
+                           audio_cache[local_path(meta["audio"]).resolve()][1], report["vad"])
         for meta in provenance:
             ref = lookup.get((meta["dataset_id"], split, meta["ref_utt_id"]))
             if (ref is None or ref["speaker_id"] != meta["speaker_id"]

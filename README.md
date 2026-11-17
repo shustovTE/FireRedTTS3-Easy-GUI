@@ -370,7 +370,7 @@ and whole-utterance cloned-voice evaluation.
 
 Commands use `/opt/firered-tuning`. If the existing workspace was moved from
 `/home/firered-tuning`, follow the [relocation instructions](docs/WORKSPACE_RELOCATION.md)
-to preserve historical absolute paths and dataset fingerprints.
+to read historical metadata without a compatibility symlink or changing dataset fingerprints.
 
 **Research status (2026-11-17):** the joint/hybrid and sampled-history experiments
 have not resolved long-utterance omissions or acoustic drift. Read the

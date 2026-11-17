@@ -17,6 +17,8 @@ import shutil
 import subprocess
 import sys
 
+from .workspace_paths import local_path, runtime_manifest
+
 SOURCE_URL = "https://github.com/OpenBMB/VoxCPM.git"
 SOURCE_COMMIT = "300e4260b509066151d623dc9c0aa922cf82232b"
 MODEL_ID = "openbmb/VoxCPM2"
@@ -36,7 +38,7 @@ LORA = {"enable_lm": True, "enable_dit": True, "enable_proj": False,
 
 def digest(path):
     result = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    with local_path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             result.update(chunk)
     return result.hexdigest()
@@ -52,7 +54,7 @@ def write_json(path, value):
 
 def read_yaml(path):
     import yaml
-    value = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    value = yaml.safe_load(local_path(path).read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError("Recipe must be a YAML mapping")
     return value
@@ -69,7 +71,7 @@ def run_checked(command, *, cwd=None, capture=False):
 
 
 def verify_source(source):
-    source = Path(source).resolve()
+    source = local_path(source).resolve()
     current = run_checked(["git", "-C", source, "rev-parse", "HEAD"], capture=True).stdout.strip()
     if current != SOURCE_COMMIT:
         raise ValueError(f"VoxCPM source must be pinned to {SOURCE_COMMIT}; run setup")
@@ -84,7 +86,7 @@ def verify_source(source):
 
 def ensure_source(source):
     """Retry an interrupted initial fetch without replacing an existing checkout."""
-    source = Path(source).resolve()
+    source = local_path(source).resolve()
     if not (source / ".git").is_dir():
         if source.exists() and any(source.iterdir()):
             raise ValueError("Refusing to initialize VoxCPM in a nonempty non-git directory")
@@ -104,7 +106,7 @@ def ensure_source(source):
 
 
 def verify_model(model, *, hashes=True):
-    model = Path(model).resolve()
+    model = local_path(model).resolve()
     marker = model / MODEL_MARKER
     if not marker.is_file():
         raise ValueError("Model has no pinned download receipt; run voxcpm_training setup")
@@ -128,7 +130,7 @@ def verify_model(model, *, hashes=True):
 def download_model(model):
     """Called inside the separate environment; credentials come from HF's cache/env."""
     from huggingface_hub import snapshot_download
-    model = Path(model).resolve()
+    model = local_path(model).resolve()
     marker = model / MODEL_MARKER
     if model.exists() and any(model.iterdir()):
         if not marker.is_file():
@@ -151,7 +153,7 @@ def download_model(model):
 
 def setup(source=DEFAULT_SOURCE, venv=DEFAULT_VENV, model=DEFAULT_MODEL, *, no_download=False):
     """Install the official checkout in a dedicated venv; never install FireRed here."""
-    source, venv, model = map(lambda path: Path(path).resolve(), (source, venv, model))
+    source, venv, model = map(lambda path: local_path(path).resolve(), (source, venv, model))
     uv = shutil.which("uv")
     if not uv:
         raise ValueError("uv is required for setup; install uv first (https://docs.astral.sh/uv/)")
@@ -231,7 +233,7 @@ def check_audio_runtime():
 
 def prepared_audit(dataset):
     from .voxcpm_data import audit
-    report = audit(Path(dataset))
+    report = audit(local_path(dataset))
     if report.get("complete") is not True:
         raise ValueError("Prepared data audit is not complete")
     return report
@@ -241,15 +243,15 @@ def tokenizer_for(model, source=None):
     import voxcpm
     from transformers import LlamaTokenizerFast
     from voxcpm.model.utils import mask_multichar_chinese_tokens
-    if source is not None and not Path(voxcpm.__file__).resolve().is_relative_to(Path(source).resolve() / "src"):
+    if source is not None and not Path(voxcpm.__file__).resolve().is_relative_to(local_path(source).resolve() / "src"):
         raise ValueError("This Python imports a different VoxCPM checkout; use .venv-voxcpm2/bin/python")
-    return mask_multichar_chinese_tokens(LlamaTokenizerFast.from_pretrained(str(model), local_files_only=True))
+    return mask_multichar_chinese_tokens(LlamaTokenizerFast.from_pretrained(str(local_path(model)), local_files_only=True))
 
 
 def sequence_audit(dataset, tokenizer, *, context_limit, batch_size, max_batch_tokens):
     """Check *every* target/reference: no silent upstream length drop or truncation."""
     import soundfile as sf
-    dataset = Path(dataset)
+    dataset = local_path(dataset).resolve()
     cache, result = {}, {}
     official_limit = max_batch_tokens // batch_size if max_batch_tokens else context_limit
     limit = min(context_limit, official_limit)
@@ -264,14 +266,14 @@ def sequence_audit(dataset, tokenizer, *, context_limit, batch_size, max_batch_t
         for index, row in enumerate(rows):
             if not isinstance(row.get("text"), str) or not row["text"].strip():
                 raise ValueError(f"Empty transcript: {split} row {index + 1}")
-            if not row.get("ref_audio") or Path(row["audio"]).resolve() == Path(row["ref_audio"]).resolve():
+            def audio_path(field):
+                path = local_path(row[field])
+                return (path if path.is_absolute() else dataset / path).resolve()
+            if not row.get("ref_audio") or audio_path("audio") == audio_path("ref_audio"):
                 raise ValueError(f"Distinct ref_audio is required: {split} row {index + 1}")
             durations = []
             for field, duration_field in (("audio", "duration"), ("ref_audio", "ref_duration")):
-                path = Path(row[field])
-                if not path.is_absolute():
-                    path = dataset / path
-                path = path.resolve()
+                path = audio_path(field)
                 if path not in cache:
                     info = sf.info(path)
                     if info.channels != 1 or info.frames <= 0:
@@ -298,7 +300,7 @@ def sequence_audit(dataset, tokenizer, *, context_limit, batch_size, max_batch_t
 def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DEFAULT_MODEL,
                  python=None, epochs=1, batch_size=1, grad_accum_steps=8, learning_rate=1e-4,
                  max_batch_tokens=8192, num_workers=4):
-    dataset, output, output_dir, source, model = map(lambda p: Path(p).resolve(),
+    dataset, output, output_dir, source, model = map(lambda p: local_path(p).resolve(),
                                                      (dataset, output, output_dir, source, model))
     if any(value < 1 for value in (epochs, batch_size, grad_accum_steps, max_batch_tokens)):
         raise ValueError("Epochs, batch size, accumulation and token budget must be positive")
@@ -323,8 +325,12 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
                          f"batch_size={batch_size}. Use batch_size=1 or a divisor; no targets were dropped.")
     updates = math.ceil(epochs * (targets // batch_size) / grad_accum_steps)
     warmup = min(100, max(1, updates // 10)) if updates > 1 else 0
-    recipe = {"pretrained_path": str(model), "train_manifest": str(dataset / "train.jsonl"),
-              "val_manifest": str(dataset / "validation.jsonl"), "sample_rate": 16000,
+    # Keep original manifests and their fingerprints immutable. The official
+    # loader receives separate path-only views when this workspace has moved.
+    train_view = runtime_manifest(dataset / "train.jsonl")
+    validation_view = runtime_manifest(dataset / "validation.jsonl")
+    recipe = {"pretrained_path": str(model), "train_manifest": str(train_view),
+              "val_manifest": str(validation_view), "sample_rate": 16000,
               "out_sample_rate": 48000, "batch_size": batch_size, "grad_accum_steps": grad_accum_steps,
               "num_workers": num_workers, "preprocessing_num_workers": max(1, num_workers),
               "num_iters": updates, "log_interval": 1, "valid_interval": min(100, updates),
@@ -335,11 +341,11 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
               "lora": dict(LORA)}
     output.parent.mkdir(parents=True, exist_ok=True)
     write_yaml(output, recipe)
-    manifest_paths = [dataset / name for name in report["manifests"]]
+    manifest_paths = [dataset / name for name in report["manifests"]] + [train_view, validation_view]
     audit = {"schema": SCHEMA, "source": str(source), "source_commit": SOURCE_COMMIT,
              # Resolving the interpreter symlink escapes its venv and loses the
              # isolated package installation. Keep its absolute lexical path.
-             "python": os.path.abspath(python or sys.executable), "model_revision": MODEL_REVISION,
+             "python": os.path.abspath(local_path(python or sys.executable)), "model_revision": MODEL_REVISION,
              "model_receipt_sha256": digest(model / MODEL_MARKER), "dataset": str(dataset),
              "dataset_report_sha256": digest(dataset / "report.json"),
              "manifests": {str(p): digest(p) for p in manifest_paths}, "sequence_audit": lengths,
@@ -358,8 +364,8 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
 
 
 def verify_recipe(recipe_path, audit_path=None, *, check_data=True):
-    recipe_path = Path(recipe_path).resolve()
-    audit_path = Path(audit_path or recipe_path.with_suffix(".audit.json"))
+    recipe_path = local_path(recipe_path).resolve()
+    audit_path = local_path(audit_path or recipe_path.with_suffix(".audit.json"))
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     if audit.get("schema") != SCHEMA or audit.get("recipe_sha256") != digest(recipe_path):
         raise ValueError("Recipe changed after audit; build a new recipe")
@@ -368,6 +374,14 @@ def verify_recipe(recipe_path, audit_path=None, *, check_data=True):
         raise ValueError("Unexpected official LoRA/encoder configuration")
     if audit.get("source_commit") != SOURCE_COMMIT or audit.get("model_revision") != MODEL_REVISION:
         raise ValueError("Recipe provenance does not match pinned source and base")
+    # Only after verifying the original recipe bytes do we construct a runtime
+    # copy. Saved YAML/JSONL/provenance is never rewritten during relocation.
+    for key in ("source", "dataset"):
+        audit[key] = str(local_path(audit[key]).resolve())
+    audit["python"] = os.path.abspath(local_path(audit["python"]))
+    for key in ("pretrained_path", "save_path", "tensorboard"):
+        if recipe.get(key):
+            recipe[key] = str(local_path(recipe[key]).resolve())
     verify_source(audit["source"])
     if not Path(audit["python"]).is_file():
         raise ValueError("Recipe Python is missing; build with the isolated VoxCPM environment")
@@ -377,11 +391,22 @@ def verify_recipe(recipe_path, audit_path=None, *, check_data=True):
     dataset = Path(audit["dataset"])
     if digest(dataset / "report.json") != audit["dataset_report_sha256"]:
         raise ValueError("Prepared data report changed after recipe build")
+    mapped_manifests = {}
     for path, expected in audit["manifests"].items():
-        if digest(path) != expected:
+        actual = local_path(path).resolve()
+        if digest(actual) != expected:
             raise ValueError("Prepared manifests changed after recipe build")
+        mapped_manifests[str(actual)] = expected
     if check_data:
         prepared_audit(dataset)
+    for key in ("train_manifest", "val_manifest"):
+        actual = local_path(recipe[key]).resolve()
+        if str(actual) not in mapped_manifests:
+            raise ValueError("Training/validation manifest is not bound to the recipe audit")
+        view = runtime_manifest(actual)
+        recipe[key] = str(view)
+        mapped_manifests[str(view)] = digest(view)
+    audit["manifests"] = mapped_manifests
     return recipe, audit
 
 
@@ -399,13 +424,13 @@ def check_training_runtime(python, source):
         "    raise SystemExit('This official BF16 recipe requires a BF16-capable CUDA GPU')\n"
         "print('[voxcpm] GPU:',torch.cuda.get_device_name(0),'torch:',torch.__version__,flush=True)\n"
     )
-    run_checked([python, "-c", script, str(source)])
+    run_checked([local_path(python), "-c", script, str(local_path(source))])
 
 
 def launch(recipe_path, job_dir, *, pilot_steps=None):
     import fcntl
     from .training_job import now, write_json as atomic_json
-    recipe_path, job = Path(recipe_path).resolve(), Path(job_dir).resolve()
+    recipe_path, job = local_path(recipe_path).resolve(), local_path(job_dir).resolve()
     # Rehash the large audio corpus in the detached worker before training,
     # rather than twice (also while the initiating SSH shell is waiting).
     recipe, audit = verify_recipe(recipe_path, check_data=False)
@@ -458,8 +483,11 @@ def launch(recipe_path, job_dir, *, pilot_steps=None):
 
 def worker(job, lock_fd):
     from .training_job import now, run_commands, write_json as atomic_json
-    job = Path(job).resolve()
+    job = local_path(job).resolve()
     state = json.loads((job / "status.json").read_text(encoding="utf-8"))
+    for key in ("cwd", "python", "source_recipe", "output_dir", "lock_path", "log"):
+        if state.get(key):
+            state[key] = str(local_path(state[key]))
     os.chdir(state["cwd"])
     try:
         recipe, audit = verify_recipe(job / "recipe.yaml", job / "recipe.audit.json")
@@ -531,7 +559,7 @@ def main(argv=None):
         result = launch(args.recipe, args.job_dir, pilot_steps=args.pilot_steps)
     elif args.command in {"status", "stop"}:
         from .training_job import read_status
-        job = Path(args.job_dir).resolve()
+        job = local_path(args.job_dir).resolve()
         result = read_status(job)
         if args.command == "stop":
             if not result["active"]:
