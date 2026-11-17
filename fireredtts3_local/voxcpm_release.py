@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import shutil
 import tempfile
 
@@ -13,8 +14,8 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 import torch
 
-from .release import remote_matches
-from .voxcpm_eval import adapter_info
+from .release import matches_hub_file, remote_matches
+from .voxcpm_eval import adapter_info, full_checkpoint_info
 from .voxcpm_training import (DEFAULT_MODEL, DEFAULT_SOURCE, LORA, MODEL_FILES, MODEL_ID, MODEL_MARKER,
                               MODEL_REVISION, ROOT, digest, verify_model, verify_source, write_json)
 
@@ -73,15 +74,21 @@ def merge_weights(base, adapter, config, output):
     return {"target_layers": len(targets), "changed_layers": changed}
 
 
-def prepare(output):
+def prepare(output, *, full_checkpoint=None):
     verify_model(DEFAULT_MODEL)
     source = verify_source(DEFAULT_SOURCE)
-    adapter = adapter_info(CHECKPOINT, DEFAULT_MODEL.resolve())
-    if json.loads((CHECKPOINT / "training_state.json").read_text())["step"] != STEP:
-        raise ValueError(f"Expected final checkpoint step {STEP}")
-    if Path(adapter["weights"]).name != "lora_weights.safetensors":
-        raise ValueError("Expected native safetensors adapter")
-    identity = {"base": MODEL_ID, "base_revision": MODEL_REVISION, "step": STEP, "adapter": adapter["files"]}
+    base_receipt = json.loads((DEFAULT_MODEL / MODEL_MARKER).read_text())
+    identity = {"base": MODEL_ID, "base_revision": MODEL_REVISION}
+    if full_checkpoint is None:
+        adapter = adapter_info(CHECKPOINT, DEFAULT_MODEL.resolve())
+        if json.loads((CHECKPOINT / "training_state.json").read_text())["step"] != STEP:
+            raise ValueError(f"Expected final checkpoint step {STEP}")
+        if Path(adapter["weights"]).name != "lora_weights.safetensors":
+            raise ValueError("Expected native safetensors adapter")
+        identity.update(step=STEP, adapter=adapter["files"])
+    else:
+        checkpoint, step, trained = full_checkpoint_info(full_checkpoint, DEFAULT_MODEL, base_receipt["files"])
+        identity.update(step=step, training_mode="full", weights_sha256=trained[WEIGHTS])
     if output.exists():
         receipt = json.loads((output / RECEIPT).read_text())
         if (receipt["source"] != identity or set(receipt["files"]) != PAYLOAD
@@ -101,42 +108,67 @@ def prepare(output):
         if digest(staging / TOKENIZER_CODE) != TOKENIZER_SHA:
             raise ValueError("Incorrect upstream tokenizer implementation")
         shutil.copyfile(source / "LICENSE", staging / "LICENSE")
-        print("Merging LM and DiT weights on CPU ...", flush=True)
-        stats = merge_weights(DEFAULT_MODEL / WEIGHTS, adapter["weights"], adapter["config"], staging / WEIGHTS)
-        if any(digest(CHECKPOINT / k) != h for k, h in adapter["files"].items()):
-            raise ValueError("Adapter changed during export")
-        base_receipt = json.loads((DEFAULT_MODEL / MODEL_MARKER).read_text())
-        files = {k: digest(staging / k) for k in PAYLOAD - {"README.md"}}
+        receipt = {"source": identity}
+        if full_checkpoint is None:
+            print("Merging LM and DiT weights on CPU ...", flush=True)
+            stats = merge_weights(DEFAULT_MODEL / WEIGHTS, adapter["weights"], adapter["config"], staging / WEIGHTS)
+            if any(digest(CHECKPOINT / k) != h for k, h in adapter["files"].items()):
+                raise ValueError("Adapter changed during export")
+            receipt["merge"] = stats
+            training = f"Russian LoRA merged into {stats['target_layers']} layers after {STEP} updates"
+        else:
+            print(f"Copying full checkpoint, step {step} ...", flush=True)
+            shutil.copyfile(checkpoint / WEIGHTS, staging / WEIGHTS)
+            training = f"Full fine-tuning from the original base for {step} optimizer updates"
+        files = {k: digest(staging / k) for k in sorted(PAYLOAD - {"README.md"})}
+        if full_checkpoint is not None and files[WEIGHTS] != trained[WEIGHTS]:
+            raise ValueError("Exported weights differ from the full checkpoint")
         if any(files[k] != base_receipt["files"][k] for k in set(MODEL_FILES) - {WEIGHTS}):
             raise ValueError("Copied base assets differ from the pinned model")
         (staging / "README.md").write_text(
             f"---\nlanguage: [ru]\nbase_model: {MODEL_ID}\npipeline_tag: text-to-speech\n"
             "library_name: voxcpm\nlicense: apache-2.0\n---\n\n# VoxCPM2 Russian\n\n"
             f"Complete VoxCPM2 checkpoint derived from {MODEL_ID} at `{MODEL_REVISION}`. "
-            f"Russian LoRA merged into {stats['target_layers']} layers after {STEP} updates on Dialogs, "
+            f"{training} on Dialogs, "
             "Russian Common Voice Spontaneous and Scripted. AudioVAE and tokenizer are from the base. "
             "Use as a standalone VoxCPM2 model, including with vLLM-Omni. "
             "See UPSTREAM_MODEL_CARD.md for base model attribution and usage.\n", encoding="utf-8")
         files["README.md"] = digest(staging / "README.md")
-        receipt = {"source": identity, "merge": stats, "files": files}
+        receipt["files"] = files
         write_json(staging / RECEIPT, receipt)
         staging.rename(output)
     return receipt
 
 
-def upload_private(root, api):
-    api.create_repo(DESTINATION, repo_type="model", private=True, exist_ok=True)
-    head = api.model_info(DESTINATION, files_metadata=True)
+def upload_private(root, api, *, expected_parent=None):
+    if expected_parent is None:
+        api.create_repo(DESTINATION, repo_type="model", private=True, exist_ok=True)
+    elif not re.fullmatch(r"[0-9a-f]{40}", expected_parent):
+        raise ValueError("Expected the complete 40-character parent commit SHA")
+    head = api.model_info(DESTINATION, revision="main", files_metadata=True)
     names = PAYLOAD | {RECEIPT}
     if head.private is not True:
         raise ValueError("Destination is not private; no upload")
-    if {f.rfilename for f in head.siblings} - {".gitattributes"}:
+    inventory = {f.rfilename: f for f in head.siblings if f.rfilename != ".gitattributes"}
+    changes = names
+    if expected_parent is not None:
+        if inventory.keys() != names:
+            raise ValueError("Previous private release has an unexpected file inventory")
+        changes = {name for name in names if not matches_hub_file(root / name, inventory[name])}
+        if not changes:
+            return head.sha
+        if head.sha != expected_parent:
+            raise ValueError(f"Private main is at {head.sha}; expected {expected_parent}. No files uploaded")
+        if changes - {WEIGHTS, "README.md", RECEIPT}:
+            raise ValueError("Tokenizer, AudioVAE or other base assets differ from the previous release")
+    elif inventory:
         if not remote_matches(head, root, names):
             raise ValueError("Destination already contains a different release; no files overwritten")
         return head.sha
+    step = json.loads((root / RECEIPT).read_text())["source"]["step"]
     commit = api.upload_folder(repo_id=DESTINATION, folder_path=root, repo_type="model",
-                               allow_patterns=sorted(names), parent_commit=head.sha,
-                               commit_message="Publish complete Russian VoxCPM2, step 9114").oid
+                               revision="main", allow_patterns=sorted(changes), parent_commit=head.sha,
+                               commit_message=f"Publish complete Russian VoxCPM2, step {step}").oid
     remote = api.model_info(DESTINATION, revision=commit, files_metadata=True)
     if remote.private is not True or not remote_matches(remote, root, names):
         raise ValueError(f"Private release verification failed at {commit}")
@@ -145,16 +177,24 @@ def upload_private(root, api):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=OUTPUT)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--full-checkpoint", type=Path, help="Official full fine-tuning checkpoint directory")
+    parser.add_argument("--expected-parent", help="Current private main commit for a full checkpoint update")
     parser.add_argument("--publish", action="store_true", help=f"Upload to private {DESTINATION}")
     args = parser.parse_args()
-    output = args.output.resolve()
+    if args.expected_parent and not args.full_checkpoint:
+        parser.error("--expected-parent is for a full checkpoint update")
+    if args.full_checkpoint and args.publish and not args.expected_parent:
+        parser.error("--publish with --full-checkpoint requires --expected-parent")
+    default_output = (OUTPUT.with_name(f"{OUTPUT.name}-full-{args.full_checkpoint.resolve().name}")
+                      if args.full_checkpoint else OUTPUT)
+    output = (args.output or default_output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(output) + ".lock"):
-        receipt = prepare(output)
-        print(f"Complete model: {output} ({receipt['merge']['target_layers']} LoRA layers)", flush=True)
+        receipt = prepare(output, full_checkpoint=args.full_checkpoint)
+        print(f"Complete model: {output} (step {receipt['source']['step']})", flush=True)
         if args.publish:
-            commit = upload_private(output, HfApi(token=True))
+            commit = upload_private(output, HfApi(token=True), expected_parent=args.expected_parent)
             print(f"Verified private release: https://huggingface.co/{DESTINATION}/tree/{commit}")
 
 

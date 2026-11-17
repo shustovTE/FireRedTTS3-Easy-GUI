@@ -423,6 +423,27 @@ vllm serve shustov-te/VoxCPM2-Russian --omni --trust-remote-code
 Для проверки подайте ту же длинную реплику и тот же образец голоса, которые
 прослушивали на нативном адаптере.
 
+### Новая ревизия с весами полного дообучения
+
+Для прогона `voxcpm2-ru-all-01` тренер сохраняет финальные веса после 1000 обновлений
+в `step_0001000`. Последний шаг в журнале имеет номер 999. Выполните на Gauss
+с сохранённым HF-токеном с правом записи:
+
+```bash
+cd /opt/firered-tuning
+.venv-voxcpm2/bin/python -m fireredtts3_local.voxcpm_release \
+  --full-checkpoint training/outputs/voxcpm2-ru-all-01/step_0001000 \
+  --expected-parent f6458608a046337e8389848e43796092f131ebf3 \
+  --publish
+```
+
+Экспортёр копирует обученные веса с исходной точностью в отдельный каталог
+`training/exports/VoxCPM2-Russian-full-step_0001000`. Для экспорта потребуется
+свободное место примерно в размере файлов `model.safetensors` и `audiovae.pth`
+вместе. Экспортёр сверяет контрольные суммы, обновляет приватный `main` одним
+коммитом и печатает ссылку на проверенную ревизию. Предыдущая версия доступна
+по SHA из `--expected-parent`. При обрыве связи повторите ту же команду.
+
 ## Источники
 
 - [VoxCPM source, pinned](https://github.com/OpenBMB/VoxCPM/tree/300e4260b509066151d623dc9c0aa922cf82232b)

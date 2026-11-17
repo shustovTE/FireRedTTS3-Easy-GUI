@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -7,6 +8,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from fireredtts3_local import voxcpm_release as release
+from fireredtts3_local.release import git_blob_digest
 
 
 class VoxCPMReleaseTest(unittest.TestCase):
@@ -47,6 +49,65 @@ class VoxCPMReleaseTest(unittest.TestCase):
                 api.model_info.return_value = Mock(private=private, siblings=files)
                 with self.assertRaises(ValueError):
                     release.upload_private(Path("."), api)
+                api.upload_folder.assert_not_called()
+
+    def test_full_update_preserves_weights_and_private_history_and_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, checkpoint, output = root / "base", root / "step_0001000", root / "export"
+            base.mkdir()
+            checkpoint.mkdir()
+            for name in release.MODEL_FILES:
+                (base / name).write_text(name)
+                shutil.copyfile(base / name, checkpoint / name)
+            save_file({"layer": torch.zeros(2, dtype=torch.bfloat16)}, base / release.WEIGHTS)
+            save_file({"layer": torch.ones(2, dtype=torch.float32)}, checkpoint / release.WEIGHTS)
+            release.write_json(base / release.MODEL_MARKER, {"files": {
+                name: release.digest(base / name) for name in release.MODEL_FILES}})
+            release.write_json(checkpoint / "training_state.json", {"step": 1000})
+            (checkpoint / "optimizer.pth").write_text("private trainer state")
+            (root / "LICENSE").write_text("upstream license")
+            code = root / release.TOKENIZER_CODE
+            code.write_text("tokenizer code")
+            with (patch.object(release, "DEFAULT_MODEL", base), patch.object(release, "verify_model"),
+                  patch.object(release, "verify_source", return_value=root),
+                  patch.object(release, "hf_hub_download", return_value=code),
+                  patch.object(release, "TOKENIZER_SHA", release.digest(code))):
+                receipt = release.prepare(output, full_checkpoint=checkpoint)
+                self.assertEqual(release.prepare(output, full_checkpoint=checkpoint), receipt)
+            self.assertEqual(receipt["source"]["step"], 1000)
+            self.assertEqual(receipt["files"][release.WEIGHTS], release.digest(checkpoint / release.WEIGHTS))
+            self.assertEqual({p.name for p in output.iterdir()}, release.PAYLOAD | {release.RECEIPT})
+            self.assertNotIn("merge", receipt)
+            self.assertIn("Full fine-tuning", (output / "README.md").read_text())
+
+            changed = {release.WEIGHTS, "README.md", release.RECEIPT}
+            def snapshot(sha, modified):
+                files = [Mock(rfilename=p.name, size=p.stat().st_size, lfs=None,
+                              blob_id="0" * 40 if p.name in modified else git_blob_digest(p))
+                         for p in output.iterdir()]
+                return Mock(private=True, sha=sha, siblings=files)
+
+            parent, new = "a" * 40, "b" * 40
+            api = Mock()
+            old_snapshot = snapshot(parent, changed)
+            new_snapshot = snapshot(new, set())
+            api.model_info.side_effect = [old_snapshot, new_snapshot, new_snapshot]
+            api.upload_folder.return_value.oid = new
+            for _ in range(2):
+                self.assertEqual(release.upload_private(output, api, expected_parent=parent), new)
+            api.upload_folder.assert_called_once()
+            upload = api.upload_folder.call_args.kwargs
+            self.assertEqual(set(upload["allow_patterns"]), changed)
+            self.assertEqual((upload["revision"], upload["parent_commit"]), ("main", parent))
+            self.assertEqual(api.model_info.call_args_list[1].kwargs["revision"], new)
+            api.create_repo.assert_not_called()
+            for head in [snapshot("c" * 40, changed), snapshot(parent, changed | {"config.json"}),
+                         Mock(private=False, siblings=[])]:
+                api = Mock()
+                api.model_info.return_value = head
+                with self.assertRaises(ValueError):
+                    release.upload_private(output, api, expected_parent=parent)
                 api.upload_folder.assert_not_called()
 
     def test_full_export_can_be_reused_after_upload_interruption_but_rejects_tampering(self):
