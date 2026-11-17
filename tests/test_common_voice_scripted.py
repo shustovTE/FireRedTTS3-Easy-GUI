@@ -256,8 +256,10 @@ class DownloadTests(unittest.TestCase):
             opener.return_value.open.return_value = Response(b'{"downloadUrl":"https://storage.example/data?secret-signature"}')
             cv.download(archive, log=logs.append)
             self.assertEqual(opener.return_value.open.call_args.args[0].get_header("Authorization"), "Bearer fixture-api-secret")
+            self.assertEqual(opener.return_value.open.call_args.args[0].get_header("User-agent"), cv.USER_AGENT)
             request = storage.call_args.args[0]
             self.assertIsNone(request.get_header("Authorization"))
+            self.assertEqual(request.get_header("User-agent"), cv.USER_AGENT)
             self.assertEqual(request.get_header("Range"), "bytes=8-")
             cv.download(archive, log=logs.append)
             self.assertEqual(storage.call_count, 1)

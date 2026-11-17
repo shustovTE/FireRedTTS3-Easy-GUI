@@ -27,7 +27,9 @@ USER_AGENT = "FireRedTTS3-Easy-GUI/0.1.1"
 def safe_failure(phase, error):
     """Diagnose transport/status failures without reflecting tokens or signed URLs."""
     if isinstance(error, urllib.error.HTTPError):
-        content_type = error.headers.get("Content-Type", "") if error.headers else ""
+        headers = {name.lower(): str(value).strip() for name, value in error.headers.items()} if error.headers else {}
+        content_type = headers.get("content-type", "").lower()
+        challenge = headers.get("cf-mitigated", "").lower() == "challenge"
         kind = "JSON" if "json" in content_type else "HTML" if "html" in content_type else "non-JSON"
         cloudflare_code = None
         try:
@@ -40,7 +42,12 @@ def safe_failure(phase, error):
             pass
         finally:
             error.close()
-        if cloudflare_code == 1010:
+        if challenge:
+            hint = ("Cloudflare challenge (cf-mitigated: challenge) replaced the API/storage response. "
+                    "This is not an API-key validation result. Use the dataset's normal browser download "
+                    "or contact Mozilla Data Collective about API access from this host; changing the key "
+                    "alone does not address this challenge.")
+        elif cloudflare_code == 1010:
             hint = "Cloudflare 1010 rejected the client signature before API authentication; update the downloader/User-Agent."
         else:
             hint = {

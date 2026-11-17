@@ -116,6 +116,26 @@ class DownloadTests(unittest.TestCase):
             self.assertIn(expected, result)
             self.assertNotIn("secret-signature", result)
 
+    def test_challenge_header_is_distinguished_without_exposing_html_or_headers(self):
+        for header in ("cf-mitigated", "CF-Mitigated"):
+            error = fetch.urllib.error.HTTPError("https://api.example/?secret-signature", 403,
+                "fixture-secret", {"Content-Type": "text/html; charset=UTF-8", header: "challenge",
+                                   "X-Debug": "fixture-secret"},
+                io.BytesIO(b"<html>private challenge fixture-secret secret-signature</html>"))
+            result = str(fetch.safe_failure("Mozilla download API", error))
+            self.assertIn("HTTP 403, response=HTML", result)
+            self.assertIn("cf-mitigated: challenge", result)
+            self.assertIn("not an API-key validation result", result)
+            self.assertNotIn("fixture-secret", result)
+            self.assertNotIn("secret-signature", result)
+
+    def test_html_403_without_challenge_header_does_not_guess_its_cause(self):
+        error = fetch.urllib.error.HTTPError("https://api.example", 403, "Forbidden",
+            {"Content-Type": "text/html"}, io.BytesIO(b"<html>Forbidden</html>"))
+        result = str(fetch.safe_failure("Mozilla download API", error))
+        self.assertIn("not necessarily an invalid key", result)
+        self.assertNotIn("Cloudflare challenge", result)
+
     def test_api_failure_is_not_relabelled_as_invalid_key_and_does_not_start_storage(self):
         error = fetch.urllib.error.HTTPError("https://api.example", 403, "Forbidden",
             {"Content-Type": "application/json"}, io.BytesIO(b'{"cloudflare_error":true,"error_code":1010}'))
