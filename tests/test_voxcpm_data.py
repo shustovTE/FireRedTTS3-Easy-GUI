@@ -110,6 +110,52 @@ class VoxCPMDataTests(unittest.TestCase):
         self.assertEqual(report["corpora"]["dialogs"]["train"]["source"]["clips"], 4)
         self.assertEqual(report["corpora"]["dialogs"]["train"]["retained"]["clips"], 3)
 
+    def test_workspace_move_alias_reuses_prepared_data_without_rewriting_identity(self):
+        report = self.prepare()
+        before = {path.relative_to(self.root): path.read_bytes()
+                  for path in self.root.rglob("*.json*")}
+        with tempfile.TemporaryDirectory() as destination:
+            moved = Path(destination) / "project"
+            self.root.rename(moved)
+            self.root.symlink_to(moved, target_is_directory=True)
+            try:
+                new_paths = {name: moved / path.relative_to(self.root) for name, path in self.paths.items()}
+                new_output = moved / self.output.relative_to(self.root)
+                self.assertEqual(data.audit(new_output), report)
+                with patch.object(data, "_trim_audio", side_effect=AssertionError("must not repeat VAD")):
+                    self.assertEqual(data.prepare(**new_paths, output=new_output, log=lambda _: None), report)
+                self.assertEqual({path: (moved / path).read_bytes() for path in before}, before)
+                # Compatibility aliases never replace content/provenance checks.
+                source = Path(self.rows["dialogs"]["train"][0]["audio"])
+                samples, rate = sf.read(source)
+                sf.write(source, samples * .5, rate, subtype="FLOAT")
+                with self.assertRaisesRegex(ValueError, "Source audio hash changed"):
+                    data.audit(new_output)
+            finally:
+                self.root.unlink()
+                moved.rename(self.root)
+
+    def test_fresh_preparation_after_move_uses_new_canonical_paths(self):
+        original_manifest = (self.paths["dialogs"] / "train.jsonl").read_bytes()
+        with tempfile.TemporaryDirectory() as destination:
+            moved = Path(destination) / "project"
+            self.root.rename(moved)
+            self.root.symlink_to(moved, target_is_directory=True)
+            try:
+                new_paths = {name: moved / path.relative_to(self.root) for name, path in self.paths.items()}
+                new_output = moved / "prepared"
+                report = data.prepare(**new_paths, output=new_output, detector=Detector(), log=lambda _: None)
+                for spec in report["sources"].values():
+                    self.assertTrue(Path(spec["path"]).is_relative_to(moved))
+                for row in data._read_rows(new_output / "train-provenance.jsonl"):
+                    self.assertTrue(Path(row["audio"]).is_relative_to(moved))
+                    self.assertTrue(Path(row["source_audio"]).is_relative_to(moved))
+                self.assertEqual(data.audit(new_output), report)
+                self.assertEqual((new_paths["dialogs"] / "train.jsonl").read_bytes(), original_manifest)
+            finally:
+                self.root.unlink()
+                moved.rename(self.root)
+
     def test_validation_interleaves_corpora_and_speakers_without_losing_targets(self):
         expected = set()
         for corpus in self.paths:

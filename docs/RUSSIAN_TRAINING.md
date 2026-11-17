@@ -124,7 +124,7 @@ RUAccent `+` перед гласными и combining acute убираются; 
 shards; это не скачивание всего YO-CPT-ru. Для уже загруженных данных:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 .venv/bin/python -m fireredtts3_local.adapt prepare-yo \
   training/raw/yo/data/*.parquet \
   --output training/datasets/yo-complete \

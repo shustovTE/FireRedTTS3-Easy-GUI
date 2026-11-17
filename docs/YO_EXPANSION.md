@@ -22,7 +22,7 @@
 командную строку `--token ...` или репозиторий его вставлять не требуется.
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 .venv/bin/hf auth login
 .venv/bin/hf auth whoami
 ```

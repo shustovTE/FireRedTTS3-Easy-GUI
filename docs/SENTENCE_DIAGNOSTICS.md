@@ -14,7 +14,7 @@
 ## Запуск на Gauss
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \

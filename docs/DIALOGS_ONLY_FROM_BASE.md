@@ -31,7 +31,7 @@
 На Gauss:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
@@ -70,7 +70,7 @@ LoRA rank 16, alpha 32, dropout 0.05, backbone, LR `3e-6`, batch 8,
 
 ```bash
 .venv/bin/python -m fireredtts3_local.cleanup_yo --apply
-df -h /home/firered-tuning
+df -h /opt/firered-tuning
 ```
 
 Удаляются известные каталоги raw YO, импортированные/обрезанные YO, старые

@@ -26,7 +26,7 @@
 Команды выполняются на GPU-машине, где находятся модели и обученный адаптер:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 
 .venv/bin/hf auth login --force
@@ -196,9 +196,9 @@ uv pip install --python .venv/bin/python --prerelease=allow -e '.[firered-tts3]'
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 .venv/bin/sgl-omni serve \
-  --model-path /home/firered-tuning/training/exports/FireRedTTS3-Base-Russian \
+  --model-path /opt/firered-tuning/training/exports/FireRedTTS3-Base-Russian \
   --config examples/configs/firered_tts3_base.yaml \
-  --allowed-local-media-path /home/firered-tuning/training \
+  --allowed-local-media-path /opt/firered-tuning/training \
   --port 8000
 ```
 
@@ -212,7 +212,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/sgl-omni serve \
 окружении **обучающего репозитория**, пока сервер работает в другом терминале:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 .venv/bin/python - <<'PY'
 import json
 from pathlib import Path

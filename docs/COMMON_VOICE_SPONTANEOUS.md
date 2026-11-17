@@ -65,7 +65,7 @@ YO не используется. Этот эксперимент направл
 На Gauss, без активного задания обучения:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 
 .venv/bin/python -m fireredtts3_local.common_voice_spontaneous download

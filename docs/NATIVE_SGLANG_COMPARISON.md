@@ -13,7 +13,7 @@
 Перезапуск или перенастройка сервера для этого теста не выполняются.
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 bash scripts/compare_native_sglang.sh
 ```
@@ -83,7 +83,7 @@ DIAG_SEED=1235 bash scripts/compare_native_sglang.sh
 Если дефект есть и в native, сравните его с исходной предобученной моделью:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   .venv/bin/python -u -m fireredtts3_local.native_comparison baseline

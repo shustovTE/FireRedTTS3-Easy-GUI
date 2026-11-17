@@ -6,7 +6,7 @@
 Для SGLang и сохранённого голоса `Dovbish_Anastasiia`:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 bash scripts/diagnose_long_speech.sh
 ```
@@ -80,7 +80,7 @@ DIAG_SEED=1235 DIAG_STOP_THRESHOLD=0.5 bash scripts/diagnose_long_speech.sh
 активные запросы при перезапуске будут прерваны.
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 bash scripts/set_sglang_text_limit.sh 2000
 docker restart sglang-fire-tts-firered-tts3-1
@@ -116,7 +116,7 @@ docker restart sglang-fire-tts-firered-tts3-1
 Когда контейнер уже работает с лимитом 2000, пример «Михаил, я вас поняла…»:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 DIAG_TEXT_FILE=examples/diagnostics/long-mikhail.txt \
   bash scripts/diagnose_long_speech.sh

@@ -75,7 +75,7 @@ revision. После сверки полного файлового списка
 текущего GPU-запуска. Новые каталоги должны быть пустыми/отсутствовать.
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 
 .venv/bin/python -m fireredtts3_local.adapt plan-dialogs \

@@ -63,7 +63,7 @@ VAD может принимать шум/дыхание за речь, а мет
 ## 1. Подготовка в фоне
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 mkdir -p training/logs
 

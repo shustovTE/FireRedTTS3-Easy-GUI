@@ -641,7 +641,7 @@ def audit(output=DEFAULT_OUTPUT):
             raise ValueError("Prepared manifest changed")
         for row in rows:
             path = Path(row["audio"])
-            if not path.is_relative_to(output / "audio") or not path.is_file() or path.is_symlink():
+            if not path.resolve().is_relative_to(output / "audio") or not path.is_file() or path.is_symlink():
                 raise ValueError("Prepared audio path changed")
             if file_digest(path) != row["audio_sha256"] or abs(sf.info(path).duration - row["duration"]) > 1e-6:
                 raise ValueError("Prepared audio changed")

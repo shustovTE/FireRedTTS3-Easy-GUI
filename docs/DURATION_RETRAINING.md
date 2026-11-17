@@ -24,7 +24,7 @@ preservation=0.1 относительно базы и обе проверки к
 ## Подготовить и запустить пилот
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 
 .venv/bin/python -u -m fireredtts3_local.duration_retrain

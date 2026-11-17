@@ -202,6 +202,28 @@ class ArchiveTests(unittest.TestCase):
                 cv.extract_metadata(archive, self.root / f"out-{i}")
         self.assertFalse((self.root / "escape").exists())
 
+    def test_workspace_move_alias_preserves_scripted_manifest_and_content_audit(self):
+        archive, _ = self.archive()
+        output = self.root / "prepared"
+        report = cv.prepare(archive, output, log=lambda _: None)
+        before = {name: (output / name).read_bytes()
+                  for name in ("report.json", "train.jsonl", "validation.jsonl")}
+        with tempfile.TemporaryDirectory() as destination:
+            moved = Path(destination) / "project"
+            self.root.rename(moved)
+            self.root.symlink_to(moved, target_is_directory=True)
+            try:
+                new_output = moved / "prepared"
+                self.assertEqual(cv.audit(new_output), report)
+                self.assertEqual({name: (new_output / name).read_bytes() for name in before}, before)
+                row = json.loads((new_output / "train.jsonl").read_text().splitlines()[0])
+                Path(row["audio"]).write_bytes(b"modified")
+                with self.assertRaisesRegex(ValueError, "audio changed"):
+                    cv.audit(new_output)
+            finally:
+                self.root.unlink()
+                moved.rename(self.root)
+
 
 class Response(io.BytesIO):
     def __init__(self, data, status=200, headers=None):

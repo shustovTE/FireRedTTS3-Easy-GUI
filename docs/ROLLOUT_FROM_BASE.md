@@ -67,7 +67,7 @@ loss; обычное обучение на этих записях сохран�
 На Gauss, после завершения других обучающих jobs:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
@@ -214,7 +214,7 @@ rollout-горизонт равнялся **2**. Четыре патча исп�
 Например, для проблемного `case-00006.wav`:
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
 
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \

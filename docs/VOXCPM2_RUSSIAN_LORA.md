@@ -3,7 +3,7 @@
 Готовится **новая LoRA исходной VoxCPM2**, без переноса адаптеров FireRed.
 Используется официальный trainer, закреплённый по commit. Его обучающая цель
 не переписана. Работа на GPU запускается на вашем хосте; команды ниже рассчитаны
-на `/home/firered-tuning` и RTX PRO 6000 Blackwell 96 GB.
+на `/opt/firered-tuning` и RTX PRO 6000 Blackwell 96 GB.
 
 ## Что входит в обучение
 
@@ -28,10 +28,12 @@ split; валидатор может превысить ориентир 200 с�
 - SHA256: `3f269caf4757a7837048153067ca84e29c53fd5dee9394a55e6ecc92afb6055a`;
 - корень: `cv-corpus-27.0-2026-09-11/ru`;
 - все confirmed audio: 178 296 записей, 3392 client_id, около 254,4 часа;
-- фактически извлечены, декодированы и проверены после текстовых фильтров и квот:
+- фактически извлечены и проверены после текстовых фильтров и квот:
   71 780 train / 10 577 validation, около 104,5002 / 16,2963 часа, 2407 client_id;
-- квоты перепроверены по точной декодированной длительности: ещё 63 записи
-  исключены по сравнению с планом, основанным на округлённой TSV-длительности.
+- квоты перепроверены по длительности, прочитанной импортёром из аудиофайлов:
+  ещё 63 записи исключены по сравнению с планом на основе TSV-длительности.
+  У MP3 это оценка libsndfile; точное число декодированных отсчётов используется
+  на следующем этапе VAD и в финальных manifests VoxCPM.
 
 Последние числа **до VAD и сверки текстов с двумя вашими корпусами**; конечные
 числа берите из локального отчёта. Scripted — чтение, и при одном проходе по
@@ -74,9 +76,21 @@ FLOAT WAV в 16 kHz. Обучение и генерация на GPU в обла
 ## 1. Обновить репозиторий
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 git pull --ff-only origin feat/russian-tts-adaptation
+```
 
+Если каталог перенесён из `/home/firered-tuning`, один раз восстановите доступ
+по старым абсолютным путям, не меняя manifests и их контрольные хэши:
+
+```bash
+python3 scripts/relocate_workspace.py --old-root /home/firered-tuning
+```
+
+Подробности: [перенос рабочего каталога](WORKSPACE_RELOCATION.md). Готовые
+VAD-аудио и скачанные модели повторно создавать не нужно.
+
+```bash
 test -s training/datasets/dialogs-base-08/train.jsonl
 test -s training/datasets/dialogs-base-08/validation.jsonl
 test -s training/datasets/cv-spontaneous-09/train.jsonl
@@ -89,7 +103,7 @@ test -s training/datasets/cv-spontaneous-09/validation.jsonl
 ## 2. Отдельное окружение и исходная модель
 
 ```bash
-cd /home/firered-tuning
+cd /opt/firered-tuning
 .venv/bin/python -m fireredtts3_local.voxcpm_training setup
 ```
 

@@ -166,7 +166,24 @@ def _describe(rows):
     }
 
 
-def _load_sources(paths):
+def _recorded_path(path, namespace):
+    """Express a verified physical path through an existing relocation alias.
+
+    Old reports keep their byte-for-byte path identity after a whole workspace
+    move. Only an actual symlink ancestor can supply that namespace; this never
+    guesses another filename or changes the file whose contents are audited.
+    """
+    actual = Path(path).resolve()
+    namespace = Path(namespace)
+    for ancestor in (namespace, *namespace.parents):
+        if ancestor.is_symlink():
+            physical = ancestor.resolve()
+            if actual.is_relative_to(physical):
+                return ancestor / actual.relative_to(physical)
+    return actual
+
+
+def _load_sources(paths, *, recorded_namespace=False):
     """Validate source reports and audio without importing any FireRed models."""
     records, signatures, cache = {}, {}, {}
     for dataset, root in paths.items():
@@ -220,7 +237,8 @@ def _load_sources(paths):
                     if (duration > maximum + 1e-6 or row.get("start", 0) != 0
                             or row.get("dialogs_tail_review") or row.get("tail_trim")):
                         raise ValueError(f"Require original unreviewed {dataset} selection: {row['utt_id']}")
-                checked.append({**row, "audio": str(audio), "duration": duration,
+                identity_path = _recorded_path(audio, root) if recorded_namespace else audio
+                checked.append({**row, "audio": str(identity_path), "duration": duration,
                                 "audio_sha256": digest, "_source_pcm_sha256": pcm,
                                 "_source_samples": frames, "_source_sample_rate": rate,
                                 "_dataset": dataset, "_split": split})
@@ -325,7 +343,9 @@ def _new_detector():
 
 
 def _check_output_location(output, roots):
+    output = Path(output).resolve()
     for source in roots:
+        source = Path(source).resolve()
         if output == source or output.is_relative_to(source) or source.is_relative_to(output):
             raise ValueError("Prepared output must be separate from all source selections")
 
@@ -339,17 +359,22 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
              (("dialogs", dialogs), ("spontaneous", spontaneous), ("scripted", scripted))}
     output = Path(output).resolve()
     _check_output_location(output, paths.values())
-    sources, signatures = _load_sources(paths)
     policy = {"padding_seconds": PADDING_SECONDS,
               "reference_preferred_seconds": PREFERRED_REFERENCE_SECONDS,
               "reference_max_seconds": None, "scripted_target_max_seconds": None,
               "validation_order": VALIDATION_ORDER}
     if output.exists():
         existing = audit(output)
-        if (existing["sources"] != signatures or existing["policy"] != policy
+        # The immutable report may name the old workspace through its retained
+        # compatibility symlink. Audit already rechecks every source/hash in
+        # that namespace; compare actual locations to the caller's new paths.
+        same_sources = {name: Path(spec["path"]).resolve()
+                        for name, spec in existing["sources"].items()} == paths
+        if (not same_sources or existing["policy"] != policy
                 or (detector is not None and existing["vad"] != dict(getattr(detector, "metadata", {})))):
             raise ValueError("Preparation already exists for different inputs/settings; choose a new output")
         return existing
+    sources, signatures = _load_sources(paths)
     output.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(output) + ".prepare.lock", timeout=0):
         if output.exists():
@@ -517,11 +542,13 @@ def audit(output=DEFAULT_OUTPUT):
                                "reference_max_seconds": None, "scripted_target_max_seconds": None,
                                "validation_order": VALIDATION_ORDER}:
         raise ValueError("Prepared policy changed")
-    paths = {dataset: Path(spec["path"]).resolve() for dataset, spec in report["sources"].items()}
+    # Preserve recorded lexical names for fingerprints; all file reads and
+    # containment checks still address/resolve their current physical files.
+    paths = {dataset: Path(spec["path"]) for dataset, spec in report["sources"].items()}
     if set(paths) != set(SOURCE_SCHEMAS):
         raise ValueError("Expected all three source corpora")
     _check_output_location(output, paths.values())
-    sources, signatures = _load_sources(paths)
+    sources, signatures = _load_sources(paths, recorded_namespace=True)
     if signatures != report["sources"]:
         raise ValueError("Source manifests/reports changed after preparation")
     required = {"vad-audit.jsonl", "rejections.jsonl"}
