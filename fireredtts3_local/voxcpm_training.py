@@ -21,6 +21,7 @@ SOURCE_URL = "https://github.com/OpenBMB/VoxCPM.git"
 SOURCE_COMMIT = "300e4260b509066151d623dc9c0aa922cf82232b"
 MODEL_ID = "openbmb/VoxCPM2"
 MODEL_REVISION = "7936080b41163874f38610f46f438e2c0757f9fd"
+DATASETS_VERSION = "3.6.0"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = ROOT / ".runtime/VoxCPM2"
 DEFAULT_VENV = ROOT / ".venv-voxcpm2"
@@ -161,14 +162,17 @@ def setup(source=DEFAULT_SOURCE, venv=DEFAULT_VENV, model=DEFAULT_MODEL, *, no_d
         run_checked([uv, "venv", "--python", "3.12", venv])
     python = venv / "bin/python"
     constraints = venv / "voxcpm-constraints.txt"
-    constraints.write_text("torch==2.8.0\ntorchaudio==2.8.0\ntorchcodec==0.7.0\ndatasets>=3,<4\n",
+    constraints.write_text(f"torch==2.8.0\ntorchaudio==2.8.0\ntorchcodec==0.7.0\ndatasets=={DATASETS_VERSION}\n",
                            encoding="utf-8")
     run_checked([uv, "pip", "install", "--python", python, "--index-url",
                  "https://download.pytorch.org/whl/cu128", "torch==2.8.0", "torchaudio==2.8.0"])
     run_checked([uv, "pip", "install", "--python", python, "--constraint", constraints,
                  "-e", source, "torchcodec==0.7.0", "tensorboardX", "PyYAML", "silero-vad==6.2.3"])
-    run_checked([python, "-c", "import torch, torchaudio, torchcodec, voxcpm, yaml, tensorboardX; "
-                 "print('VoxCPM imports OK; torch', torch.__version__, 'CUDA', torch.version.cuda)"])
+    # Upstream declares torchcodec as a dependency, but its datasets 3.x audio
+    # loader and native VoxCPM2 reference path use SoundFile/librosa. Importing
+    # unused TorchCodec here incorrectly requires FFmpeg 4-7 shared libraries
+    # even on hosts whose actual training/inference audio backend works.
+    run_checked([python, "-m", "fireredtts3_local.voxcpm_training", "check-runtime"], cwd=ROOT)
     frozen = run_checked([uv, "pip", "freeze", "--python", python], capture=True).stdout
     (venv / "voxcpm-installed.txt").write_text(frozen, encoding="utf-8")
     write_json(venv / "voxcpm-environment.json", {"schema": SCHEMA, "source": str(source),
@@ -179,6 +183,50 @@ def setup(source=DEFAULT_SOURCE, venv=DEFAULT_VENV, model=DEFAULT_MODEL, *, no_d
     return {"python": str(python), "source": str(source), "source_commit": SOURCE_COMMIT,
             "model": str(model), "model_revision": MODEL_REVISION,
             "next": f"{python} -m fireredtts3_local.voxcpm_training build-recipe --help"}
+
+
+def check_audio_runtime():
+    """Exercise the actual datasets/native audio paths, without weights or GPU."""
+    import tempfile
+    import numpy as np
+    import soundfile as sf
+    import librosa
+    import torch
+    import torchaudio
+    import yaml  # noqa: F401
+    import tensorboardX  # noqa: F401
+    from datasets import Audio, Dataset, __version__ as datasets_version
+    from voxcpm.model import VoxCPM2Model  # noqa: F401
+
+    if datasets_version != DATASETS_VERSION:
+        raise ValueError(f"Expected datasets=={DATASETS_VERSION}, got {datasets_version}; rerun setup")
+    with tempfile.TemporaryDirectory(prefix="voxcpm-audio-check-") as temporary:
+        paths = []
+        for name, rate, frequency in (("target", 24000, 440), ("reference", 48000, 330)):
+            path = Path(temporary) / f"{name}.wav"
+            samples = (.1 * np.sin(2 * np.pi * frequency * np.arange(rate // 4) / rate)).astype("float32")
+            sf.write(path, samples, rate, subtype="FLOAT")
+            paths.append(str(path))
+        dataset = Dataset.from_dict({"audio": paths[:1], "ref_audio": paths[1:]})
+        for field in ("audio", "ref_audio"):
+            dataset = dataset.cast_column(field, Audio(sampling_rate=16000))
+        decoded = dataset[0]
+        for field in ("audio", "ref_audio"):
+            audio = decoded[field]
+            wave = np.asarray(audio["array"])
+            if (audio["sampling_rate"] != 16000 or wave.shape != (4000,)
+                    or not np.isfinite(wave).all() or not np.any(wave)):
+                raise RuntimeError(f"Official datasets audio backend failed to decode/resample {field}")
+        # Native VoxCPM2 uses librosa.load for the voice/prompt reference.
+        reference, rate = librosa.load(paths[1], sr=16000, mono=True)
+        if rate != 16000 or reference.shape != (4000,) or not np.isfinite(reference).all():
+            raise RuntimeError("Native VoxCPM2 reference decoding failed")
+        np.testing.assert_allclose(reference, decoded["ref_audio"]["array"], atol=1e-6)
+    return {"audio_runtime": "ok", "torch": torch.__version__, "cuda": torch.version.cuda,
+            "torchaudio": torchaudio.__version__, "datasets": datasets_version,
+            "audio_backend": "datasets.Audio / SoundFile / librosa", "sample_rate": 16000,
+            "checked": ["FLOAT WAV target", "FLOAT WAV reference", "native reference resampling"],
+            "torchcodec_required_for_this_workflow": False}
 
 
 def prepared_audit(dataset):
@@ -440,6 +488,7 @@ def main(argv=None):
     install.add_argument("--venv", default=str(DEFAULT_VENV))
     install.add_argument("--model", default=str(DEFAULT_MODEL))
     install.add_argument("--no-download", action="store_true")
+    commands.add_parser("check-runtime", help="Check actual audio decoding/resampling without downloading weights or using a GPU")
     build = commands.add_parser("build-recipe", help="Audit all whole recordings and create a fresh official LoRA recipe")
     build.add_argument("--dataset", default="training/datasets/voxcpm2-ru")
     build.add_argument("--output", default="training/recipes/voxcpm2-ru.yaml")
@@ -469,6 +518,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "setup":
         result = setup(args.source, args.venv, args.model, no_download=args.no_download)
+    elif args.command == "check-runtime":
+        result = check_audio_runtime()
     elif args.command == "build-recipe":
         options = vars(args).copy()
         for key in ("command", "dataset", "output", "output_dir"):

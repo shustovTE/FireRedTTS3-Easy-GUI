@@ -109,8 +109,20 @@ cd /opt/firered-tuning
 
 Команда использует установленный `uv`, создаёт `.venv-voxcpm2`, устанавливает
 PyTorch 2.8/cu128, официальный VoxCPM и Silero 6.2.3, скачивает исходные веса.
-Прежняя `.venv` FireRed не изменяется. Нужны системные библиотеки FFmpeg,
-совместимые с TorchCodec 0.7; проверка импорта выполняется автоматически.
+Прежняя `.venv` FireRed не изменяется. Для этого workflow закреплён
+`datasets==3.6.0`: официальный loader читает WAV через SoundFile/librosa,
+а native VoxCPM2 использует librosa для reference. Setup проверяет реальное
+чтение target/reference FLOAT WAV и ресэмплинг в 16 kHz без загрузки весов.
+
+TorchCodec остаётся установлен как зависимость upstream, но не используется
+этими путями и не является обязательной проверкой. Ошибка старого setup
+`Could not load libtorchcodec` с отсутствующими `libavutil.so.56–59` исправлена:
+обновите репозиторий и повторите `setup`. Устанавливать старый FFmpeg или менять
+PyTorch для этого workflow не требуется. Самостоятельная проверка:
+
+```bash
+.venv-voxcpm2/bin/python -m fireredtts3_local.voxcpm_training check-runtime
+```
 
 Версии:
 
