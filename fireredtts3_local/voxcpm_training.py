@@ -301,7 +301,7 @@ def sequence_audit(dataset, tokenizer, *, context_limit, batch_size, max_batch_t
 
 def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DEFAULT_MODEL,
                  python=None, epochs=1, batch_size=1, grad_accum_steps=8, learning_rate=1e-4,
-                 max_batch_tokens=8192, num_workers=4):
+                 max_batch_tokens=8192, num_workers=4, full_epoch=False):
     dataset, output, output_dir, source, model = map(lambda p: local_path(p).resolve(),
                                                      (dataset, output, output_dir, source, model))
     if any(value < 1 for value in (epochs, batch_size, grad_accum_steps, max_batch_tokens)):
@@ -317,6 +317,10 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
     verify_source(source)
     config = verify_model(model)
     report = prepared_audit(dataset)
+    if full_epoch:
+        from .voxcpm_data import RAW_SCHEMA
+        if report.get("schema") != RAW_SCHEMA or epochs != 1:
+            raise ValueError("Full-epoch recipe expects the uncapped Dialogs/Scripted 30s preparation and one epoch")
     lengths = sequence_audit(dataset, tokenizer_for(model, source), context_limit=int(config["max_length"]),
                              batch_size=batch_size, max_batch_tokens=max_batch_tokens)
     targets = lengths["train"]["targets"]
@@ -329,7 +333,8 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
     warmup = min(100, max(1, updates // 10)) if updates > 1 else 0
     # Keep original manifests and their fingerprints immutable. The official
     # loader receives separate path-only views when this workspace has moved.
-    train_view = runtime_manifest(dataset / "train.jsonl")
+    from .voxcpm_balance import MANIFEST as balanced_manifest
+    train_view = runtime_manifest(dataset / (balanced_manifest if full_epoch else "train.jsonl"))
     validation_view = runtime_manifest(dataset / "validation.jsonl")
     recipe = {"pretrained_path": str(model), "train_manifest": str(train_view),
               "val_manifest": str(validation_view), "sample_rate": 16000,
@@ -342,7 +347,6 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
               "tensorboard": str(output_dir / "logs"), "lambdas": {"loss/diff": 1., "loss/stop": 1.},
               "lora": dict(LORA)}
     output.parent.mkdir(parents=True, exist_ok=True)
-    write_yaml(output, recipe)
     manifest_paths = [dataset / name for name in report["manifests"]] + [train_view, validation_view]
     audit = {"schema": SCHEMA, "source": str(source), "source_commit": SOURCE_COMMIT,
              # Resolving the interpreter symlink escapes its venv and loses the
@@ -351,7 +355,7 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
              "model_receipt_sha256": digest(model / MODEL_MARKER), "dataset": str(dataset),
              "dataset_report_sha256": digest(dataset / "report.json"),
              "manifests": {str(p): digest(p) for p in manifest_paths}, "sequence_audit": lengths,
-             "recipe_sha256": digest(output), "requested_epochs": epochs, "updates": updates,
+             "requested_epochs": epochs, "updates": updates,
              "target_draws": updates * batch_size * grad_accum_steps,
              "official_validation": {"max_batches_per_call": 10, "tensorboard_generated_samples": 2,
                                      "tensorboard_generation_uses_reference": False, "shuffled_loader": True,
@@ -360,9 +364,14 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
                      "Fresh base, official loss. Upstream validation is capped at 10 batches; "
                      "zero-based step labels are recorded after an update. "
                      "Independent whole-utterance cloning/listening validation is required before release."}
+    if full_epoch:
+        audit["balance"] = report["balance"]
+        recipe, audit = official_full_recipe(recipe, audit, output_dir, whole_epoch=True)
+    write_yaml(output, recipe)
+    audit["recipe_sha256"] = digest(output)
     write_json(output.with_suffix(".audit.json"), audit)
-    return {"recipe": str(output), "audit": str(output.with_suffix(".audit.json")), **lengths,
-            "updates": updates, "target_draws": audit["target_draws"], "output": str(output_dir)}
+    return {"recipe": str(output), "audit": str(output.with_suffix(".audit.json")), **audit["sequence_audit"],
+            "updates": audit["updates"], "target_draws": audit["target_draws"], "output": str(output_dir)}
 
 
 def verify_recipe(recipe_path, audit_path=None, *, check_data=True):
@@ -433,7 +442,7 @@ def check_training_runtime(python, source):
     run_checked([local_path(python), "-c", script, str(local_path(source))])
 
 
-def official_full_recipe(bound, audit, output):
+def official_full_recipe(bound, audit, output, *, whole_epoch=False):
     """Keep only verified paths from the earlier recipe; take settings from upstream."""
     if audit["schema"] != SCHEMA:
         raise ValueError("start-all expects the original audited dataset-bound LoRA recipe")
@@ -442,11 +451,25 @@ def official_full_recipe(bound, audit, output):
         recipe[key] = bound[key]
     recipe.update(save_path=str(output), tensorboard=str(output / "logs"))
     lengths = dict(audit["sequence_audit"])
+    targets = lengths["train"]["targets"]
+    if whole_epoch:
+        draws = audit["balance"]["target_draws"]
+        preferred = recipe["batch_size"] * recipe["grad_accum_steps"]
+        # The pinned loader drops a partial microbatch and loops across epochs.
+        # Use the largest divisor <=16 so both the final microbatch and the
+        # final accumulation finish exactly on the last balanced draw.
+        effective_batch = next(n for n in range(preferred, 0, -1) if draws % n == 0)
+        recipe["batch_size"] = math.gcd(effective_batch, recipe["batch_size"])
+        recipe["grad_accum_steps"] = effective_batch // recipe["batch_size"]
+        updates = draws // effective_batch
+        recipe.update(num_iters=updates, max_steps=updates,
+                      warmup_steps=min(recipe["warmup_steps"], updates // 10),
+                      save_interval=max(recipe["save_interval"], math.ceil(updates / 2)))
     limit = recipe["max_batch_tokens"] // recipe["batch_size"]
     for split in ("train", "validation"):
         if lengths[split]["max_sequence_tokens"] > min(lengths["context_limit"], limit):
             raise ValueError(f"Whole {split} sequences exceed the upstream full-recipe token budget")
-    if lengths["train"]["targets"] < recipe["batch_size"]:
+    if (audit["balance"]["target_draws"] if whole_epoch else targets) < recipe["batch_size"]:
         raise ValueError("Dataset cannot supply one full training batch")
     lengths["upstream_filter_limit"] = limit
     draws = recipe["num_iters"] * recipe["batch_size"] * recipe["grad_accum_steps"]
@@ -456,7 +479,11 @@ def official_full_recipe(bound, audit, output):
                  sequence_audit=lengths, updates=recipe["num_iters"], target_draws=draws,
                  official_validation=validation,
                  note="Official full fine-tuning step budget; fresh pinned base, frozen AudioVAE.")
-    audit.pop("requested_epochs", None)
+    if whole_epoch:
+        audit.update(requested_epochs=1, extra_draws_after_epoch=0,
+                     note="One complete balanced epoch on one GPU; each manifest entry is used once.")
+    else:
+        audit.pop("requested_epochs", None)
     return recipe, audit
 
 
@@ -591,6 +618,10 @@ def main(argv=None):
     build.add_argument("--learning-rate", type=float, default=1e-4)
     build.add_argument("--max-batch-tokens", type=int, default=8192)
     build.add_argument("--num-workers", type=int, default=4)
+    full_epoch = commands.add_parser("build-full-epoch", help="Build the original Base full-tuning recipe for every uncapped Dialogs/Scripted target")
+    full_epoch.add_argument("--dataset")
+    full_epoch.add_argument("--output", default="training/recipes/voxcpm2-dialogs-scripted-30s-full.yaml")
+    full_epoch.add_argument("--output-dir", default="training/outputs/voxcpm2-dialogs-scripted-30s-full")
     start = commands.add_parser("start", help="Start a detached fresh-base job; no implicit resume")
     start.add_argument("recipe")
     start.add_argument("--job-dir", required=True)
@@ -619,6 +650,9 @@ def main(argv=None):
         for key in ("command", "dataset", "output", "output_dir"):
             options.pop(key)
         result = build_recipe(args.dataset, args.output, args.output_dir, **options)
+    elif args.command == "build-full-epoch":
+        from .voxcpm_data import RAW_OUTPUT
+        result = build_recipe(args.dataset or RAW_OUTPUT, args.output, args.output_dir, full_epoch=True)
     elif args.command == "start-all":
         if os.name != "posix":
             parser.error("Detached jobs require Linux/POSIX")

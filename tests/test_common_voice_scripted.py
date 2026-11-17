@@ -174,6 +174,36 @@ class ArchiveTests(unittest.TestCase):
             p.start(); self.addCleanup(p.stop)
         return archive, source
 
+    def test_uncapped_import_reads_originals_and_never_imports_unvalidated_mp3(self):
+        from fireredtts3_local import voxcpm_validated_sources as raw
+        archive, _ = self.archive()
+        source = self.root / "dialogs"
+        (source / "wavs").mkdir(parents=True)
+        rows = []
+        for i in range(6):
+            row = dict(audio_path=f"wavs/masha_dima_part{1 + i % 2}_{i}.wav", speaker_id="M",
+                       duration="12.5", text=f"Это вопрос номер {i}?", emotion="angry" if i == 5 else "neutral")
+            rows.append(row)
+            sf.write(source / row["audio_path"], .1 * np.sin(np.arange(200000) * (.02 + i * .001)), 16000)
+        with (source / "metadata.csv").open("w", newline="") as out:
+            writer = csv.DictWriter(out, rows[0].keys(), delimiter="|")
+            writer.writeheader()
+            writer.writerows(rows)
+        output = self.root / "new-sources"
+        available = {r["audio_path"] for r in rows}
+        with (patch.object(raw.dialogs, "fetch_files"),
+              patch.object(raw.dialogs, "file_inventory", return_value=(available, "inventory"))):
+            raw.import_sources(source, archive, output)
+            raw.import_sources(source, archive, output)
+        def imported(name):
+            return [json.loads(line) for split in ("train", "validation")
+                    for line in (output / name / (split + ".jsonl")).read_text().splitlines()]
+        self.assertEqual(len(imported("dialogs")), 5)
+        self.assertTrue(all(r["emotion"] == "neutral" and r["duration"] > 10 for r in imported("dialogs")))
+        self.assertEqual(len(imported("scripted")), 12)
+        self.assertTrue(all(r["cv_validated"] and Path(r["audio"]).is_file() for r in imported("scripted")))
+        self.assertFalse((output / "scripted/audio/not_validated.mp3").exists())
+
     def test_prepare_keeps_exact_original_audio_and_audit_detects_changes(self):
         archive, source = self.archive()
         output = self.root / "prepared"

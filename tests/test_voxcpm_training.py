@@ -79,6 +79,38 @@ class VoxCPMTrainingTests(unittest.TestCase):
         self.assertEqual(result["target_draws"], 10)
         self.assertEqual(vt.read_yaml(vt.ROOT / "recipes/voxcpm2_russian_lora.yaml")["lora"], vt.LORA)
 
+    def test_full_epoch_uses_all_targets_for_even_and_odd_counts(self):
+        from fireredtts3_local.voxcpm_data import RAW_SCHEMA
+        self.report["schema"] = RAW_SCHEMA
+        template = self.source / vt.FULL_TEMPLATE
+        template.parent.mkdir(parents=True)
+        vt.write_yaml(template, {"batch_size": 2, "grad_accum_steps": 8, "max_batch_tokens": 8192,
+                                 "learning_rate": 1e-5, "warmup_steps": 100, "save_interval": 500,
+                                 "sample_rate": 16000, "out_sample_rate": 48000})
+        for n, effective, batch in [(17, 14, 2), (20, 16, 2), (9, 14, 2)]:
+            with self.subTest(n=n):
+                (self.dataset / "train.jsonl").write_text("".join(json.dumps(self.train[0]) + "\n" for _ in range(n)))
+                draws = n * 28
+                pairs = self.dataset / "balanced-train.jsonl"
+                pairs.write_text((json.dumps(self.train[0]) + "\n") * draws)
+                self.report["balance"] = {"target_draws": draws}
+                self.report["manifests"][pairs.name] = vt.digest(pairs)
+                output = self.root / f"full-{n}.yaml"
+                with (patch.object(vt, "verify_source"), patch.object(vt, "prepared_audit", return_value=self.report),
+                      patch.object(vt, "tokenizer_for", return_value=list)):
+                    result = vt.build_recipe(self.dataset, output, self.root / "output", source=self.source,
+                                             model=self.model, full_epoch=True)
+                    recipe, audit = vt.verify_recipe(output)
+                self.assertNotIn("lora", recipe)
+                self.assertEqual(recipe["pretrained_path"], str(self.model))
+                self.assertEqual((recipe["batch_size"], recipe["grad_accum_steps"]), (batch, effective // batch))
+                self.assertEqual((recipe["num_iters"], recipe["max_steps"]), (draws//effective, draws//effective))
+                self.assertEqual(result["updates"], recipe["num_iters"])
+                self.assertEqual(audit["extra_draws_after_epoch"], 0)
+                self.assertEqual(result["updates"] * effective, draws)
+                self.assertEqual(recipe["train_manifest"], str(pairs))
+                self.assertEqual(audit["schema"], vt.FULL_SCHEMA)
+
     def test_start_all_uses_pinned_template_and_reaudits_same_data_in_separate_output(self):
         recipe_path, _ = self._build()
         original_bytes = recipe_path.read_bytes()

@@ -444,6 +444,8 @@ cd /opt/firered-tuning
 коммитом и печатает ссылку на проверенную ревизию. Предыдущая версия доступна
 по SHA из `--expected-parent`. При обрыве связи повторите ту же команду.
 
+Отдельный рецепт полного обучения с балансировкой по длине и вопросам приведён в [инструкции для Dialogs и подтверждённого Scripted](VOXCPM2_FULL_DIALOGS_SCRIPTED.md).
+
 ## Источники
 
 - [VoxCPM source, pinned](https://github.com/OpenBMB/VoxCPM/tree/300e4260b509066151d623dc9c0aa922cf82232b)

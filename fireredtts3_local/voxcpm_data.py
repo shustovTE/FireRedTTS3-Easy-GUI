@@ -1,4 +1,4 @@
-"""Prepare an audited VoxCPM union from the three existing Russian selections.
+"""Prepare audited VoxCPM datasets from selected Russian corpora.
 
 Only edge VAD trimming is performed. Transcripts, speaker labels, original split
 assignments and selection metadata are retained; originals are never modified.
@@ -18,10 +18,15 @@ from types import SimpleNamespace
 from filelock import FileLock
 import soundfile as sf
 
+from . import voxcpm_balance as balance
 from .training_data import dataset_fingerprint, file_digest, plain_text
 from .workspace_paths import local_path, recorded_path
 
 SCHEMA = "voxcpm2-ru-data-v1"
+RAW_SCHEMA = "voxcpm2-ru-validated-30s-v1"
+RAW_SOURCES = {"dialogs": "dialogs-neutral-uncapped-v1", "scripted": "cv-scripted27-validated-uncapped-v1"}
+RAW_OUTPUT = "training/datasets/voxcpm2-dialogs-scripted-30s"
+RAW_ROOT = "training/datasets/voxcpm2-uncapped-sources"
 DEFAULT_OUTPUT = "training/datasets/voxcpm2-ru"
 SOURCE_SCHEMAS = {
     "dialogs": "dialogs-original-base-v1",
@@ -98,15 +103,18 @@ def _write_rows(path, rows):
             stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n")
 
 
-def _read_rows(path):
-    rows = []
+def _iter_rows(path):
     with Path(path).open(encoding="utf-8-sig") as stream:
         for line_number, line in enumerate(stream, 1):
             if line.strip():
                 row = json.loads(line)
                 if not isinstance(row, dict):
                     raise ValueError(f"Expected an object at {path}:{line_number}")
-                rows.append(row)
+                yield row
+
+
+def _read_rows(path):
+    rows = list(_iter_rows(path))
     if not rows:
         raise ValueError(f"Empty manifest: {path}")
     return rows
@@ -167,15 +175,17 @@ def _describe(rows):
     }
 
 
-def _load_sources(paths, *, recorded_namespace=False):
+def _load_sources(paths, *, recorded_namespace=False, schemas=SOURCE_SCHEMAS):
     """Validate source reports and audio without importing any FireRed models."""
+    if schemas == RAW_SOURCES:
+        from .common_voice_scripted import transcript
     records, signatures, cache = {}, {}, {}
     for dataset, root in paths.items():
         location = local_path(root).resolve()
         report_path = location / "report.json"
         report = _json(report_path)
-        if report.get("schema") != SOURCE_SCHEMAS[dataset] or report.get("complete") is not True:
-            raise ValueError(f"Require complete original {dataset} preparation ({SOURCE_SCHEMAS[dataset]})")
+        if report.get("schema") != schemas[dataset] or report.get("complete") is not True:
+            raise ValueError(f"Require complete original {dataset} preparation ({schemas[dataset]})")
         signature = {"path": str(root), "report_sha256": file_digest(report_path), "manifests": {}}
         if "recipe_sha256" in report:
             actual = file_digest(location / "recipe.json")
@@ -218,7 +228,14 @@ def _load_sources(paths, *, recorded_namespace=False):
                 if (not isinstance(recorded, (int, float)) or not math.isfinite(recorded)
                         or recorded <= 0 or abs(recorded - duration) > 0.15):
                     raise ValueError(f"Source audio duration changed: {audio}")
-                if dataset in {"dialogs", "spontaneous"}:
+                if schemas == RAW_SOURCES:
+                    if transcript(row["text"]) != row["text"]:
+                        raise ValueError("Raw source text must be complete and match the original")
+                    if dataset == "dialogs" and row.get("emotion") != "neutral":
+                        raise ValueError("Unvalidated Dialogs emotion")
+                    if dataset == "scripted" and row.get("cv_validated") is not True:
+                        raise ValueError("Unconfirmed Scripted source")
+                elif dataset in {"dialogs", "spontaneous"}:
                     maximum = 10 if dataset == "dialogs" else 30
                     if (duration > maximum + 1e-6 or row.get("start", 0) != 0
                             or row.get("dialogs_tail_review") or row.get("tail_trim")):
@@ -284,6 +301,23 @@ def _reference(target, pool):
     return short[position]
 
 
+def _pair_pool(pool, uncapped):
+    if not uncapped:
+        for row in pool:
+            yield row, _reference(row, pool)
+        return
+    # In uncapped Scripted a speaker can have tens of thousands of clips.
+    # Walk a deterministic ring instead of scanning the whole pool per target.
+    pool = sorted(pool, key=lambda r: hashlib.sha256(r["utt_id"].encode()).digest())
+    if len({_words(row["text"]) for row in pool}) < 2:
+        for row in pool:
+            yield row, None
+        return
+    for index, row in enumerate(pool):
+        candidates = (pool[(index + offset) % len(pool)] for offset in range(1, len(pool)))
+        yield row, next((ref for ref in candidates if _distinct(row, ref)), None)
+
+
 def _validation_order(pairs):
     """Cover corpora and available speakers early without dropping any target.
 
@@ -343,12 +377,27 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
     """Trim every selected target, reserve holdouts, then pair inside each split."""
     paths = {name: local_path(path).resolve() for name, path in
              (("dialogs", dialogs), ("spontaneous", spontaneous), ("scripted", scripted))}
+    return _prepare(paths, output, SOURCE_SCHEMAS, detector, log)
+
+
+def prepare_raw_30s(sources=RAW_ROOT, output=RAW_OUTPUT, *, detector=None, log=print):
+    paths = {name: (local_path(sources) / name).resolve() for name in RAW_SOURCES}
+    return _prepare(paths, output, RAW_SOURCES, detector, log)
+
+
+def _policy(raw):
+    return {"padding_seconds": PADDING_SECONDS, "reference_preferred_seconds": PREFERRED_REFERENCE_SECONDS,
+            "reference_max_seconds": 30 if raw else None, "scripted_target_max_seconds": 30 if raw else None,
+            "validation_order": VALIDATION_ORDER,
+            **({"max_post_vad_seconds": 30, "min_train_post_vad_seconds": 3,
+                "length_balance": "nearest-second-neighbour-compensation-v1", "min_train_question_fraction": 0.3} if raw else {})}
+
+
+def _prepare(paths, output, schemas, detector, log):
+    raw = schemas == RAW_SOURCES
     output = local_path(output).resolve()
     _check_output_location(output, paths.values())
-    policy = {"padding_seconds": PADDING_SECONDS,
-              "reference_preferred_seconds": PREFERRED_REFERENCE_SECONDS,
-              "reference_max_seconds": None, "scripted_target_max_seconds": None,
-              "validation_order": VALIDATION_ORDER}
+    policy = _policy(raw)
     if output.exists():
         existing = audit(output)
         # Keep immutable recorded identities while checking all actual files
@@ -359,7 +408,7 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
                 or (detector is not None and existing["vad"] != dict(getattr(detector, "metadata", {})))):
             raise ValueError("Preparation already exists for different inputs/settings; choose a new output")
         return existing
-    sources, signatures = _load_sources(paths)
+    sources, signatures = _load_sources(paths, schemas=schemas)
     output.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(output) + ".prepare.lock", timeout=0):
         if output.exists():
@@ -403,6 +452,16 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
                         trim = {**result, "source": row["audio"], "destination": str(output / relative),
                                 "dataset_id": dataset, "split": split, "utt_id": row["utt_id"]}
                         trim_audits.append(trim)
+                        if raw and info.frames > 30 * info.samplerate:
+                            rejections.append(_reject(row, "after_vad_over_30s", duration=duration))
+                            destination.unlink()
+                            completed += 1
+                            continue
+                        if raw and split == "train" and info.frames < 3 * info.samplerate:
+                            rejections.append(_reject(row, "train_after_vad_under_3s", duration=duration))
+                            destination.unlink()
+                            completed += 1
+                            continue
                         trimmed[split].append({**row, "source_audio": row["audio"],
                             "source_sha256": row["audio_sha256"], "audio": str(output / relative),
                             "source_pcm_sha256": row["_source_pcm_sha256"],
@@ -435,8 +494,7 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
                     groups[(row["_dataset"], row["speaker_id"])].append(row)
                 paired = []
                 for pool in groups.values():
-                    for row in pool:
-                        ref = _reference(row, pool)
+                    for row, ref in _pair_pool(pool, raw):
                         if ref is None:
                             rejections.append(_reject(row, "no_distinct_same_speaker_reference"))
                         else:
@@ -474,6 +532,11 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
                 datasets[split] = {**_describe(selected[split]), "fingerprint": dataset_fingerprint(official),
                                   "long_reference_pairs": sum(ref["duration"] > PREFERRED_REFERENCE_SECONDS
                                                               for _, ref in pairs)}
+            if raw:
+                train_rows = _read_rows(staging / "train.jsonl")
+                repeats, balance_report = balance.plan(train_rows)
+                with (staging / balance.MANIFEST).open("xb") as stream:
+                    manifests[balance.MANIFEST] = balance.manifest_digest(train_rows, repeats, stream)
             for dataset in paths:
                 corpora[dataset] = {split: {
                     "source": _describe(sources[dataset][split]),
@@ -482,8 +545,8 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
                 folder = staging / "corpora" / dataset
                 folder.mkdir(parents=True)
                 for split in SPLITS:
-                    rows = [row for row in _read_rows(staging / f"{split}-provenance.jsonl")
-                            if row["dataset_id"] == dataset]
+                    rows = (row for row in _iter_rows(staging / f"{split}-provenance.jsonl")
+                            if row["dataset_id"] == dataset)
                     name = f"corpora/{dataset}/{split}.jsonl"
                     _write_rows(staging / name, rows)
                     manifests[name] = file_digest(staging / name)
@@ -495,7 +558,7 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
                 _write_rows(staging / name, rows)
                 manifests[name] = file_digest(staging / name)
             report = {
-                "schema": SCHEMA, "complete": True, "sources": signatures, "policy": policy,
+                "schema": RAW_SCHEMA if raw else SCHEMA, "complete": True, "sources": signatures, "policy": policy,
                 "vad": dict(getattr(detector, "metadata", {})), "datasets": datasets, "corpora": corpora,
                 "manifests": manifests, "rejections": dict(sorted(Counter(row["reason"] for row in rejections).items())),
                 "source_clips": total, "vad_successful_clips": len(trim_audits),
@@ -504,11 +567,15 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
                 "validation": "known speakers may occur in both splits; disjoint source recordings, audio hashes and normalized word sequences",
                 "audio_identity": "File SHA256 plus canonical decoded float32 PCM SHA256 before and after VAD; container headers excluded from PCM identity",
                 "validation_order_note": "Round-robin across corpora and speakers, every target once. Validation loss uses up to 10 shuffled batches. TensorBoard audio uses fixed indices.",
-                "reference": "same corpus, speaker and split; distinct audio/text; prefer <=30s, otherwise shortest complete reference",
+                "reference": ("same corpus, speaker and split; distinct audio/text; all <=30s" if raw else
+                              "same corpus, speaker and split; distinct audio/text; prefer <=30s, otherwise shortest complete reference"),
             }
+            if raw:
+                report["balance"] = balance_report
+                report["selection"] = "Uncapped original corpora, held-out sessions/texts; balanced training manifest."
             _write_json(staging / "report.json", report)
             # Recheck original audio and metadata before installing the complete directory.
-            _, after = _load_sources(paths)
+            _, after = _load_sources(paths, schemas=schemas)
             if after != signatures:
                 raise ValueError("Sources changed during preparation")
             staging.rename(output)
@@ -519,26 +586,27 @@ def audit(output=DEFAULT_OUTPUT):
     """Verify inputs, derivative hashes, references and union-level split leakage."""
     output = local_path(output).resolve()
     report = _json(output / "report.json")
-    if report.get("schema") != SCHEMA or report.get("complete") is not True:
+    raw = report.get("schema") == RAW_SCHEMA
+    schemas = RAW_SOURCES if raw else SOURCE_SCHEMAS
+    if report.get("schema") not in {SCHEMA, RAW_SCHEMA} or report.get("complete") is not True:
         raise ValueError("Require a complete VoxCPM preparation")
     _validate_vad(report.get("vad"))
-    if report.get("policy") != {"padding_seconds": PADDING_SECONDS,
-                               "reference_preferred_seconds": PREFERRED_REFERENCE_SECONDS,
-                               "reference_max_seconds": None, "scripted_target_max_seconds": None,
-                               "validation_order": VALIDATION_ORDER}:
+    if report.get("policy") != _policy(raw):
         raise ValueError("Prepared policy changed")
     # Preserve recorded lexical names for fingerprints; all file reads and
     # containment checks still address/resolve their current physical files.
     paths = {dataset: Path(spec["path"]) for dataset, spec in report["sources"].items()}
-    if set(paths) != set(SOURCE_SCHEMAS):
-        raise ValueError("Expected all three source corpora")
+    if set(paths) != set(schemas):
+        raise ValueError("Unexpected set of source corpora")
     _check_output_location(output, paths.values())
-    sources, signatures = _load_sources(paths, recorded_namespace=True)
+    sources, signatures = _load_sources(paths, recorded_namespace=True, schemas=schemas)
     if signatures != report["sources"]:
         raise ValueError("Source manifests/reports changed after preparation")
     required = {"vad-audit.jsonl", "rejections.jsonl"}
+    if raw:
+        required.add(balance.MANIFEST)
     required.update(f"{split}{suffix}.jsonl" for split in SPLITS for suffix in ("", "-provenance"))
-    required.update(f"corpora/{dataset}/{split}.jsonl" for dataset in SOURCE_SCHEMAS for split in SPLITS)
+    required.update(f"corpora/{dataset}/{split}.jsonl" for dataset in schemas for split in SPLITS)
     if set(report["manifests"]) != required:
         raise ValueError("Prepared manifest audit is incomplete")
     for name, expected in report["manifests"].items():
@@ -553,6 +621,10 @@ def audit(output=DEFAULT_OUTPUT):
         provenance = _read_rows(output / f"{split}-provenance.jsonl")
         if len(rows) != len(provenance) or dataset_fingerprint(rows) != report["datasets"][split]["fingerprint"]:
             raise ValueError(f"Prepared {split} fingerprint/metadata mismatch")
+        if raw and split == "train":
+            repeats, expected = balance.plan(rows)
+            if report.get("balance") != expected or balance.manifest_digest(rows, repeats) != report["manifests"][balance.MANIFEST]:
+                raise ValueError("Length/question plan does not match the training draws")
         lookup = {}
         for row, meta in zip(rows, provenance):
             if set(row) != {"audio", "text", "ref_audio", "duration", "ref_duration"}:
@@ -579,6 +651,10 @@ def audit(output=DEFAULT_OUTPUT):
                 if path not in audio_cache:
                     audio_cache[path] = (file_digest(path), sf.info(path), _pcm_digest(path))
                 actual, info, pcm = audio_cache[path]
+                if raw and info.frames > 30 * info.samplerate:
+                    raise ValueError(f"Post-VAD audio exceeds 30 seconds: {path}")
+                if raw and split == "train" and info.frames < 3 * info.samplerate:
+                    raise ValueError(f"Post-VAD train audio below 3 seconds: {path}")
                 if (actual != expected_hash or pcm != expected_pcm or info.channels != 1 or not info.frames
                         or not math.isfinite(duration) or abs(info.duration - duration) > 1 / info.samplerate):
                     raise ValueError(f"Prepared audio changed: {path}")
@@ -603,7 +679,7 @@ def audit(output=DEFAULT_OUTPUT):
             expected_order = [row[0]["audio"] for row in _validation_order([(row, None) for row in provenance])]
             if expected_order != [row["audio"] for row in provenance]:
                 raise ValueError("Validation must retain deterministic corpus/speaker interleaving")
-        if {row["dataset_id"] for row in provenance} != set(SOURCE_SCHEMAS):
+        if {row["dataset_id"] for row in provenance} != set(schemas):
             raise ValueError(f"Every required corpus must have usable {split} pairs")
         if _describe(provenance) != {key: report["datasets"][split][key] for key in _describe(provenance)}:
             raise ValueError(f"Prepared {split} statistics changed")

@@ -100,6 +100,39 @@ class VoxCPMDataTests(unittest.TestCase):
         with patch.object(data, "_trim_audio", side_effect=AssertionError("must not repeat VAD")):
             self.assertEqual(self.prepare(), report)
 
+    def test_uncapped_sources_filter_after_vad_and_only_pair_within_limit(self):
+        class Edges(Detector):
+            def __call__(self, samples):
+                # Remove exactly one second total after 200 ms of padding on both edges.
+                return [{"start": 11200, "end": len(samples) - 11200}] if len(samples) > 32000 else super().__call__(samples)
+
+        for corpus, schema in data.RAW_SOURCES.items():
+            for split, rows in self.rows[corpus].items():
+                for i, row in enumerate(rows):
+                    row.update({"emotion": "neutral"} if corpus == "dialogs" else {"cv_validated": True})
+                    row["text"] = row["text"].removesuffix(".") + ("?" if i % 2 == 0 else ".")
+                    if i != 3:
+                        frames = 31 * 16000 + i if i < 2 else 7 * 16000
+                        path = Path(row["audio"])
+                        samples = np.sin(np.arange(frames) * (.02 + (.03 if corpus == "dialogs" else .04)
+                                                               + (.005 if split == "train" else 0) + i * .001))
+                        sf.write(path, samples, 16000, subtype="FLOAT")
+                        row.update(audio_sha256=file_digest(path), duration=frames / 16000)
+            self.save(corpus)
+            path = self.paths[corpus] / "report.json"
+            path.write_text(json.dumps(dict(json.loads(path.read_text()), schema=schema)))
+        report = data.prepare_raw_30s(self.root, self.output, detector=Edges(), log=lambda _: None)
+        self.assertEqual(report, data.audit(self.output))
+        self.assertEqual(report["rejections"], {"after_vad_over_30s": 4, "train_after_vad_under_3s": 2})
+        self.assertEqual(set(report["sources"]), {"dialogs", "scripted"})
+        for split in data.SPLITS:
+            rows = self.provenance(split)
+            self.assertEqual(len(rows), 4 if split == "train" else 6)
+            self.assertEqual(max(r["duration"] for r in rows), 30.)
+            self.assertLessEqual(max(r["ref_duration"] for r in rows), 30.)
+            self.assertFalse(any(r["utt_id"].endswith(":1") for r in rows))
+            self.assertFalse(any(r["ref_utt_id"].endswith(":1") for r in rows))
+
     def test_cross_corpus_normalized_text_holdout_wins(self):
         self.rows["dialogs"]["train"][0]["text"] = "Всё готово?"
         self.rows["scripted"]["validation"][0]["text"] = "ВСЕ готово."

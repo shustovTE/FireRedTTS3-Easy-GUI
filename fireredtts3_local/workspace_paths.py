@@ -42,38 +42,50 @@ def runtime_manifest(value):
     audit original data first and bind the returned file's hash to its recipe.
     """
     source = local_path(value).resolve(strict=True)
-    rows, changed = [], False
-    for line in source.read_text(encoding="utf-8-sig").splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        if not isinstance(row, dict):
-            raise ValueError("Expected a JSON object in VoxCPM manifest")
-        for key in ("audio", "ref_audio"):
-            if not isinstance(row.get(key), str) or not row[key]:
-                raise ValueError(f"VoxCPM manifest needs {key}")
-            path = local_path(row[key])
-            actual = (path if path.is_absolute() else source.parent / path).resolve(strict=True)
-            changed |= row[key] != str(actual)
-            row[key] = str(actual)
-        rows.append(row)
-    if not rows:
+    # A balanced epoch can repeat a WAV thousands of times. Resolve every unique
+    # path once and stream the JSONL, including when relocation needs a new copy.
+    paths = {}
+    def mapped_rows():
+        with source.open(encoding="utf-8-sig") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("Expected a JSON object in VoxCPM manifest")
+                for key in ("audio", "ref_audio"):
+                    name = row.get(key)
+                    if not isinstance(name, str) or not name:
+                        raise ValueError(f"VoxCPM manifest needs {key}")
+                    if name not in paths:
+                        path = local_path(name)
+                        paths[name] = str((path if path.is_absolute() else source.parent / path).resolve(strict=True))
+                    row[key] = paths[name]
+                yield row
+
+    for _ in mapped_rows():
+        pass
+    if not paths:
         raise ValueError("Empty VoxCPM manifest")
-    if not changed:
+    if all(name == actual for name, actual in paths.items()):
         return source
-    content = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
-                      for row in rows).encode()
     folder = WORKSPACE_ROOT / ".runtime/voxcpm-manifests"
     folder.mkdir(parents=True, exist_ok=True)
-    destination = folder / (hashlib.sha256(content).hexdigest() + ".jsonl")
     with tempfile.NamedTemporaryFile(dir=folder, suffix=".tmp", delete=False) as temporary:
-        temporary.write(content)
         temporary_path = Path(temporary.name)
     try:
+        checksum = hashlib.sha256()
+        with temporary_path.open("wb") as stream:
+            for row in mapped_rows():
+                line = (json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n").encode()
+                checksum.update(line)
+                stream.write(line)
+        destination = folder / (checksum.hexdigest() + ".jsonl")
         try:
             os.link(temporary_path, destination)
         except FileExistsError:
-            if destination.is_symlink() or destination.read_bytes() != content:
+            from .training_data import file_digest
+            if destination.is_symlink() or file_digest(destination) != checksum.hexdigest():
                 raise ValueError("Runtime manifest changed; refusing to replace it") from None
     finally:
         temporary_path.unlink(missing_ok=True)
