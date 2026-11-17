@@ -287,8 +287,8 @@ def _reference(target, pool):
 def _validation_order(pairs):
     """Cover corpora and available speakers early without dropping any target.
 
-    The pinned upstream trainer checks only its first ten validation batches.
-    This ordering broadens that prefix; it does not make it a full-holdout test.
+    Upstream selects two fixed audio examples by index. Validation loss instead
+    uses a shuffled loader, so manifest order does not fix those ten batches.
     """
     grouped = defaultdict(lambda: defaultdict(list))
     for pair in pairs:
@@ -503,7 +503,7 @@ def prepare(dialogs="training/datasets/dialogs-base-08",
                 "selection": "existing selections and splits; no oversampling; holdouts win overlap conflicts",
                 "validation": "known speakers may occur in both splits; disjoint source recordings, audio hashes and normalized word sequences",
                 "audio_identity": "File SHA256 plus canonical decoded float32 PCM SHA256 before and after VAD; container headers excluded from PCM identity",
-                "validation_order_note": "Round-robin across corpora and speakers, every target once. The pinned upstream trainer evaluates only its first 10 batches, not the complete held-out manifest.",
+                "validation_order_note": "Round-robin across corpora and speakers, every target once. Validation loss uses up to 10 shuffled batches. TensorBoard audio uses fixed indices.",
                 "reference": "same corpus, speaker and split; distinct audio/text; prefer <=30s, otherwise shortest complete reference",
             }
             _write_json(staging / "report.json", report)

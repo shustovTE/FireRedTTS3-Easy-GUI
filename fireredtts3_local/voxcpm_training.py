@@ -1,4 +1,4 @@
-"""Pinned official VoxCPM2 LoRA training, isolated from the FireRed environment.
+"""Pinned official VoxCPM2 LoRA and full-parameter training, isolated from the FireRed environment.
 
 This module only prepares/audits configuration and supervises the upstream
 trainer. It does not change the model, objective, precision, or generation code.
@@ -29,6 +29,8 @@ DEFAULT_SOURCE = ROOT / ".runtime/VoxCPM2"
 DEFAULT_VENV = ROOT / ".venv-voxcpm2"
 DEFAULT_MODEL = ROOT / "models/VoxCPM2"
 SCHEMA = "voxcpm2-official-lora-run-v1"
+FULL_SCHEMA = "voxcpm2-official-full-run-v1"
+FULL_TEMPLATE = Path("conf/voxcpm_v2/voxcpm_finetune_all.yaml")
 MODEL_MARKER = ".voxcpm2-pinned-model.json"
 MODEL_FILES = ("config.json", "model.safetensors", "audiovae.pth", "tokenizer.json",
                "tokenizer_config.json", "special_tokens_map.json")
@@ -352,7 +354,7 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
              "recipe_sha256": digest(output), "requested_epochs": epochs, "updates": updates,
              "target_draws": updates * batch_size * grad_accum_steps,
              "official_validation": {"max_batches_per_call": 10, "tensorboard_generated_samples": 2,
-                                     "tensorboard_generation_uses_reference": False,
+                                     "tensorboard_generation_uses_reference": False, "shuffled_loader": True,
                                      "covers_full_validation_manifest": lengths["validation"]["targets"] <= 10 * batch_size},
              "note": "Official shuffled DataLoader; rounded-up updates may begin the next epoch. "
                      "Fresh base, official loss. Upstream validation is capped at 10 batches; "
@@ -367,11 +369,15 @@ def verify_recipe(recipe_path, audit_path=None, *, check_data=True):
     recipe_path = local_path(recipe_path).resolve()
     audit_path = local_path(audit_path or recipe_path.with_suffix(".audit.json"))
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
-    if audit.get("schema") != SCHEMA or audit.get("recipe_sha256") != digest(recipe_path):
+    if audit.get("schema") not in (SCHEMA, FULL_SCHEMA) or audit.get("recipe_sha256") != digest(recipe_path):
         raise ValueError("Recipe changed after audit; build a new recipe")
     recipe = read_yaml(recipe_path)
-    if recipe.get("lora") != LORA or recipe.get("sample_rate") != 16000 or recipe.get("out_sample_rate") != 48000:
-        raise ValueError("Unexpected official LoRA/encoder configuration")
+    if (recipe.get("sample_rate"), recipe.get("out_sample_rate")) != (16000, 48000):
+        raise ValueError("Unexpected encoder/decoder sample rates")
+    if audit["schema"] == SCHEMA and recipe.get("lora") != LORA:
+        raise ValueError("Unexpected official LoRA configuration")
+    if audit["schema"] == FULL_SCHEMA and "lora" in recipe:
+        raise ValueError("Full-parameter recipe must omit the lora key")
     if audit.get("source_commit") != SOURCE_COMMIT or audit.get("model_revision") != MODEL_REVISION:
         raise ValueError("Recipe provenance does not match pinned source and base")
     # Only after verifying the original recipe bytes do we construct a runtime
@@ -427,13 +433,62 @@ def check_training_runtime(python, source):
     run_checked([local_path(python), "-c", script, str(local_path(source))])
 
 
-def launch(recipe_path, job_dir, *, pilot_steps=None):
+def official_full_recipe(bound, audit, output):
+    """Keep only verified paths from the earlier recipe; take settings from upstream."""
+    if audit["schema"] != SCHEMA:
+        raise ValueError("start-all expects the original audited dataset-bound LoRA recipe")
+    recipe = read_yaml(Path(audit["source"]) / FULL_TEMPLATE)
+    for key in ("pretrained_path", "train_manifest", "val_manifest"):
+        recipe[key] = bound[key]
+    recipe.update(save_path=str(output), tensorboard=str(output / "logs"))
+    lengths = dict(audit["sequence_audit"])
+    limit = recipe["max_batch_tokens"] // recipe["batch_size"]
+    for split in ("train", "validation"):
+        if lengths[split]["max_sequence_tokens"] > min(lengths["context_limit"], limit):
+            raise ValueError(f"Whole {split} sequences exceed the upstream full-recipe token budget")
+    if lengths["train"]["targets"] < recipe["batch_size"]:
+        raise ValueError("Dataset cannot supply one full training batch")
+    lengths["upstream_filter_limit"] = limit
+    draws = recipe["num_iters"] * recipe["batch_size"] * recipe["grad_accum_steps"]
+    validation = dict(audit["official_validation"], shuffled_loader=True,
+                      covers_full_validation_manifest=lengths["validation"]["targets"] <= 10 * recipe["batch_size"])
+    audit = dict(audit, schema=FULL_SCHEMA, upstream_template=str(FULL_TEMPLATE),
+                 sequence_audit=lengths, updates=recipe["num_iters"], target_draws=draws,
+                 official_validation=validation,
+                 note="Official full fine-tuning step budget; fresh pinned base, frozen AudioVAE.")
+    audit.pop("requested_epochs", None)
+    return recipe, audit
+
+
+def check_full_disk(recipe):
+    # The pinned base stores BF16 weights. Upstream saves FP32 weights + two
+    # AdamW moments at step 0, each interval, the last index and num_iters;
+    # latest is a separate copy. Include copied VAE and a working margin.
+    model, out = Path(recipe["pretrained_path"]), Path(recipe["save_path"])
+    steps = recipe["num_iters"]
+    saved = set(range(0, steps, recipe["save_interval"])) | {steps - 1, steps}
+    one = 6 * (model / "model.safetensors").stat().st_size + (model / "audiovae.pth").stat().st_size
+    budget = (len(saved) + 1) * one + 2 * 1024**3
+    out.parent.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(out.parent).free
+    if free < budget:
+        raise ValueError(f"Full checkpoints need an estimated {budget/1024**3:.1f} GiB free at {out.parent}; "
+                         f"available: {free/1024**3:.1f} GiB")
+    return budget
+
+
+def launch(recipe_path, job_dir, *, pilot_steps=None, all_output=None):
     import fcntl
     from .training_job import now, write_json as atomic_json
     recipe_path, job = local_path(recipe_path).resolve(), local_path(job_dir).resolve()
     # Rehash the large audio corpus in the detached worker before training,
     # rather than twice (also while the initiating SSH shell is waiting).
     recipe, audit = verify_recipe(recipe_path, check_data=False)
+    if all_output is not None:
+        output = local_path(all_output).resolve()
+        if output == Path(recipe["save_path"]):
+            raise ValueError("Choose a separate output for the full-parameter experiment")
+        recipe, audit = official_full_recipe(recipe, audit, output)
     if pilot_steps is not None:
         if not 1 <= pilot_steps < recipe["num_iters"]:
             raise ValueError("Pilot steps must be positive and smaller than the full run")
@@ -441,6 +496,8 @@ def launch(recipe_path, job_dir, *, pilot_steps=None):
         recipe["save_path"] += f"-pilot-{pilot_steps}"
         recipe["tensorboard"] = str(Path(recipe["save_path"]) / "logs")
     output = Path(recipe["save_path"]).resolve()
+    if audit["schema"] == FULL_SCHEMA:
+        audit["estimated_disk_budget_bytes"] = check_full_disk(recipe)
     locks = ROOT / ".runtime/voxcpm-job-locks"
     locks.mkdir(parents=True, exist_ok=True)
     lock_path = locks / (hashlib.sha256(str(output).encode()).hexdigest() + ".lock")
@@ -458,7 +515,9 @@ def launch(recipe_path, job_dir, *, pilot_steps=None):
         lock.flush()
         write_yaml(job / "recipe.yaml", recipe)
         audit.update(recipe_sha256=digest(job / "recipe.yaml"), pilot_steps=pilot_steps,
-                     full_recipe_sha256=digest(recipe_path))
+                     source_recipe_sha256=digest(recipe_path))
+        if all_output is None:
+            audit["full_recipe_sha256"] = digest(recipe_path)
         write_json(job / "recipe.audit.json", audit)
         state = {"status": "starting", "created_at": now(), "cwd": str(ROOT),
                  "python": audit["python"], "source_recipe": str(recipe_path), "output_dir": str(output),
@@ -478,7 +537,8 @@ def launch(recipe_path, job_dir, *, pilot_steps=None):
             raise
     return {"pid": process.pid, "job_dir": str(job), "log": str(job / "job.log"),
             "output_dir": str(output), "pilot": pilot_steps is not None,
-            "note": "Pilot is a separate smoke/performance run. Full training starts fresh from base."}
+            "mode": "full-parameter" if audit["schema"] == FULL_SCHEMA else "lora",
+            "updates": recipe["num_iters"], "note": "Pilot is a separate smoke/performance run. Full training starts fresh from base."}
 
 
 def worker(job, lock_fd):
@@ -490,6 +550,7 @@ def worker(job, lock_fd):
             state[key] = str(local_path(state[key]))
     os.chdir(state["cwd"])
     try:
+        print("[voxcpm] Checking prepared audio, manifests and base weights ...", flush=True)
         recipe, audit = verify_recipe(job / "recipe.yaml", job / "recipe.audit.json")
         output = Path(recipe["save_path"])
         if output.exists() and any(output.iterdir()):
@@ -498,7 +559,8 @@ def worker(job, lock_fd):
         trainer = Path(audit["source"]) / "scripts/train_voxcpm_finetune.py"
         command = [audit["python"], "-u", str(trainer), "--config_path", str(job / "recipe.yaml")]
         print(f"[voxcpm] Official source {SOURCE_COMMIT}; base {MODEL_REVISION}", flush=True)
-        print("[voxcpm] Fresh LoRA; automatic resume disabled. Evaluate complete generated speech before release.", flush=True)
+        mode = "Full parameters (frozen AudioVAE)" if audit["schema"] == FULL_SCHEMA else "LoRA"
+        print(f"[voxcpm] Fresh base; {mode}; {recipe['num_iters']} updates, lr={recipe['learning_rate']:g}", flush=True)
         return run_commands(job, state, [("official-train", command)], lock_fd)
     except BaseException as exc:
         state.update(status="failed", finished_at=now(), error=str(exc))
@@ -533,6 +595,10 @@ def main(argv=None):
     start.add_argument("recipe")
     start.add_argument("--job-dir", required=True)
     start.add_argument("--pilot-steps", type=int)
+    full = commands.add_parser("start-all", help="Run the official full-parameter preset from Base, using the audited RU data")
+    full.add_argument("--data-recipe", default="training/recipes/voxcpm2-ru.yaml")
+    full.add_argument("--output-dir", default="training/outputs/voxcpm2-ru-all-01")
+    full.add_argument("--job-dir", default="training/jobs/voxcpm2-ru-all-01")
     for action in ("status", "stop"):
         sub = commands.add_parser(action)
         sub.add_argument("job_dir")
@@ -553,6 +619,10 @@ def main(argv=None):
         for key in ("command", "dataset", "output", "output_dir"):
             options.pop(key)
         result = build_recipe(args.dataset, args.output, args.output_dir, **options)
+    elif args.command == "start-all":
+        if os.name != "posix":
+            parser.error("Detached jobs require Linux/POSIX")
+        result = launch(args.data_recipe, args.job_dir, all_output=args.output_dir)
     elif args.command == "start":
         if os.name != "posix":
             parser.error("Detached jobs require Linux/POSIX")

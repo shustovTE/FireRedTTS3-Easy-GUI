@@ -79,6 +79,41 @@ class VoxCPMTrainingTests(unittest.TestCase):
         self.assertEqual(result["target_draws"], 10)
         self.assertEqual(vt.read_yaml(vt.ROOT / "recipes/voxcpm2_russian_lora.yaml")["lora"], vt.LORA)
 
+    def test_start_all_uses_pinned_template_and_reaudits_same_data_in_separate_output(self):
+        recipe_path, _ = self._build()
+        original_bytes = recipe_path.read_bytes()
+        template = self.source / vt.FULL_TEMPLATE
+        template.parent.mkdir(parents=True)
+        config = {"pretrained_path": "/example", "train_manifest": "/example", "val_manifest": None,
+                  "batch_size": 2, "grad_accum_steps": 8, "sample_rate": 16000, "out_sample_rate": 48000,
+                  "num_iters": 1000, "max_steps": 1000, "max_batch_tokens": 8192, "learning_rate": .00001,
+                  "save_interval": 500, "valid_interval": 500, "warmup_steps": 100}
+        vt.write_yaml(template, config)
+        job = self.root / "job-all"
+        output = self.root / "trained-all"
+        with patch.object(vt, "ROOT", self.root), patch.object(vt, "verify_source", return_value=self.source), \
+                patch.object(vt, "prepared_audit", return_value=self.report), patch.object(vt.subprocess, "Popen"):
+            result = vt.launch(recipe_path, job, all_output=output)
+            launched, audit = vt.verify_recipe(job / "recipe.yaml")
+        original = vt.read_yaml(recipe_path)
+        self.assertEqual(recipe_path.read_bytes(), original_bytes)
+        self.assertEqual(launched, dict(config, pretrained_path=str(self.model), train_manifest=original["train_manifest"],
+                                        val_manifest=original["val_manifest"], save_path=str(output),
+                                        tensorboard=str(output / "logs")))
+        self.assertEqual((audit["schema"], audit["updates"], audit["target_draws"]), (vt.FULL_SCHEMA, 1000, 16000))
+        self.assertEqual(audit["sequence_audit"]["upstream_filter_limit"], 4096)
+        self.assertEqual(result["mode"], "full-parameter")
+
+    def test_full_recipe_disk_counts_last_index_final_and_latest(self):
+        recipe = {"pretrained_path": str(self.model), "save_path": str(self.root / "all"),
+                  "num_iters": 1000, "save_interval": 500}
+        one = 6 * (self.model / "model.safetensors").stat().st_size + (self.model / "audiovae.pth").stat().st_size
+        with patch.object(vt.shutil, "disk_usage", return_value=shutil.disk_usage(self.root)._replace(free=9999999999)):
+            self.assertEqual(vt.check_full_disk(recipe), 5 * one + 2 * 1024**3)
+        with patch.object(vt.shutil, "disk_usage", return_value=shutil.disk_usage(self.root)._replace(free=1)):
+            with self.assertRaisesRegex(ValueError, "GiB free"):
+                vt.check_full_disk(recipe)
+
     def test_all_validation_examples_are_length_checked_too(self):
         self.validation[0]["text"] = "а" * 200
         self._write_dataset()

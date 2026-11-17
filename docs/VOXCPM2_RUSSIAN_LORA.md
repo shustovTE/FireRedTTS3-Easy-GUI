@@ -295,10 +295,9 @@ clip norm1. Число шагов вычисляется из фактическ
 запись встретится строго один раз и ни одна не повторится в последнем update.
 
 `val_manifest` задан явно. Но pinned official trainer считает validation loss
-только по **первым 10 batch**, а его TensorBoard sample helper не передаёт
-референс клонирования. Весь отложенный corpus остаётся на диске; порядок
-validation перемежает корпуса и дикторов, чтобы первые batch не оказались
-только Dialogs. Это ограниченная проверка, не оценка всей валидационной выборки.
+по **максимум 10 батчам перемешанного validation loader**. Между проверками
+примеры могут различаться. Для двух TensorBoard-аудио штатный код отдельно берёт
+первые записи из упорядоченного датасета и не передаёт референс клонирования. Это ограниченная проверка, не оценка всей валидационной выборки.
 Аудит данных/VAD/контекста, напротив, охватывает все записи.
 
 Checkpoint сохраняется каждые 100 обновлений (для коротких runs чаще) и в конце:
@@ -359,6 +358,41 @@ mode с исходным reference и точным prompt transcript, CFG2, 10 f
 клонирование и нарастание тембра/громкости. Этот benchmark — прежний небольшой
 набор разработки, а не доказательство качества всех незнакомых голосов.
 `report.json` не выдаёт автоматический perceptual gate.
+
+## Полнопараметрический эксперимент от исходной Base
+
+Для сравнения с готовой русской LoRA команда ниже запускает опубликованный
+`conf/voxcpm_v2/voxcpm_finetune_all.yaml` из закреплённого исходника VoxCPM2.
+Берутся исходные веса `models/VoxCPM2` и те же проверенные train/validation, что
+и в `training/recipes/voxcpm2-ru.yaml`. Аудит сверяет готовые данные, VAD
+повторно не запускается. AudioVAE заморожен. Гиперпараметры upstream: 1000
+обновлений, batch 2 × accumulation 8, LR 1e-5, warmup 100, clip 1, валидация
+и сохранение через 500 шагов. На одном GPU это 16000 предъявлений train.
+Для диска заложите 150 GiB свободного места: штатное сохранение включает два
+момента AdamW, файлы промежуточных шагов и копию последнего чекпойнта.
+
+```bash
+cd /opt/firered-tuning
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+.venv-voxcpm2/bin/python -m fireredtts3_local.voxcpm_training start-all
+tail -n 40 -f training/jobs/voxcpm2-ru-all-01/job.log
+```
+
+После выхода из SSH процесс продолжит работу. Для проверки статуса:
+
+```bash
+.venv-voxcpm2/bin/python -m fireredtts3_local.voxcpm_training status training/jobs/voxcpm2-ru-all-01
+```
+
+Рецепт запуска сохранён в `training/jobs/voxcpm2-ru-all-01/recipe.yaml`.
+После успешного завершения сравните с Base и готовой LoRA на тех же фразах:
+
+```bash
+.venv-voxcpm2/bin/python -m fireredtts3_local.voxcpm_eval \
+  --benchmark training/eval/dialogs-base-08/benchmark.jsonl \
+  --full-checkpoint training/outputs/voxcpm2-ru-all-01/step_0001000 \
+  --output training/eval/voxcpm2-ru/all-01
+```
 
 ## Полная русская модель для vLLM-Omni
 

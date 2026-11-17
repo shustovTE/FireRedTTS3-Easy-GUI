@@ -125,6 +125,31 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(report["model_revision"], MODEL_REVISION)
         self.assertEqual(report["benchmark_sha256"], digest(self.benchmark))
 
+    def test_full_checkpoint_uses_trained_weights_and_rejects_incomplete_state(self):
+        import shutil
+        from safetensors.torch import save_file
+        original = {"parameter": torch.ones(3, dtype=torch.bfloat16)}
+        save_file(original, self.model / "model.safetensors")
+        marker = self.model / MODEL_MARKER
+        receipt = json.loads(marker.read_text())
+        receipt["files"]["model.safetensors"] = digest(self.model / "model.safetensors")
+        marker.write_text(json.dumps(receipt))
+        full = self.root / "step_0001000"
+        shutil.copytree(self.model, full)
+        (full / MODEL_MARKER).unlink()
+        (full / "training_state.json").write_text('{"step": 1000}')
+        save_file({"parameter": torch.zeros(3)}, full / "model.safetensors")
+        with patch("fireredtts3_local.voxcpm_eval.verify_source", return_value=self.source), \
+             patch("fireredtts3_local.voxcpm_eval._load_model", return_value=FakeNative()) as loader:
+            report = evaluate(self.benchmark, self.model, self.root / "out", full_checkpoint=full)
+            loader.assert_called_once_with(full, self.source, None)
+            self.assertEqual(report["full_checkpoint"]["step"], 1000)
+            self.assertEqual(report["model_files"]["model.safetensors"], digest(full / "model.safetensors"))
+            self.assertNotEqual(report["model_files"]["model.safetensors"], receipt["files"]["model.safetensors"])
+            save_file({"wrong": torch.zeros(3)}, full / "model.safetensors")
+            with self.assertRaisesRegex(ValueError, "do not cover"):
+                evaluate(self.benchmark, self.model, self.root / "bad", full_checkpoint=full)
+
     def test_raw_float_retains_out_of_range_audio_and_listening_copy_has_one_gain(self):
         report = self.run_mocked(FakeNative())
         row = report["results"][0]

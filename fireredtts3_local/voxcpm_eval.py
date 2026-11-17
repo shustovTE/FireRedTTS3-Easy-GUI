@@ -170,7 +170,30 @@ def generate_case(tts, row, settings):
                      "failures": [] if stopped else ["generation_limit"]}
 
 
-def evaluate(benchmark, model, output, adapter=None, *, source=DEFAULT_SOURCE,
+def full_checkpoint_info(directory, base, base_files):
+    """Native from_local loads with strict=False. Reject partial weights before inference."""
+    from safetensors import safe_open
+    directory = local_path(directory).resolve(strict=True)
+    step = json.loads((directory / "training_state.json").read_text())["step"]
+    if type(step) is not int or step < 0:
+        raise ValueError("Expected an official full training checkpoint with a numbered step")
+    if any((directory / name).exists() for name in ("lora_config.json", "audiovae.safetensors")):
+        raise ValueError("Expected a full checkpoint with the original AudioVAE")
+    files = {name: digest(directory / name) for name in base_files}
+    for name in base_files.keys() - {"model.safetensors"}:
+        if files[name] != base_files[name]:
+            raise ValueError(f"Full checkpoint differs from pinned base asset: {name}")
+    with safe_open(base / "model.safetensors", framework="pt") as original, safe_open(
+        directory / "model.safetensors", framework="pt"
+    ) as trained:
+        if set(trained.keys()) != set(original.keys()) or any(
+            trained.get_slice(k).get_shape() != original.get_slice(k).get_shape() for k in original.keys()
+        ):
+            raise ValueError("Full checkpoint weights do not cover the base architecture")
+    return directory, step, files
+
+
+def evaluate(benchmark, model, output, adapter=None, *, source=DEFAULT_SOURCE, full_checkpoint=None,
              seed=None, max_steps=1000, cfg=2., steps=10):
     if type(max_steps) is not int or max_steps < 4 or type(steps) is not int or steps < 1:
         raise ValueError("max_steps must be >=4 and steps must be >=1")
@@ -183,7 +206,13 @@ def evaluate(benchmark, model, output, adapter=None, *, source=DEFAULT_SOURCE,
     source = verify_source(local_path(source))
     verify_model(model)
     receipt = json.loads((model / MODEL_MARKER).read_text(encoding="utf-8"))
+    if full_checkpoint is not None and adapter is not None:
+        raise ValueError("Select one full checkpoint or one LoRA adapter")
     adapter = adapter_info(adapter, model)
+    base = model
+    step, files = None, receipt["files"]
+    if full_checkpoint is not None:
+        model, step, files = full_checkpoint_info(full_checkpoint, base, files)
     settings = {"clone_mode": "reference_plus_prompt", "split_text": False, "normalize_text": False,
                 "denoise": False, "trim_silence_vad": False, "retry_badcase": False, "max_attempts": 1,
                 "min_steps": 2, "max_steps": max_steps, "cfg_value": float(cfg), "inference_timesteps": steps,
@@ -191,9 +220,13 @@ def evaluate(benchmark, model, output, adapter=None, *, source=DEFAULT_SOURCE,
     report = {"schema": "voxcpm2-native-eval-v1", "complete": False, "results": [],
               "benchmark": str(benchmark), "benchmark_sha256": digest(benchmark),
               "source": str(source), "source_commit": SOURCE_COMMIT, "model": str(model),
-              "model_id": MODEL_ID, "model_revision": MODEL_REVISION, "model_files": receipt["files"],
+              "model_id": MODEL_ID if step is None else None,
+              "model_revision": MODEL_REVISION if step is None else None, "model_files": files,
               "adapter": adapter, "settings": settings,
               "quality_assessment": "Listening and content/voice checks are required; these metrics are not a perceptual gate."}
+    if step is not None:
+        report["full_checkpoint"] = {"step": step, "path": str(model), "base_path": str(base),
+                                     "base_id": MODEL_ID, "base_revision": MODEL_REVISION}
     tts = _load_model(model, source, adapter)
     settings["patch_seconds"] = tts.patch_size * tts._decode_chunk_size / tts.sample_rate
     settings["max_generated_seconds"] = max_steps * settings["patch_seconds"]
@@ -231,7 +264,9 @@ def main():
     parser.add_argument("--benchmark", required=True)
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--source", default=str(DEFAULT_SOURCE))
-    parser.add_argument("--adapter", help="Official checkpoint directory; omit for the original Base")
+    weights = parser.add_mutually_exclusive_group()
+    weights.add_argument("--full-checkpoint", help="Numbered checkpoint directory from official full fine-tuning")
+    weights.add_argument("--adapter", help="Official checkpoint directory; omit for the original Base")
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, help="Override every case seed; otherwise keep benchmark seeds")
     parser.add_argument("--max-steps", type=int, default=1000, help="Audio patches, 160 seconds at the pinned model's 6.25 Hz")
