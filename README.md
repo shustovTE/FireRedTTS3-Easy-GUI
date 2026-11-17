@@ -361,6 +361,13 @@ Prepared datasets and project metadata are kept separate from the original sourc
 
 ## 🧬 LoRA Training
 
+For the separate official **VoxCPM2 LoRA** workflow using the existing Dialogs,
+confirmed Spontaneous and validated Common Voice Scripted 27 Russian corpora,
+see **[the complete setup and launch guide](docs/VOXCPM2_RUSSIAN_LORA.md)**.
+It pins upstream/model versions, isolates dependencies, trims only recording
+edges with Silero VAD 6.2.3, audits all three corpora and supports detached jobs
+and whole-utterance cloned-voice evaluation.
+
 **Research status (2026-11-17):** the joint/hybrid and sampled-history experiments
 have not resolved long-utterance omissions or acoustic drift. Read the
 **[training strategy review](docs/TRAINING_STRATEGY_REVIEW_2026_11.md)** before

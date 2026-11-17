@@ -1,4 +1,5 @@
 .venv/
+.venv-voxcpm2/
 .runtime/
 models/
 outputs/
