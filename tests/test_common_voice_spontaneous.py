@@ -262,6 +262,28 @@ class PreparationTests(unittest.TestCase):
         self.assertLessEqual(np.abs(output).max(), .981)
         self.assertNotEqual(output[-1], 0.)
 
+    def test_voxcpm_originals_use_confirmed_row_and_apply_duration_limit_after_vad(self):
+        from fireredtts3_local.voxcpm_validated_sources import import_spontaneous
+        first = self.records[0]
+        self.records[1]["votes"] = "0"
+        self.records[2]["transcription"] = "Я [unclear]."
+        first["duration_ms"] = "31000"
+        audio = self.source / "audios" / first["audio_file"]
+        sf.write(audio, .1*np.sin(np.arange(31*16000)*.01), 16000, format="WAV", subtype="FLOAT")
+        self.write_metadata()
+        archive = self.archive()
+        staging = self.root / "prepared-voxcpm"
+        import_spontaneous(archive, staging, staging, {"train": [], "validation": []})
+        rows = [json.loads(line) for split in ("train", "validation")
+                for line in (staging / "spontaneous" / f"{split}.jsonl").read_text().splitlines()]
+        by_id = {row["cv_audio_id"]: row for row in rows}
+        self.assertNotIn("2", by_id)
+        self.assertNotIn("3", by_id)
+        self.assertEqual(by_id["1"]["duration"], 31.)
+        self.assertEqual(file_digest(by_id["1"]["audio"]), file_digest(audio))
+        self.assertEqual(by_id["1"]["text"], first["transcription"])
+        self.assertEqual(by_id["1"]["cv_audio_processing"]["method"], "original_mp3")
+
     def test_exact_thirds_extra_holdout_and_deterministic_pairs(self):
         rows,_ = collect(self.source, self.root / "audio")
         train,val,skipped = select(rows)

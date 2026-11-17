@@ -1,4 +1,4 @@
-"""Prepare uncapped neutral Dialogs and validated Russian Scripted from their original releases."""
+"""Prepare uncapped neutral Dialogs with a confirmed Russian Common Voice corpus."""
 from __future__ import annotations
 
 import argparse
@@ -12,10 +12,12 @@ from filelock import FileLock
 import numpy as np
 import soundfile as sf
 
+from . import common_voice_download as sps_archive
 from . import common_voice_scripted as cv
 from . import dialogs_dataset as dialogs
 from .training_data import dataset_fingerprint, file_digest
-from .voxcpm_data import RAW_OUTPUT, RAW_ROOT, RAW_SOURCES, SPLITS, _words, _write_json, _write_rows, prepare_raw_30s
+from .voxcpm_data import (FAIR_OUTPUT, FAIR_ROOT, FAIR_SOURCES, RAW_OUTPUT, RAW_ROOT, RAW_SOURCES, SPLITS,
+                          _words, _write_json, _write_rows, prepare_raw_30s, prepare_spontaneous_1000)
 
 
 def heldout_sessions(rows):
@@ -70,7 +72,7 @@ def dialog_candidates(source):
                     "metadata_rejections": rejected}
 
 
-def assign_scripted(rows, dialog_splits):
+def assign_common_voice(rows, dialog_splits):
     # Keep every occurrence of a sentence on one side, also across corpora.
     held = {_words(r["text"]) for r in dialog_splits["validation"]}
     train = {_words(r["text"]) for r in dialog_splits["train"]}
@@ -119,36 +121,62 @@ def save_source(dataset, folder, splits, details, *, installed_dir=None):
             accepted.append(dict(row, audio=str(final), duration=duration, audio_sha256=sha))
         _write_rows(folder / f"{split}.jsonl", accepted)
         datasets[split] = {"clips": len(accepted), "fingerprint": dataset_fingerprint(accepted)}
-    _write_json(folder / "report.json", dict(details, schema=RAW_SOURCES[dataset], complete=True,
+    _write_json(folder / "report.json", dict(details, schema=(RAW_SOURCES | FAIR_SOURCES)[dataset], complete=True,
                                              datasets=datasets, audio_rejections=dict(rejected)))
 
 
-def import_sources(source, archive, output, log=print):
+def import_spontaneous(archive, staging, output, dialog_splits):
+    from .common_voice_spontaneous import collect
+    original = sps_archive.extract_verified(archive, staging.parent / "original")
+    folder = staging / "spontaneous"
+    rows, excluded = collect(original, folder / "audio", original_for_vad=True)
+    candidates = []
+    rejections = Counter(r["reason"] for r in excluded)
+    for row in rows:
+        try:
+            cv.transcript(row["text"])
+        except ValueError as exc:
+            rejections[str(exc)] += 1
+            continue
+        candidates.append(row)
+    splits = assign_common_voice(candidates, dialog_splits)
+    save_source("spontaneous", folder, splits,
+                {"dataset_id": sps_archive.DATASET_ID, "raw_input": str(archive),
+                 "archive_sha256": sps_archive.ARCHIVE_SHA256, "source_rejections": dict(rejections)},
+                installed_dir=output / "spontaneous")
+
+
+def import_sources(source, archive, output, log=print, *, spontaneous=False):
     source, archive, output = (Path(p).resolve() for p in (source, archive, output))
     output.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(output) + ".lock", timeout=0):
         if output.exists():
             # prepare_raw_30s rechecks both source reports, manifests and audio.
-            for dataset, schema in RAW_SOURCES.items():
+            for dataset, schema in (FAIR_SOURCES if spontaneous else RAW_SOURCES).items():
                 report = json.loads((output / dataset / "report.json").read_text())
                 raw_input = source if dataset == "dialogs" else archive
                 if (report.get("schema") != schema or report.get("complete") is not True
                         or report.get("raw_input") != str(raw_input)):
                     raise ValueError(f"Incomplete original source import at {output}")
             return
-        cv.verify_archive(archive)
+        (sps_archive if spontaneous else cv).verify_archive(archive)
         with tempfile.TemporaryDirectory(dir=output.parent, prefix=".voxcpm-originals-") as temporary:
             staging = Path(temporary) / "data"
             log("[sources] Reading the pinned Dialogs inventory and fetching eligible neutral recordings", flush=True)
             dialog_splits, details = dialog_candidates(source)
             save_source("dialogs", staging / "dialogs", dialog_splits, dict(details, raw_input=str(source)))
+            if spontaneous:
+                log("[sources] Reading confirmed Russian Spontaneous from original MP3s", flush=True)
+                import_spontaneous(archive, staging, output, dialog_splits)
+                staging.rename(output)
+                return
             folder = staging / "scripted"
             log("[sources] Reading Russian Scripted validated recordings and confirmed sentences", flush=True)
             metadata = cv.extract_metadata(archive, folder / "metadata")
             rows, excluded, hashes = cv.candidates(metadata)
             log(f"[sources] Extracting {len(rows)} eligible Scripted recordings", flush=True)
             cv._extract_audio(archive, folder / "audio", rows, print)
-            splits = assign_scripted(rows, dialog_splits)
+            splits = assign_common_voice(rows, dialog_splits)
             save_source("scripted", folder, splits,
                         {"dataset_id": cv.DATASET_ID, "raw_input": str(archive), "archive_sha256": cv.ARCHIVE_SHA256, "metadata_sha256": hashes,
                          "metadata_rejections": dict(Counter(r["reason"] for r in excluded))},
@@ -159,20 +187,26 @@ def import_sources(source, archive, output, log=print):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dialogs", default="training/raw/dialogs")
-    parser.add_argument("--archive", default=cv.DEFAULT_ARCHIVE)
-    parser.add_argument("--sources", default=RAW_ROOT)
-    parser.add_argument("--output", default=RAW_OUTPUT)
+    parser.add_argument("--spontaneous", action="store_true", help="Dialogs + confirmed Spontaneous, fixed 1000 updates")
+    parser.add_argument("--archive")
+    parser.add_argument("--sources")
+    parser.add_argument("--output")
     args = parser.parse_args()
-    import_sources(args.dialogs, args.archive, args.sources)
-    report = prepare_raw_30s(args.sources, args.output)
+    sources = args.sources or (FAIR_ROOT if args.spontaneous else RAW_ROOT)
+    output = args.output or (FAIR_OUTPUT if args.spontaneous else RAW_OUTPUT)
+    archive = args.archive or (sps_archive.DEFAULT_ARCHIVE if args.spontaneous else cv.DEFAULT_ARCHIVE)
+    import_sources(args.dialogs, archive, sources, spontaneous=args.spontaneous)
+    report = (prepare_spontaneous_1000 if args.spontaneous else prepare_raw_30s)(sources, output)
     for name, groups in report["corpora"].items():
         for split, group in groups.items():
             stats = group["retained"]
             print(f"{name}/{split}: {stats['clips']} clips, {stats['hours']:.2f} hours")
     balance = report["balance"]
+    highest = (balance["max_draws_per_clip"] if args.spontaneous else
+               max(b["max_draws_per_clip"] for b in balance["buckets"].values()))
     print(f"Balanced epoch: {balance['unique_targets']} unique targets, {balance['target_draws']} draws, "
           f"{balance['question_fraction']:.2%} containing '?'. "
-          f"Maximum draws for one clip: {max(b['max_draws_per_clip'] for b in balance['buckets'].values())}")
+          f"Maximum draws for one clip: {highest}")
     print(f"Rejections: {report['rejections']}")
 
 

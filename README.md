@@ -368,6 +368,8 @@ It pins upstream/model versions, isolates dependencies, trims only recording
 edges with Silero VAD 6.2.3, audits all three corpora and supports detached jobs
 and whole-utterance cloned-voice evaluation.
 
+The [Dialogs and Spontaneous Full recipe](docs/VOXCPM2_FULL_DIALOGS_SPONTANEOUS.md) trains VoxCPM2 from Base for 1,000 updates with DPDFNet8 applied to Spontaneous after VAD.
+
 Commands use `/opt/firered-tuning`. If the existing workspace was moved from
 `/home/firered-tuning`, follow the [relocation instructions](docs/WORKSPACE_RELOCATION.md)
 to read historical metadata without a compatibility symlink or changing dataset fingerprints.

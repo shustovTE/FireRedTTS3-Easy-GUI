@@ -111,6 +111,30 @@ class VoxCPMTrainingTests(unittest.TestCase):
                 self.assertEqual(recipe["train_manifest"], str(pairs))
                 self.assertEqual(audit["schema"], vt.FULL_SCHEMA)
 
+    def test_fixed_spontaneous_profile_builds_exact_official_full_budget(self):
+        from fireredtts3_local.voxcpm_data import FAIR_SCHEMA
+        template = self.source / vt.FULL_TEMPLATE
+        template.parent.mkdir(parents=True)
+        vt.write_yaml(template, {"batch_size": 2, "grad_accum_steps": 8, "max_batch_tokens": 8192,
+                                 "learning_rate": 1e-5, "warmup_steps": 100, "save_interval": 500,
+                                 "valid_interval": 500, "sample_rate": 16000, "out_sample_rate": 48000})
+        pairs = self.dataset / "balanced-train.jsonl"
+        pairs.write_text((json.dumps(self.train[0]) + "\n") * 16000)
+        self.report.update(schema=FAIR_SCHEMA, balance={"target_draws": 16000})
+        self.report["manifests"][pairs.name] = vt.digest(pairs)
+        out = self.root / "fair.yaml"
+        opts = dict(source=self.source, model=self.model, full_epoch=True, expected_data_schema=FAIR_SCHEMA)
+        with (patch.object(vt, "verify_source"), patch.object(vt, "prepared_audit", return_value=self.report),
+              patch.object(vt, "tokenizer_for", return_value=list)):
+            result = vt.build_recipe(self.dataset, out, self.root / "training-output", **opts)
+            recipe, audit = vt.verify_recipe(out)
+        self.assertEqual((result["updates"], result["target_draws"]), (1000, 16000))
+        self.assertEqual((recipe["batch_size"], recipe["grad_accum_steps"], recipe["max_steps"]), (2, 8, 1000))
+        self.assertEqual(recipe["pretrained_path"], str(self.model))
+        self.assertEqual(recipe["train_manifest"], str(pairs))
+        self.assertNotIn("lora", recipe)
+        self.assertEqual(audit["extra_draws_after_epoch"], 0)
+
     def test_start_all_uses_pinned_template_and_reaudits_same_data_in_separate_output(self):
         recipe_path, _ = self._build()
         original_bytes = recipe_path.read_bytes()

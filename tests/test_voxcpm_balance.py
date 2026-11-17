@@ -2,8 +2,9 @@ import hashlib
 import io
 import json
 import unittest
+from collections import Counter
 
-from fireredtts3_local.voxcpm_balance import manifest_digest, plan
+from fireredtts3_local.voxcpm_balance import even_repeats, manifest_digest, plan
 
 
 class LengthAndQuestionBalanceTests(unittest.TestCase):
@@ -38,3 +39,30 @@ class LengthAndQuestionBalanceTests(unittest.TestCase):
         for text, duration in [("Обрыв", 8), ("Обрыв…", 8), ("Обрыв?..", 8), ("Да?", 2.99), ("Да?", 30.01)]:
             with self.subTest(text=text, duration=duration), self.assertRaises(ValueError):
                 plan([{"audio": "test.wav", "duration": duration, "text": text}])
+
+
+class ClipExposureTests(unittest.TestCase):
+    def test_rare_duration_does_not_override_equal_clip_repeats(self):
+        rows = [{"audio": f"{i}.wav", "duration": 4 if i < 3998 else 29.9,
+                 "text": "Готовы? Начинаем." if i % 2 else "Хорошо."} for i in range(4001)]
+        corpora = ["dialogs"] * 3701 + ["spontaneous"] * 300
+        repeats, report = even_repeats(rows, corpora)
+        self.assertEqual(sum(repeats), 16000)
+        self.assertEqual(set(repeats), {3, 4})
+        self.assertEqual(repeats[-3:], [4, 4, 4])
+        self.assertEqual(report["corpus_draws"]["spontaneous"], sum(repeats[-300:]))
+        self.assertEqual({str(k): v for k, v in Counter(repeats).items()}, report["draw_histogram"])
+        self.assertGreaterEqual(report["question_draws"], 4800)
+        self.assertIn(29, report["empty_seconds"])
+        reverse, _ = even_repeats(rows[::-1], corpora[::-1])
+        self.assertEqual(repeats, reverse[::-1])
+
+    def test_question_constraint_changes_only_necessary_exposures(self):
+        rows = [{"audio": str(i), "text": "Да?" if i < 2 else "Да.", "duration": 5.} for i in range(10)]
+        repeats, report = even_repeats(rows, ["dialogs"] * 10, draws=83)
+        self.assertEqual(sum(repeats), 83)
+        self.assertEqual(report["question_draws"], 25)
+        for pool in (repeats[:2], repeats[2:]):
+            self.assertLessEqual(max(pool)-min(pool), 1)
+        with self.assertRaisesRegex(ValueError, "30%"):
+            even_repeats(rows, ["dialogs"] * 10, draws=10)

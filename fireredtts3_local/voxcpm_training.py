@@ -301,7 +301,7 @@ def sequence_audit(dataset, tokenizer, *, context_limit, batch_size, max_batch_t
 
 def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DEFAULT_MODEL,
                  python=None, epochs=1, batch_size=1, grad_accum_steps=8, learning_rate=1e-4,
-                 max_batch_tokens=8192, num_workers=4, full_epoch=False):
+                 max_batch_tokens=8192, num_workers=4, full_epoch=False, expected_data_schema=None):
     dataset, output, output_dir, source, model = map(lambda p: local_path(p).resolve(),
                                                      (dataset, output, output_dir, source, model))
     if any(value < 1 for value in (epochs, batch_size, grad_accum_steps, max_batch_tokens)):
@@ -319,8 +319,8 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
     report = prepared_audit(dataset)
     if full_epoch:
         from .voxcpm_data import RAW_SCHEMA
-        if report.get("schema") != RAW_SCHEMA or epochs != 1:
-            raise ValueError("Full-epoch recipe expects the uncapped Dialogs/Scripted 30s preparation and one epoch")
+        if report.get("schema") != (expected_data_schema or RAW_SCHEMA) or epochs != 1:
+            raise ValueError("Balanced Full recipe requires the matching audited data profile and one manifest pass")
     lengths = sequence_audit(dataset, tokenizer_for(model, source), context_limit=int(config["max_length"]),
                              batch_size=batch_size, max_batch_tokens=max_batch_tokens)
     targets = lengths["train"]["targets"]
@@ -367,6 +367,11 @@ def build_recipe(dataset, output, output_dir, *, source=DEFAULT_SOURCE, model=DE
     if full_epoch:
         audit["balance"] = report["balance"]
         recipe, audit = official_full_recipe(recipe, audit, output_dir, whole_epoch=True)
+        from .voxcpm_data import FAIR_SCHEMA
+        if report["schema"] == FAIR_SCHEMA and (
+                recipe["num_iters"], recipe["max_steps"], recipe["batch_size"], recipe["grad_accum_steps"]
+        ) != (1000, 1000, 2, 8):
+            raise ValueError("Dialogs/Spontaneous Full requires exactly 1000 updates of 2 x 8 recordings")
     write_yaml(output, recipe)
     audit["recipe_sha256"] = digest(output)
     write_json(output.with_suffix(".audit.json"), audit)
@@ -618,6 +623,10 @@ def main(argv=None):
     build.add_argument("--learning-rate", type=float, default=1e-4)
     build.add_argument("--max-batch-tokens", type=int, default=8192)
     build.add_argument("--num-workers", type=int, default=4)
+    fixed = commands.add_parser("build-dialogs-spontaneous", help="Full from Base, 1000 updates, balanced clip repetitions")
+    fixed.add_argument("--dataset")
+    fixed.add_argument("--output")
+    fixed.add_argument("--output-dir")
     full_epoch = commands.add_parser("build-full-epoch", help="Build the original Base full-tuning recipe for every uncapped Dialogs/Scripted target")
     full_epoch.add_argument("--dataset")
     full_epoch.add_argument("--output", default="training/recipes/voxcpm2-dialogs-scripted-30s-full.yaml")
@@ -650,6 +659,11 @@ def main(argv=None):
         for key in ("command", "dataset", "output", "output_dir"):
             options.pop(key)
         result = build_recipe(args.dataset, args.output, args.output_dir, **options)
+    elif args.command == "build-dialogs-spontaneous":
+        from .voxcpm_data import FAIR_OUTPUT, FAIR_RUN, FAIR_SCHEMA
+        result = build_recipe(args.dataset or FAIR_OUTPUT, args.output or f"training/recipes/{FAIR_RUN}.yaml",
+                              args.output_dir or f"training/outputs/{FAIR_RUN}", full_epoch=True,
+                              expected_data_schema=FAIR_SCHEMA)
     elif args.command == "build-full-epoch":
         from .voxcpm_data import RAW_OUTPUT
         result = build_recipe(args.dataset or RAW_OUTPUT, args.output, args.output_dir, full_epoch=True)

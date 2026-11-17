@@ -133,6 +133,46 @@ class VoxCPMDataTests(unittest.TestCase):
             self.assertFalse(any(r["utt_id"].endswith(":1") for r in rows))
             self.assertFalse(any(r["ref_utt_id"].endswith(":1") for r in rows))
 
+    def test_spontaneous_denoising_follows_vad_for_targets_and_references(self):
+        for corpus, schema in data.FAIR_SOURCES.items():
+            for split, rows in self.rows[corpus].items():
+                for i, row in enumerate(rows):
+                    row["text"] = f"Скажите {'имя' if corpus == 'dialogs' else 'город'} номер {i} " + (
+                        "сегодня?" if split == "train" else "завтра?")
+                    path = Path(row["audio"])
+                    samples, _ = sf.read(path)
+                    sf.write(path, np.tile(samples, 14), 32000, subtype="FLOAT")
+                    row.update(audio_sha256=file_digest(path), duration=7)
+                    if corpus == "dialogs":
+                        row["emotion"] = "neutral"
+                    else:
+                        row.update(cv_official_split="dev", cv_votes=1, cv_source_sha256=file_digest(path),
+                                   cv_original_transcription=row["text"])
+            self.save(corpus)
+            path = self.paths[corpus] / "report.json"
+            path.write_text(json.dumps(dict(json.loads(path.read_text()), schema=schema)))
+
+        def fake_denoiser(cut, final):
+            samples, rate = sf.read(cut)
+            self.assertIn("vad-spontaneous", cut.parts)
+            self.assertLess(len(samples), 7 * rate)
+            sf.write(final, samples[::2] * .8, 16000, subtype="FLOAT")
+
+        with patch.object(data.denoise, "SpontaneousDenoiser", return_value=fake_denoiser):
+            report = data.prepare_spontaneous_1000(self.root, self.output, detector=Detector(), log=lambda _: None)
+        self.assertEqual(report["denoised_clips"], {"train": 4, "validation": 4})
+        for split in data.SPLITS:
+            for meta in self.provenance(split):
+                spontaneous = meta["dataset_id"] == "spontaneous"
+                for field in ("audio", "ref_audio"):
+                    self.assertEqual(sf.info(meta[field]).samplerate, 16000 if spontaneous else 32000)
+                self.assertEqual(meta["trim"]["destination"] != meta["audio"], spontaneous)
+        clip = next(m for m in self.provenance("train") if m["dataset_id"] == "spontaneous")
+        with open(clip["trim"]["destination"], "ab") as stream:
+            stream.write(b"changed")
+        with self.assertRaisesRegex(ValueError, "Post-VAD Spontaneous input changed"):
+            data.audit(self.output)
+
     def test_cross_corpus_normalized_text_holdout_wins(self):
         self.rows["dialogs"]["train"][0]["text"] = "Всё готово?"
         self.rows["scripted"]["validation"][0]["text"] = "ВСЕ готово."

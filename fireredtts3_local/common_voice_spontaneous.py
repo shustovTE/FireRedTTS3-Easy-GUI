@@ -21,11 +21,8 @@ import torchaudio
 from .common_voice_download import (ARCHIVE_SHA256, CORPUS, DATASET_ID,
                                    DEFAULT_ARCHIVE, download, extract_verified)
 from .dialogs_dataset import category, lexical_key
-from .dialogs_only import audit_prepared as audit_dialogs
 from .training_data import (SpeakerPairs, assert_disjoint, dataset_fingerprint,
                             file_digest, plain_text, write_manifest)
-from .training_run import (TrainingOptions, initial_adapter_info, prepare_run_data,
-                           primary_examples_per_update)
 from .yo_dataset import has_sentence_ending
 
 SCHEMA = "cv-spontaneous-dialogs-v1"
@@ -71,7 +68,7 @@ def transcript(text):
     return result, changes
 
 
-def collect(source, audio_output, blocked_texts=()):
+def collect(source, audio_output, blocked_texts=(), *, original_for_vad=False):
     """Audit every confirmed candidate before selection; never crop or use ASR."""
     source, audio_output = Path(source), Path(audio_output)
     audio_output.mkdir(parents=True)
@@ -105,7 +102,7 @@ def collect(source, audio_output, blocked_texts=()):
             if record["audio_file"] != f"spontaneous-speech-ru-{audio_id}.mp3":
                 raise ValueError("invalid_audio_path")
             duration = float(record["duration_ms"]) / 1000
-            if not math.isfinite(duration) or not 2 <= duration <= 30:
+            if not math.isfinite(duration) or duration <= 0 or (not original_for_vad and not 2 <= duration <= 30):
                 raise ValueError("duration")
             if set(record["quality_tags"].split("|")) & {"transcription-length", "speech-rate", "short-audio", "long-audio"}:
                 raise ValueError("source_quality_flag")
@@ -113,14 +110,14 @@ def collect(source, audio_output, blocked_texts=()):
             key = lexical_key(text)
             if key in blocked_texts:
                 raise ValueError("dialogs_text_overlap")
-            if key in seen_text:
+            if not original_for_vad and key in seen_text:
                 raise ValueError("duplicate_word_sequence")
             path = source / "audios" / record["audio_file"]
             data, rate = sf.read(path, dtype="float32", always_2d=True)
             if data.shape[1] != 1 or not len(data) or not np.isfinite(data).all():
                 raise ValueError("invalid_audio")
             actual = len(data) / rate
-            if not 2 <= actual <= 30 or abs(actual - duration) > .15:
+            if abs(actual - duration) > .15 or (not original_for_vad and not 2 <= actual <= 30):
                 raise ValueError("audio_duration")
             if float(np.sqrt(np.mean(data.astype(np.float64)**2))) < 1e-5:
                 raise ValueError("near_silent_audio")
@@ -128,19 +125,27 @@ def collect(source, audio_output, blocked_texts=()):
             near_fullscale = float(np.mean(np.abs(data) >= .999))
             if near_fullscale > .001:
                 raise ValueError("excess_near_fullscale_samples")
-            wave = torchaudio.functional.resample(torch.from_numpy(data.T.copy()), rate, 24000)[0].numpy()
-            # MP3/resampling can overshoot. Fixed attenuation preserves dynamics
-            # and every sample; no hard clipping, compression or loudness target.
-            resampled_peak = float(np.abs(wave).max())
-            gain = .98 / resampled_peak if resampled_peak > 1. else 1.
-            destination = audio_output / f"{audio_id}.wav"
-            sf.write(destination, wave * gain, 24000, subtype="PCM_16")
+            processing = dict(source_sample_rate=rate, decoded_peak=peak, fraction_near_fullscale=near_fullscale)
+            if original_for_vad:
+                destination = audio_output / path.name
+                shutil.copyfile(path, destination)
+                seconds = actual
+                processing["method"] = "original_mp3"
+            else:
+                wave = torchaudio.functional.resample(torch.from_numpy(data.T.copy()), rate, 24000)[0].numpy()
+                # MP3/resampling can overshoot. Fixed attenuation preserves dynamics
+                # and every sample; no hard clipping, compression or loudness target.
+                resampled_peak = float(np.abs(wave).max())
+                gain = .98 / resampled_peak if resampled_peak > 1. else 1.
+                destination = audio_output / f"{audio_id}.wav"
+                sf.write(destination, wave * gain, 24000, subtype="PCM_16")
+                processing.update(resampled_peak=resampled_peak, fixed_gain=gain)
+                seconds = sf.info(destination).duration
             digest = file_digest(destination)
             if digest in seen_audio:
                 destination.unlink()
                 raise ValueError("duplicate_audio")
-            seconds = sf.info(destination).duration
-            if seconds > 30:
+            if not original_for_vad and seconds > 30:
                 destination.unlink()
                 raise ValueError("resampled_duration")
             seen_audio.add(digest)
@@ -152,8 +157,7 @@ def collect(source, audio_output, blocked_texts=()):
                 cv_official_split=record["split"], cv_votes=int(record["votes"]),
                 cv_original_transcription=record["transcription"], cv_transcript_changes=changes,
                 cv_quality_tags=record["quality_tags"], cv_source_sha256=file_digest(path),
-                cv_audio_processing=dict(source_sample_rate=rate, decoded_peak=peak,
-                    fraction_near_fullscale=near_fullscale, resampled_peak=resampled_peak, fixed_gain=gain)))
+                cv_audio_processing=processing))
         except (ValueError, RuntimeError) as exc:
             excluded.append(dict(audio_id=audio_id, reason=str(exc)))
     return rows, excluded
@@ -232,6 +236,7 @@ def summary(rows):
 
 
 def audit(output=DEFAULT_OUTPUT):
+    from .training_run import initial_adapter_info, prepare_run_data
     output = Path(output).resolve()
     report = json.loads((output / "report.json").read_text())
     if report.get("schema") != SCHEMA or not report.get("complete"):
@@ -252,6 +257,8 @@ def audit(output=DEFAULT_OUTPUT):
 
 def prepare(archive=DEFAULT_ARCHIVE, output=DEFAULT_OUTPUT,
             dialogs="training/datasets/dialogs-base-08", recipe=DEFAULT_RECIPE, log=print):
+    from .dialogs_only import audit_prepared as audit_dialogs
+    from .training_run import TrainingOptions, initial_adapter_info, prepare_run_data, primary_examples_per_update
     output, dialogs = Path(output).resolve(), Path(dialogs).resolve()
     config = json.loads(Path(recipe).read_text())
     opts = TrainingOptions.parse(config["options"])

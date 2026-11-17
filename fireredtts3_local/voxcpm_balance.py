@@ -1,5 +1,5 @@
 """Construct a reproducible full epoch from unique, VAD-checked training pairs."""
-from collections import defaultdict
+from collections import Counter, defaultdict
 import hashlib
 import json
 import math
@@ -8,10 +8,10 @@ from .yo_dataset import has_sentence_ending
 
 SECONDS = range(3, 31)
 MANIFEST = "balanced-train.jsonl"
+FULL_DRAWS = 1000 * 2 * 8
 
 
-def plan(rows):
-    """Retain each target once, then assign additional draws in whole recordings."""
+def _groups(rows):
     groups = defaultdict(lambda: {True: [], False: []})
     for index, row in enumerate(rows):
         duration = row["duration"]
@@ -21,6 +21,12 @@ def plan(rows):
     if not groups:
         raise ValueError("No eligible training pairs remain")
 
+    return groups
+
+
+def plan(rows):
+    """Retain each target once, then assign additional draws in whole recordings."""
+    groups = _groups(rows)
     counts = {s: sum(map(len, g.values())) for s, g in groups.items()}
     quota = max(counts.values())
     budgets = dict.fromkeys(counts, quota)
@@ -88,6 +94,76 @@ def plan(rows):
                      "question_draws": sum(questions.values()), "minimum_question_draws": required,
                      "question_fraction": sum(questions.values()) / total,
                      "empty_bin_transfers": transfers, "buckets": buckets}
+
+
+def even_repeats(rows, corpora, *, draws=FULL_DRAWS):
+    """Allocate the fixed single-GPU budget with the smallest clip exposure disparity.
+
+    At the natural question share, all clip counts differ by at most one.
+    If the floor binds, use as few extra question slots as necessary and keep
+    counts within each class at floor/ceil. Duration only decides remainders.
+    """
+    groups = _groups(rows)
+    if len(corpora) != len(rows) or len(rows) > draws:
+        raise ValueError("Fixed draw budget must cover each identified training target")
+    n_questions = sum(len(group[True]) for group in groups.values())
+    required = (3 * draws + 9) // 10
+    if not n_questions or draws - (len(rows) - n_questions) < required:
+        raise ValueError("Cannot reach 30% questions while presenting every target at least once")
+    q_draws = max(required, (draws * n_questions + len(rows) // 2) // len(rows))
+    counts = Counter()
+    repeats = [0] * len(rows)
+    remaining = {}
+    for question, budget in ((True, q_draws), (False, draws - q_draws)):
+        n = n_questions if question else len(rows) - n_questions
+        base, remaining[question] = divmod(budget, n) if n else (0, 0)
+        for sec, group in groups.items():
+            group[question].sort(key=lambda i: hashlib.sha256(rows[i]["audio"].rsplit("/", 1)[-1].encode()).digest())
+            for i in group[question]:
+                repeats[i] = base
+            counts[sec] += base * len(group[question])
+
+    # Each second has two half-shares. Transfer a missing second's half-shares
+    # to its closest occupied neighbours, both to the sole neighbour at an edge.
+    weights = Counter()
+    for sec in SECONDS:
+        left = max((s for s in groups if s <= sec), default=None)
+        right = min((s for s in groups if s >= sec), default=None)
+        weights[left or right] += 1
+        weights[right or left] += 1
+    units = 2 * len(SECONDS)
+    while any(remaining.values()):
+        eligible = ((sec, q) for sec, group in groups.items() for q in (True, False)
+                    if remaining[q] and group[q])
+        # Prefer the duration farthest below its share, within the clip budgets.
+        sec, question = max(eligible, key=lambda k: (draws * weights[k[0]] - units * counts[k[0]],
+                                                     remaining[k[1]], -k[0], k[1]))
+        i = groups[sec][question].pop()
+        repeats[i] += 1
+        counts[sec] += 1
+        remaining[question] -= 1
+
+    histogram = Counter(repeats)
+    class_counts = defaultdict(Counter)
+    corpus_counts = Counter()
+    buckets = defaultdict(list)
+    for row, corpus, times in zip(rows, corpora, repeats, strict=True):
+        buckets[math.floor(row["duration"] + .5)].append(times)
+        corpus_counts[corpus] += times
+        class_counts["questions" if "?" in row["text"] else "other"][str(times)] += 1
+    if min(repeats) < 1 or sum(repeats) != draws or sum(
+            times for row, times in zip(rows, repeats) if "?" in row["text"]) != q_draws:
+        raise RuntimeError("Inconsistent per-record exposure or question allocation")
+    return repeats, {"unique_targets": len(rows), "target_draws": draws, "unique_questions": n_questions,
+                     "question_draws": q_draws, "minimum_question_draws": required,
+                     "question_fraction": q_draws / draws, "corpus_draws": dict(corpus_counts),
+                     "draw_histogram_by_type": {k: dict(v) for k, v in class_counts.items()},
+                     "draw_histogram": {str(k): v for k, v in sorted(histogram.items())},
+                     "min_draws_per_clip": min(repeats), "max_draws_per_clip": max(repeats),
+                     "empty_seconds": [s for s in SECONDS if s not in groups],
+                     "buckets": {str(s): {"unique": len(buckets[s]), "draws": counts[s],
+                                          "desired_draws": draws * weights[s] / units}
+                                 for s in SECONDS}}
 
 
 def manifest_digest(rows, repeats, stream=None):
