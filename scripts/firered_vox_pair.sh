@@ -9,7 +9,7 @@ fi
 step=$1
 python=.venv/bin/python
 module=fireredtts3_local.vox_recipe_transfer
-output=training/outputs/firered-vox-recipe-12
+output=training/outputs/firered-vox-recipe-12-cap30m
 printf -v checkpoint 'step-%04d' "$step"
 shopt -s nullglob
 for mode in lora full; do
@@ -21,10 +21,10 @@ for mode in lora full; do
     if (( ${#saved[@]} )); then
         resume=(--resume)
     fi
-    "$python" -u -m "$module" train "$mode" --until "$step" "${resume[@]}"
+    "$python" -u -m "$module" train "$mode" --output "$output" --until "$step" "${resume[@]}"
 done
 benchmark=()
 if (( $# == 2 )); then
     benchmark=(--benchmark "$2")
 fi
-"$python" -u -m "$module" compare --step "$step" "${benchmark[@]}"
+"$python" -u -m "$module" compare --output "$output" --step "$step" "${benchmark[@]}"

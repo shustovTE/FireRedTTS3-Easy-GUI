@@ -1,6 +1,10 @@
 # LoRA и Full по рецептам VoxCPM2 для FireRedTTS3-Base
 
-Два независимых эксперимента стартуют с оригинального FireRedTTS3-Base. Для сравнения используется уже подготовленный на Gauss датасет `training/datasets/voxcpm2-dialogs-spontaneous-full-1000`. Программа сверяет его отчёт, исходники, разбиение, WAV, тексты и пары. Оба режима получают все 16 000 показов в одном порядке. Референсу каждого диктора соответствует его собственная транскрипция. Повторная обработка VAD и DPDFNet8 не требуется.
+Два независимых эксперимента стартуют с оригинального FireRedTTS3-Base. Источник — проверенные Dialogs и Spontaneous из `training/datasets/voxcpm2-dialogs-spontaneous-full-1000` на Gauss. Программа сверяет отчёт, исходники, разбиение, WAV и тексты.
+
+На каждого диктора приходится максимум 30 минут уникального учебного аудио. Длительность измеряется по сэмплам готового WAV после VAD и обработки шума в Spontaneous. Записи сортируются от длинных к коротким, при равенстве — по `utt_id`. Отбор заканчивается перед первой записью, с которой сумма превысила бы 1 800 секунд. Поэтому у диктора может получиться, например, 29:56, даже если среди исключённых есть трёхсекундная реплика. Все записи используются целиком. Референсы для клонирования берутся из оставшихся записей того же диктора. Цель без отдельного подходящего референса исключается и учитывается в отчёте.
+
+Отложенная валидация идёт сверх лимита, с исходными парами. После отбора программа заново распределяет 16 000 учебных показов с прежним правилом равномерных повторов и минимум 30% реплик со знаком вопроса среди показов. LoRA и Full получают одни и те же пары в одном порядке.
 
 | Параметр | LoRA | Full |
 | --- | --- | --- |
@@ -22,8 +26,14 @@ RedAE и CAM++ заморожены. Времена для flow matching бер�
 cd /opt/firered-tuning
 df -h .
 ls training/datasets/voxcpm2-dialogs-spontaneous-full-1000/report.json
-.venv/bin/python -m fireredtts3_local.vox_recipe_transfer --help
+.venv/bin/python -m fireredtts3_local.vox_recipe_transfer selection
 mkdir -p training/logs
+```
+
+Команда `selection` выполняется на CPU и печатает число оставшихся записей, их суммарную длительность и путь к отчёту. Посмотреть длительности и число исключений по каждому диктору можно так.
+
+```bash
+jq '.speakers' training/outputs/firered-vox-recipe-12-cap30m/speaker_selection.json
 ```
 
 ## 2. Запустить два пилота последовательно
@@ -31,13 +41,13 @@ mkdir -p training/logs
 Каждый пилот выполняет первые 30 из 1 000 обновлений с исходным расписанием LR. Первый запуск подготовит кэш FireRed. Фоновая оболочка переживает закрытие SSH и запускает Full после успешного завершения LoRA.
 
 ```bash
-nohup bash scripts/firered_vox_pair.sh 30 > training/logs/firered-vox-pilot.log 2>&1 < /dev/null &
+nohup bash scripts/firered_vox_pair.sh 30 > training/logs/firered-vox-cap30m-pilot.log 2>&1 < /dev/null &
 ```
 
 ## 3. Послушать пилот
 
 ```bash
-tail -n 30 -f training/logs/firered-vox-pilot.log
+tail -n 30 -f training/logs/firered-vox-cap30m-pilot.log
 ```
 
 Последняя строка успешного сравнения указывает на `comparison-0030-…/report.json`. Рядом лежат папки `base/`, `lora/`, `full/` с исходными float WAV. Имена файлов соответствуют порядку в `cases.json`. По умолчанию используются один отложенный референс Dialogs, вопрос, полные тексты «по городам» и «Тимофей», seed 1234 и 1235. Для своего голоса передайте команде `compare --benchmark путь/к/benchmark.jsonl` с полями `id`, `text`, `reference_audio`, `reference_text`, `seed` и `language`. Путь к WAV может быть относительным к JSONL. Для повторных сравнений используйте тот же файл. ASR и проверка диктора при первом запуске могут скачать large-v3 и microsoft/wavlm-base-plus-sv. Параметры `--asr` и `--speaker-model` принимают и локальные каталоги.
@@ -49,20 +59,20 @@ tail -n 30 -f training/logs/firered-vox-pilot.log
 После проверки пилотов можно продолжить с сохранёнными весами, оптимизатором, расписанием и состоянием генераторов случайных чисел. Оба запуска используют одинаковые следующие пары.
 
 ```bash
-nohup bash scripts/firered_vox_pair.sh 500 > training/logs/firered-vox-500.log 2>&1 < /dev/null &
+nohup bash scripts/firered_vox_pair.sh 500 > training/logs/firered-vox-cap30m-500.log 2>&1 < /dev/null &
 ```
 
 После прослушивания шага 500 запускается заключительная половина. Скрипт использует сохранённый чекпойнт каждого режима и позволяет повторить сравнение готовой пары. Необязательный второй аргумент — путь к своему benchmark.jsonl, одинаковому для всех шагов.
 
 ```bash
-nohup bash scripts/firered_vox_pair.sh 1000 > training/logs/firered-vox-full.log 2>&1 < /dev/null &
+nohup bash scripts/firered_vox_pair.sh 1000 > training/logs/firered-vox-cap30m-full.log 2>&1 < /dev/null &
 ```
 
 ## 5. Сравнить результаты
 
 ```bash
-tail -n 30 training/logs/firered-vox-full.log
-find training/outputs/firered-vox-recipe-12 -name report.json
+tail -n 30 training/logs/firered-vox-cap30m-full.log
+find training/outputs/firered-vox-recipe-12-cap30m -name report.json
 ```
 
 Чекпойнты находятся в `lora/step-0500`, `full/step-0500`, `lora/step-1000`, `full/step-1000`. Внутри LoRA лежат файлы PEFT, внутри Full — каталог `fireredtts3_base` с весами и конфигурацией генератора для исходного комплекта FireRed. Эксперимент сохраняет кандидатов отдельно от исходной модели. Выбор версии делается по полным записям и отчётам. Для независимого эксперимента можно указать новое значение `--output` для всех команд.

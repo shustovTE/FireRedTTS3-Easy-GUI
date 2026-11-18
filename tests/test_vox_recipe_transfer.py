@@ -17,7 +17,24 @@ from fireredtts3_local.training_batch import set_training
 from fireredtts3_local.vox_recipe_transfer import configure, objective, save_checkpoint, paired_data
 from fireredtts3_local.vox_recipe_compare import content_flags
 from fireredtts3_local import vox_recipe_transfer as transfer
-from fireredtts3_local import voxcpm_data, voxcpm_balance
+from fireredtts3_local import voxcpm_data
+
+
+def speaker_rows(root, speaker, lengths, corpus='dialogs'):
+    rows = []
+    for index, frames in enumerate(lengths):
+        uid = f'{speaker}-{index}'
+        path = str(root / f'{uid}.wav')
+        sf.write(path, np.zeros(frames), 1000)
+        rows.append(dict(utt_id=uid, dataset_id=corpus, speaker_id=speaker, audio=path,
+                         text=f'Реплика {uid}' + ('?' if index % 2 == 0 else '.'),
+                         duration=frames / 1000, source_audio=path, source_sha256=uid,
+                         audio_sha256=uid, source_pcm_sha256=uid, pcm_sha256=uid))
+    for index, row in enumerate(rows):
+        ref = rows[(index + 1) % len(rows)]
+        row.update(ref_utt_id=ref['utt_id'], ref_audio=ref['audio'], ref_sha256=ref['audio_sha256'],
+                   ref_duration=ref['duration'], ref_pcm_sha256=ref['pcm_sha256'], ref_text=ref['text'])
+    return rows
 
 
 class TransferTests(unittest.TestCase):
@@ -30,19 +47,62 @@ class TransferTests(unittest.TestCase):
             d = Path(folder)
             report = dict(schema=voxcpm_data.FAIR_SCHEMA)
             (d/'report.json').write_text(json.dumps(report))
-            rows = [dict(audio=f'{i}.wav', text=f'hello {i}', ref_text=f'hello {1-i}',
-                         ref_audio=f'{1-i}.wav', audio_sha256=str(i)) for i in range(2)]
-            for name, data in [('validation-provenance.jsonl', rows), ('train-provenance.jsonl', rows),
-                               (voxcpm_balance.MANIFEST, rows*8000)]:
+            # 9+7 seconds fit. The 5-second clip crosses the cap. The 3-second
+            # clip would fit in the gap but falls after the first excluded clip.
+            rows = speaker_rows(d, 'alice', [9000, 7000, 5000, 3000])
+            held = speaker_rows(d, 'held', [20000, 18000])
+            for name, data in [('validation-provenance.jsonl', held), ('train-provenance.jsonl', rows)]:
                 (d/name).write_text(''.join(json.dumps(r)+'\n' for r in data))
-            with patch.object(voxcpm_data, 'audit', return_value=report):
-                a, unique, _ = paired_data(d)
-                b, _, _ = paired_data(d)
+            with patch.object(voxcpm_data, 'audit', return_value=report), patch.object(transfer, 'CAP_SECONDS', 20):
+                a, unique, selection = paired_data(d)
+                b, _, second = paired_data(d)
             self.assertEqual(a, b)
-            self.assertEqual(len(unique), 2)
+            self.assertEqual(selection, second)
+            self.assertEqual(len(unique), 4)
             self.assertEqual(len(a['train']), 16000)
-            self.assertEqual(sum(t['text'] == 'hello 0' for _,t,_ in a['train']), 8000)
-            self.assertTrue(all(p['text'] == t['ref_text'] for p,t,_ in a['train']))
+            self.assertEqual(sum('?' in t['text'] for _, t, _ in a['train']), 8000)
+            self.assertEqual({r['utt_id'] for pair in a['train'] for r in pair[:2]}, {'alice-0', 'alice-1'})
+            self.assertTrue(all(p['utt_id'] != t['utt_id'] and p['text'] == t['ref_text'] and
+                                p['pcm_sha256'] == t['ref_pcm_sha256'] for p, t, _ in a['train']))
+            self.assertEqual([(p['utt_id'], t['utt_id']) for p, t, _ in a['validation']],
+                             [(r['ref_utt_id'], r['utt_id']) for r in held])
+            self.assertEqual(selection['speakers']['alice'], dict(source_clips=4, source_seconds=24,
+                             train_clips=2, train_seconds=16, excluded_by_cap=2, excluded_without_reference=0,
+                             replaced_references=1))
+
+    def test_cap_exact_sample_boundary_ties_and_independent_speakers(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(transfer, 'CAP_SECONDS', 20):
+            root = Path(folder)
+            exact = speaker_rows(root, 'a', [7300, 6350, 6350, 6350])
+            over = speaker_rows(root, 'b', [7301, 6350, 6350, 3000])
+            under = speaker_rows(root, 'c', [4000, 3000], 'spontaneous')
+            selected, stats = transfer.cap_training_speakers(list(reversed(exact + over + under)))
+            self.assertEqual([r['utt_id'] for r in selected], ['a-0', 'a-1', 'a-2', 'b-0', 'b-1', 'c-0', 'c-1'])
+            self.assertEqual(stats['a']['train_seconds'], 20)
+            self.assertEqual(stats['b']['train_seconds'], 13.651)
+            self.assertEqual(stats['c']['excluded_by_cap'], 0)
+            self.assertEqual(selected[-2:], under)
+
+    def test_real_30_minute_cap_counts_decoded_samples(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            # At 1 kHz, the 61st 3-second clip would exceed the limit by one sample.
+            exact = speaker_rows(root, 'exact', [30000]*59 + [27000, 3000])
+            over = speaker_rows(root, 'over', [30000]*59 + [27001, 3000])
+            _, stats = transfer.cap_training_speakers(exact + over)
+            self.assertEqual(stats['exact']['train_seconds'], 1800)
+            self.assertEqual(stats['exact']['train_clips'], 61)
+            self.assertEqual(stats['over']['train_seconds'], 1797.001)
+            self.assertEqual(stats['over']['excluded_by_cap'], 1)
+
+    def test_does_not_reintroduce_short_reference_outside_cap(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(transfer, 'CAP_SECONDS', 20):
+            rows = speaker_rows(Path(folder), 'a', [14000, 8000])
+            selected, stats = transfer.cap_training_speakers(rows)
+            self.assertEqual(selected, [])
+            self.assertEqual(stats['a']['excluded_by_cap'], 1)
+            self.assertEqual(stats['a']['excluded_without_reference'], 1)
+            self.assertEqual(stats['a']['train_seconds'], 0)
 
     def test_modes_update_and_reload(self):
         for mode in ('lora','full'):
@@ -112,7 +172,8 @@ class TransferTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, ExitStack() as mocks:
             for name, val in (('ModelManager', manager), ('FeatureCache', cache),
                               ('require_training_hardware', lambda: None), ('model_identity', lambda d: transfer.BASE_SHA),
-                              ('paired_data', lambda d: ({'train': pairs*16, 'validation': pairs}, rows, 'toy'))):
+                              ('paired_data', lambda d: ({'train': pairs*16, 'validation': pairs}, rows,
+                                                        {'selection_sha256': 'toy'}))):
                 mocks.enter_context(patch.object(transfer, name, val))
             from safetensors.torch import load_file
             for mode in ('lora', 'full'):
@@ -155,7 +216,7 @@ class TransferTests(unittest.TestCase):
                 return [SimpleNamespace(text=hyp)], None
             scorer = SimpleNamespace(eval=lambda: lambda **kw: SimpleNamespace(embeddings=torch.ones(1,8)))
             for module, name, value in [
-                (comp,'paired_data',lambda d: ({'train':[]}, [], 'audited')),
+                (comp,'paired_data',lambda d: ({'train':[]}, [], {'selection_sha256':'audited'})),
                 (comp,'model_identity',lambda d: transfer.BASE_SHA), (comp,'generate_case',generate),
                 (comp,'ModelManager',lambda:manager), (comp,'configure',lambda core, *args:core),
             ]:

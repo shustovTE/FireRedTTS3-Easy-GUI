@@ -48,7 +48,7 @@ def default_benchmark(validation):
 def compare(dataset, output, step, benchmark, asr, speaker_model):
     from faster_whisper import WhisperModel
     from transformers import AutoFeatureExtractor, WavLMForXVector
-    splits, _, data_sha = paired_data(dataset)
+    splits, _, selection = paired_data(dataset)
     if model_identity(MODEL_DIR) != BASE_SHA:
         raise ValueError('Compare with the original training base')
     checkpoints = {mode: output / mode / f'step-{step:04d}' for mode in LR}
@@ -57,7 +57,7 @@ def compare(dataset, output, step, benchmark, asr, speaker_model):
         record = json.loads((path / 'checkpoint.json').read_text())
         recipe = record['recipe']
         if (record['step'], recipe['base_sha256'], recipe['dataset_sha256'], recipe['mode']) != (
-                step, BASE_SHA, data_sha, mode):
+                step, BASE_SHA, selection['selection_sha256'], mode):
             raise ValueError(f'Checkpoint/data mismatch for {mode}')
         recipes[mode] = recipe
     root = Path(tempfile.mkdtemp(prefix=f'comparison-{step:04d}-', dir=output))

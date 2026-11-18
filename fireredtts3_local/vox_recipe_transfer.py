@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
+from fractions import Fraction
 import json
 from pathlib import Path
 import random
 import tempfile
 
 from filelock import FileLock
+import soundfile as sf
 import torch
 
 from . import voxcpm_balance, voxcpm_data
@@ -16,11 +19,13 @@ from .paths import MODEL_DIR
 from .training_batch import batch_flow_loss, set_training
 from .training_data import file_digest, model_identity, plain_text
 from .training_features import BatchFeatures, BatchRequest, FeatureCache, precompute_features
+from .training_job import write_json
 from .training_objective import adapter_targets
 from .training_run import isolated_rng, require_training_hardware, to_examples
 from .workspace_paths import local_path
 
-OUTPUT = 'training/outputs/firered-vox-recipe-12'
+OUTPUT = 'training/outputs/firered-vox-recipe-12-cap30m'
+CAP_SECONDS = 1800
 BASE_SHA = 'd41f62029f89c6837d5f5b16248aceb695ea362136c54c2ea8011f4e41390f25'
 UPSTREAM = '300e4260b509066151d623dc9c0aa922cf82232b'
 SEED = 1234
@@ -32,30 +37,82 @@ def read_rows(path):
     return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
 
 
+def cap_training_speakers(rows):
+    """Keep a longest-first prefix per speaker, measured in decoded WAV samples."""
+    speakers = defaultdict(list)
+    for row in rows:
+        info = sf.info(local_path(row['audio']))
+        duration = Fraction(info.frames, info.samplerate)
+        speakers[row['speaker_id']].append((duration, row))
+
+    selected, stats = [], {}
+    for speaker, clips in sorted(speakers.items()):
+        clips.sort(key=lambda clip: (-clip[0], clip[1]['utt_id']))
+        used = Fraction()
+        retained = []
+        for duration, row in clips:
+            if used + duration > CAP_SECONDS:
+                break
+            retained.append((duration, row))
+            used += duration
+
+        # Source speaker IDs include the corpus namespace. Keep both sides of
+        # every training pair inside the same capped pool.
+        pool = [row for _, row in retained]
+        available = {row['audio'] for row in pool}
+        missing = replaced = 0
+        for duration, row in retained:
+            if row['ref_audio'] in available:
+                selected.append(row)
+                continue
+            ref = voxcpm_data._reference(row, pool)
+            if ref is None:
+                missing += 1
+                used -= duration
+                continue
+            selected.append(dict(row, ref_audio=ref['audio'], ref_text=ref['text'],
+                                 ref_utt_id=ref['utt_id'], ref_duration=ref['duration'],
+                                 ref_sha256=ref['audio_sha256'], ref_pcm_sha256=ref['pcm_sha256']))
+            replaced += 1
+        stats[speaker] = dict(source_clips=len(clips), source_seconds=float(sum(d for d, _ in clips)),
+                              train_clips=len(pool) - missing, train_seconds=float(used),
+                              excluded_by_cap=len(clips) - len(pool), excluded_without_reference=missing,
+                              replaced_references=replaced)
+    return selected, stats
+
+
 def paired_data(dataset):
     report = voxcpm_data.audit(dataset)
     if report['schema'] != voxcpm_data.FAIR_SCHEMA:
         raise ValueError('Expected the confirmed Dialogs + Spontaneous 1000-update preparation')
-    draws = read_rows(dataset / voxcpm_balance.MANIFEST)
-    if len(draws) != TOTAL * MICRO * ACCUM:
-        raise ValueError('Expected exactly 16000 training draws')
+    original = read_rows(dataset / 'train-provenance.jsonl')
+    train, speakers = cap_training_speakers(original)
+    missing_corpora = {r['dataset_id'] for r in original} - {r['dataset_id'] for r in train}
+    if missing_corpora:
+        raise ValueError(f'No same-speaker pairs remain after the duration cap in {sorted(missing_corpora)}')
+    repeats, balance = voxcpm_balance.even_repeats(train, [r['dataset_id'] for r in train],
+                                                  draws=TOTAL * MICRO * ACCUM)
+    validation = read_rows(dataset / 'validation-provenance.jsonl')
+    source_sha = file_digest(dataset / 'report.json')
+    identity = dict(source_sha256=source_sha, policy='longest-prefix-v1', cap_seconds=CAP_SECONDS,
+                    seed=SEED, train=[(r['audio_sha256'], r['ref_sha256'], n)
+                                     for r, n in zip(train, repeats, strict=True)])
+    fingerprint = voxcpm_data._digest_json(identity)
+    selection = dict(source_report_sha256=source_sha, selection_sha256=fingerprint,
+                     cap_seconds=CAP_SECONDS, speakers=speakers, balance=balance,
+                     train_hours=sum(s['train_seconds'] for s in speakers.values()) / 3600,
+                     validation_clips=len(validation))
     splits, unique = {}, {}
-    for split in ('train', 'validation'):
-        rows = read_rows(dataset / f'{split}-provenance.jsonl')
-        by_path = {r['audio']: r for r in rows}
+    for split, rows, counts in [('train', train, repeats), ('validation', validation, [1]*len(validation))]:
         native = {r['audio']: dict(r, audio=str(local_path(r['audio'])), text=plain_text(r['text']),
                                    language='Russian') for r in rows}
         unique.update((r['audio_sha256'], r) for r in native.values())
         pairs = []
-        for target in (draws if split == 'train' else rows):
-            t = by_path[target['audio']]
-            ref = by_path[t['ref_audio']]
-            if target['ref_audio'] != ref['audio'] or t['ref_text'] != ref['text']:
-                raise ValueError('Reference transcript/pair mismatch')
-            pairs.append((native[ref['audio']], native[t['audio']], 0.))
+        for target, n in zip(rows, counts, strict=True):
+            pairs.extend([(native[target['ref_audio']], native[target['audio']], 0.)] * n)
         splits[split] = pairs
     random.Random(SEED).shuffle(splits['train'])
-    return splits, list(unique.values()), file_digest(dataset / 'report.json')
+    return splits, list(unique.values()), selection
 
 
 def configure(core, mode, checkpoint=None):
@@ -127,12 +184,13 @@ def train(dataset, output, mode, until, resume):
         raise ValueError('--until must be between 1 and 1000')
     require_training_hardware()
     print(f'[transfer] Auditing prepared audio and transcripts in {dataset}', flush=True)
-    splits, rows, data_sha = paired_data(dataset)
+    splits, rows, selection = paired_data(dataset)
     print(f'[transfer] Verified {len(rows)} unique audio files; checking the original FireRed weights', flush=True)
     fingerprint = model_identity(MODEL_DIR)
     if fingerprint != BASE_SHA:
         raise ValueError('This comparison requires the original unmerged FireRedTTS3 Base')
-    recipe = dict(version=1, mode=mode, upstream=UPSTREAM, dataset_sha256=data_sha, base_sha256=fingerprint,
+    recipe = dict(version=2, mode=mode, upstream=UPSTREAM, dataset_sha256=selection['selection_sha256'],
+                  speaker_cap_seconds=CAP_SECONDS, base_sha256=fingerprint,
                   seed=SEED, updates=TOTAL, batch_size=MICRO, accumulation=ACCUM, lr=LR[mode],
                   warmup=100, weight_decay=.01, max_grad_norm=1., flow_weight=1., stop_weight=1.)
     out = output / mode
@@ -147,6 +205,7 @@ def train(dataset, output, mode, until, resume):
         start = saved['step']
     elif resume:
         raise ValueError('No completed checkpoint to resume')
+    write_json(output / 'speaker_selection.json', selection)
     if start == until:
         print(f'[transfer] {mode} already completed {until} updates: {prior}', flush=True)
         return
@@ -221,6 +280,7 @@ def train(dataset, output, mode, until, resume):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('selection', help='Audit the data and report the longest-first training selection on CPU')
     p = sub.add_parser('train')
     p.add_argument('mode', choices=LR)
     p.add_argument('--until', type=int, default=TOTAL, help='Stop after this update without changing the LR schedule')
@@ -236,7 +296,13 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     with FileLock(str(args.output / '.run.lock'), timeout=0):
-        if args.command == 'train':
+        if args.command == 'selection':
+            _, _, selection = paired_data(args.dataset)
+            path = args.output / 'speaker_selection.json'
+            write_json(path, selection)
+            print(f"{selection['balance']['unique_targets']} training clips, {selection['train_hours']:.2f} h, "
+                  f"{selection['validation_clips']} validation clips. Report: {path}")
+        elif args.command == 'train':
             train(args.dataset, args.output, args.mode, args.until, args.resume)
         else:
             from .vox_recipe_compare import compare
