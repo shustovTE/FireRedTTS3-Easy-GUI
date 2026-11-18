@@ -77,7 +77,8 @@ def prepare_history(tts, voice, root):
             sf.write(tmp, samples, rate, subtype='FLOAT')
             tmp.replace(path)
         variants[name] = codec.encode(wave.to(tts.device), rate).float()
-    return dict(reference=codec.encode(reference, rate).float(), speaker=tts.spk_extractor(reference, rate),
+    speaker = tts.spk_extractor(reference, rate).to(tts.device)
+    return dict(reference=codec.encode(reference, rate).float(), speaker=speaker,
                 prefixes=variants, prefix_samples=source.shape[1], left=left, rate=rate)
 
 

@@ -71,6 +71,23 @@ class MultistepTests(unittest.TestCase):
                 recovery.recovery_loss(tts, [ex], [{'audio':src}], 3, config=recovery.FOUR_PATCH, patch_counts=counts)
                 self.assertEqual(counts, [1,0,0,0])
 
+    def test_probe_moves_cpu_speaker_embedding_to_synthesis_device(self):
+        # Exercise the device boundary even on workers without CUDA.
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'meta')
+        wave = torch.linspace(-.4, .4, 160)[None]
+        reference = wave.to(device)
+        embedding = torch.ones(1, 6, device='cpu')
+        tts = SimpleNamespace(device=device, tts_core=SimpleNamespace(patch_size=2),
+                              redae=SimpleNamespace(sample_rate=16000, downsample_rate=4,
+                                                    encode=lambda wav, sr: wav[:, ::4, None]),
+                              spk_extractor=lambda wav, sr: embedding)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(probe, 'read_audio', side_effect=[
+                (reference, reference, 0), (wave, wave, 0)]):
+            history = probe.prepare_history(tts, {'reference': {}, 'prefix': {}}, Path(tmp))
+        self.assertEqual(history['speaker'].device, device)
+        self.assertEqual(history['speaker'].device, history['reference'].device)
+        self.assertEqual(history['speaker'].shape, embedding.shape)
+
     def test_probe_prefills_both_histories_and_scores_only_free_suffix(self):
         core = tiny_core().eval()
         with torch.no_grad():
