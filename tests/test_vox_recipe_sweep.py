@@ -107,16 +107,17 @@ class ReplayTest(unittest.TestCase):
             (source/replay.vox_recipe_levels.REPORT).write_text('{}')
             path = source/'report.json'
             path.write_text(json.dumps(dict(asr='asr', speaker_model='speaker')))
-            recipe = dict(replay.transfer_recipe('lora', 'data'), acoustic_recovery=replay.vox_recovery.CONFIG,
-                          recovery_start_step=0)
+            recipe = dict(replay.transfer_recipe('lora', 'data'), recovery_start_step=0)
             updates, samples = [], []
             def train(dataset, run, mode, step, resume, *, fork_from, shared_features, recovery):
-                self.assertEqual((mode, recovery, fork_from, resume), ('lora', True, None, step != 50))
+                self.assertEqual((mode, fork_from, resume), ('lora', None, step != 50))
+                profile = replay.vox_recovery.STRONGER_COMB if 'comb050' in run.name else replay.vox_recovery.CONFIG
+                self.assertEqual(recovery, profile)
                 if resume:
                     self.assertTrue((run/'lora'/'step-0050'/'checkpoint.json').is_file())
                 checkpoint = run/'lora'/f'step-{step:04d}'
                 checkpoint.mkdir(parents=True)
-                (checkpoint/'checkpoint.json').write_text(json.dumps(dict(step=step, recipe=recipe)))
+                (checkpoint/'checkpoint.json').write_text(json.dumps(dict(step=step, recipe=dict(recipe, acoustic_recovery=recovery))))
                 updates.append(step)
 
             def compare(dataset, run, step, benchmark, asr, speaker_model, *, against, lora_only, reuse_base):
@@ -127,7 +128,13 @@ class ReplayTest(unittest.TestCase):
                 folder = Path(tempfile.mkdtemp(dir=run))
                 (folder/'lora').mkdir()
                 (folder/'lora'/'case-000.wav').touch()
-                (folder/'report.json').write_text('{"complete":true}')
+                checkpoint = json.loads((run/'lora'/f'step-{step:04d}'/'checkpoint.json').read_text())
+                case = dict(id='cities', text='Вопрос?', seed=1, asr={'wer':0.},
+                            end_minus_start_rms_db=3. if 'comb050' in run.name else 4.,
+                            voice_similarity=.8, final_voice_similarity=.7, audio='lora/case-000.wav')
+                (folder/'report.json').write_text(json.dumps(dict(complete=True, step=step, benchmark_sha256='cases',
+                    settings={}, asr=asr, speaker_model=speaker_model, recipes={'lora':checkpoint['recipe']},
+                    results={'lora':[case]})))
                 return folder/'report.json'
 
             with patch.object(replay, 'paired_data', return_value=({}, [], {'selection_sha256':'data'})), \
@@ -137,7 +144,24 @@ class ReplayTest(unittest.TestCase):
                     replay.fresh_recovery(source, source, [path])
                 run = replay.fresh_recovery(source, source, [path])
                 replay.fresh_recovery(source, source, [path])
-            self.assertEqual(updates, [50, 100])
-            self.assertEqual(samples, [50, 50, 100])
+                strong = replay.fresh_recovery(source, source, [path], stronger_comb=True)
+                old_path = run/'audio'/'step-0050'/'series-1'/'report.json'
+                original_report = old_path.read_text()
+                changed = json.loads(original_report)
+                changed['results']['lora'][0]['seed'] += 1
+                old_path.write_text(json.dumps(changed))
+                replay.fresh_recovery(source, source, [path], stronger_comb=True)
+                incomplete = json.loads((strong/'audio'/'step-0050'/'series-1'/'paired-recovery.json').read_text())
+                self.assertFalse(incomplete['complete'])
+                self.assertIn('seed mismatch', incomplete['reason'])
+                old_path.write_text(original_report)
+                replay.fresh_recovery(source, source, [path], stronger_comb=True)
+            self.assertNotEqual(strong, run)
+            self.assertEqual(updates, [50, 100, 50, 100])
+            self.assertEqual(samples, [50, 50, 100, 50, 100])
             for n in (50, 100):
                 self.assertTrue((run/'audio'/f'step-{n:04d}'/'series-1'/'lora'/'case-000.wav').is_file())
+                paired = json.loads((strong/'audio'/f'step-{n:04d}'/'series-1'/'paired-recovery.json').read_text())
+                pair = paired['cases'][0]
+                self.assertEqual(pair['delta_vs_standard']['end_minus_start_rms_db'], -1.)
+                self.assertTrue(Path(pair['standard_wav']).is_file() and Path(pair['stronger_wav']).is_file())

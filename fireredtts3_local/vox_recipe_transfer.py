@@ -212,6 +212,8 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
         raise ValueError('--until must be between 1 and 1000')
     if recovery and mode != 'lora':
         raise ValueError('Acoustic recovery requires LoRA')
+    if recovery is True:
+        recovery = vox_recovery.CONFIG
     require_training_hardware()
     print(f'[transfer] Auditing prepared audio and transcripts in {dataset}', flush=True)
     splits, rows, selection = paired_data(dataset)
@@ -220,7 +222,7 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
     if fingerprint != BASE_SHA:
         raise ValueError('This comparison requires the original unmerged FireRedTTS3 Base')
     parent_recipe = transfer_recipe(mode, selection['selection_sha256'])
-    recipe = dict(parent_recipe, acoustic_recovery=vox_recovery.CONFIG) if recovery else parent_recipe
+    recipe = dict(parent_recipe, acoustic_recovery=recovery) if recovery else parent_recipe
     out = output / mode
     out.mkdir(parents=True, exist_ok=True)
     checkpoints = sorted(p for p in out.glob('step-*') if (p / 'checkpoint.json').is_file())
@@ -301,17 +303,18 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
                     # Backward separately so clean and recovery activations do not coexist.
                     examples = to_examples(tts, loaded, 'native')
                     with isolated_rng(seed + 100_000):
-                        extra, count = vox_recovery.recovery_loss(tts, examples, [r[3] for r in loaded], seed + 100_000)
+                        extra, count = vox_recovery.recovery_loss(tts, examples, [r[3] for r in loaded],
+                                                                  seed + 100_000, config=recovery)
                         if not torch.isfinite(extra):
                             raise FloatingPointError(f'Nonfinite recovery loss at update {step}')
                         if count:
-                            (vox_recovery.CONFIG['weight'] * extra / ACCUM).backward()
+                            (recovery['weight'] * extra / ACCUM).backward()
                     recovery_sum += float(extra.detach()) / ACCUM
                     windows += count
             if recovery:
                 print(f'[recovery] step={step} windows={windows} clean_loss={loss_sum:.6f} '
                       f'recovery_flow={recovery_sum:.6f}', flush=True)
-                loss_sum += vox_recovery.CONFIG['weight'] * recovery_sum
+                loss_sum += recovery['weight'] * recovery_sum
             norm = torch.nn.utils.clip_grad_norm_(params, 1., error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()

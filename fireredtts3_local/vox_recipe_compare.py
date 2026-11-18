@@ -65,6 +65,38 @@ def load_saved_base(path):
     return report, baseline
 
 
+def metric_delta(current, before):
+    return {'wer': current['asr']['wer'] - before['asr']['wer'],
+            **{key: current[key] - before[key]
+               for key in ('end_minus_start_rms_db', 'voice_similarity', 'final_voice_similarity')}}
+
+
+def compare_recovery_strength(standard_path, stronger_path):
+    standard, stronger = (json.loads(p.read_text()) for p in (standard_path, stronger_path))
+    original = standard['recipes']['lora']
+    expected = dict(original, acoustic_recovery=vox_recovery.STRONGER_COMB)
+    fields = ('step', 'benchmark_sha256', 'settings', 'asr', 'speaker_model')
+    if (not standard['complete'] or not stronger['complete'] or original.get('recovery_start_step') != 0
+            or original.get('acoustic_recovery') != vox_recovery.CONFIG or stronger['recipes']['lora'] != expected
+            or any(standard[k] != stronger[k] for k in fields)):
+        raise ValueError('Recovery reports differ in training recipe, step, cases or scoring settings')
+    before = {r['id']: r for r in standard['results']['lora']}
+    now = stronger['results']['lora']
+    if (len(before) != len(standard['results']['lora']) or len(before) != len(now)
+            or before.keys() != {r['id'] for r in now}):
+        raise ValueError('Recovery reports have different or duplicate listening cases')
+    pairs = []
+    for row in now:
+        other = before[row['id']]
+        if (row['text'], row['seed']) != (other['text'], other['seed']):
+            raise ValueError(f'Text or seed mismatch for {row["id"]}')
+        pairs.append(dict(id=row['id'], seed=row['seed'], delta_vs_standard=metric_delta(row, other),
+                          standard_wav=str(standard_path.parent / other['audio']),
+                          stronger_wav=str(stronger_path.parent / row['audio'])))
+    return dict(complete=True, step=stronger['step'], standard_report=str(standard_path),
+                stronger_report=str(stronger_path), cases=pairs)
+
+
 def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, *, lora_only=False, reuse_base=False):
     from faster_whisper import WhisperModel
     from transformers import AutoFeatureExtractor, WavLMForXVector
@@ -185,10 +217,7 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, 
                 result['flags'] = content_flags(result, baseline.get(row['id']))
                 if previous:
                     before = baseline[row['id']] if reuse_base else next(r for r in previous['results'][mode] if r['id'] == row['id'])
-                    result[delta_field] = {
-                        'wer': result['asr']['wer'] - before['asr']['wer'],
-                        **{k: result[k] - before[k] for k in ('end_minus_start_rms_db', 'voice_similarity',
-                                                               'final_voice_similarity')}}
+                    result[delta_field] = metric_delta(result, before)
                 if mode == 'base':
                     baseline[row['id']] = result
                 results.append(result)

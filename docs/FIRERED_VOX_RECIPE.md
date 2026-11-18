@@ -226,3 +226,31 @@ ls "$out"/audio/step-{0050,0100}/series-2/lora/
 ```
 
 Каждая завершённая серия сразу доступна для прослушивания. В `series-1` шесть запросов, в `series-2` четыре варианта длинного `cities`; сравнивайте одноимённые WAV внутри одной серии. Рядом с каждой папкой `lora/` лежит `report.json`. Поле `delta_vs_base` даёт разницу с исходной Base для того же запроса, а `compared_to` указывает на исходный отчёт. Повтор команды с теми же отчётами после прерывания использует последний завершённый срез и достраивает его прослушивание перед дальнейшим обучением.
+
+## Эксперимент с более сильной металлической окраской истории
+
+Ключ `--stronger-comb` увеличивает коэффициент задержанной копии сигнала с 0,35 до 0,50 в тех же случайно выбранных окнах. Это углубляет провалы гребенчатого фильтра. По-прежнему примерно половина окон получает эту окраску. Подъём уровня 3–6 дБ, задержка 2–5 мс, восьмипатчевый переход и вес дополнительного loss 0,15 одинаковы в обоих опытах. Искажается только входная история при обучении. Новая LoRA стартует от исходной Base, использует прежний порядок записей и заканчивает на шаге 100. На шагах 50 и 100 она сохраняет адаптер и синтезирует обе серии целых реплик. Метрики Base берутся из имеющихся отчётов.
+
+```bash
+cd /opt/firered-tuning
+git pull --ff-only origin feat/russian-tts-adaptation
+run=training/outputs/firered-vox-recipe-12-cap30m-levels
+mkdir -p training/logs
+nohup .venv/bin/python -u -m fireredtts3_local.vox_recipe_sweep \
+  --recovery-from-base --stronger-comb \
+  "$run/comparison-0030-yrslvj2s/report.json" \
+  "$run/comparison-0030-ql21g14n/report.json" \
+  >> training/logs/firered-recovery-comb050.log 2>&1 < /dev/null &
+tail -n 30 -f training/logs/firered-recovery-comb050.log
+```
+
+Новый каталог — `$run/lora-base-recovery-comb050-0100`. Для первого прослушивания сравните его шаг 50 с шагом 50 из `$run/lora-base-recovery-0100`. После каждой серии файл `paired-recovery.json` содержит пути к парам WAV и разницы метрик «усиленная окраска минус исходная» для одинаковых текста, референса, seed и шага. Если исходный отчёт отсутствует или относится к другому эксперименту, причина записывается в поле `reason`, обучение продолжается.
+
+```bash
+run=training/outputs/firered-vox-recipe-12-cap30m-levels
+out="$run/lora-base-recovery-comb050-0100"
+jq -r '.cases[] | [.id, .standard_wav, .stronger_wav] | @tsv' \
+  "$out/audio/step-0050/series-2/paired-recovery.json"
+```
+
+В `series-2` сравните четыре варианта `cities`. Слушайте, произнесены ли перечисления целиком и сохраняется ли тембр до последнего вопроса. Поля `delta_vs_standard.wer`, `end_minus_start_rms_db` и `final_voice_similarity` в парном отчёте помогают найти случаи для прослушивания.

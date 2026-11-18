@@ -229,6 +229,16 @@ class TransferTests(unittest.TestCase):
                     fresh, direct = tensors('fresh'), tensors('fresh-direct')
                     for key in fresh:
                         torch.testing.assert_close(fresh[key], direct[key], rtol=0, atol=0)
+                    stronger = transfer.vox_recovery.STRONGER_COMB
+                    transfer.train(root, root/'stronger', mode, 1, False, recovery=stronger)
+                    with self.assertRaisesRegex(ValueError, 'same recipe'):
+                        transfer.train(root, root/'stronger', mode, 2, True, recovery=True)
+                    transfer.train(root, root/'stronger', mode, 2, True, recovery=stronger)
+                    transfer.train(root, root/'stronger-direct', mode, 2, False, recovery=stronger)
+                    stronger_split, stronger_direct = tensors('stronger'), tensors('stronger-direct')
+                    self.assertTrue(any(not torch.equal(fresh[k], stronger_split[k]) for k in fresh))
+                    for key in stronger_split:
+                        torch.testing.assert_close(stronger_split[key], stronger_direct[key], rtol=0, atol=0)
 
     def test_compare_uses_same_whole_cases_and_flags_bad_checkpoint(self):
         from fireredtts3_local import vox_recipe_compare as comp

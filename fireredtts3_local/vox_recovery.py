@@ -12,6 +12,7 @@ from .training_rollout import prefix_conditioning
 
 CONFIG = dict(schema='wav-prefix-recovery-v1', weight=.15, gain_db=[3., 6.],
               delay_ms=[2., 5.], comb_mix=.35, ramp_patches=8)
+STRONGER_COMB = dict(CONFIG, comb_mix=.50)
 
 
 def read_prefix(path, samples, padded_length, stride, rate):
@@ -43,7 +44,7 @@ def corrupt_tail(wav, ramp_samples, gain_db, delay, mix):
     return torch.cat((wav[:, :-size], tail), dim=1)
 
 
-def recovery_loss(tts, examples, target_rows, seed):
+def recovery_loss(tts, examples, target_rows, seed, *, config=CONFIG):
     """Predict one clean next patch for each eligible utterance after a corrupted late prefix."""
     rng = random.Random(seed)
     codec, core = tts.redae, tts.tts_core
@@ -58,10 +59,10 @@ def recovery_loss(tts, examples, target_rows, seed):
                 continue
             anchor = rng.randint(max(3, count // 2), count - 1)
             wav = read_prefix(row['audio'], anchor * stride, count * stride, stride, rate)
-            delay = max(1, round(rate * rng.uniform(*CONFIG['delay_ms']) / 1000))
+            delay = max(1, round(rate * rng.uniform(*config['delay_ms']) / 1000))
             # Half the windows isolate loudness drift; the others also have spectral coloration.
-            mix = CONFIG['comb_mix'] if rng.random() < .5 else 0.
-            damaged = corrupt_tail(wav, stride * CONFIG['ramp_patches'], rng.uniform(*CONFIG['gain_db']), delay, mix)
+            mix = config['comb_mix'] if rng.random() < .5 else 0.
+            damaged = corrupt_tail(wav, stride * config['ramp_patches'], rng.uniform(*config['gain_db']), delay, mix)
             history = codec.encode(damaged.to(e.target.device), rate).float()
             if history.shape != e.target[:, :anchor * patch].shape or not torch.isfinite(history).all():
                 raise ValueError(f'Invalid re-encoded recovery history: {row["audio"]}')

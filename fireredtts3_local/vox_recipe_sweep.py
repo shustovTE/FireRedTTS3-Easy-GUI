@@ -9,16 +9,18 @@ from . import vox_recipe_levels, vox_recovery
 from .training_data import file_digest
 from .training_job import write_json
 from .training_monitor import SETTINGS, load_benchmark
-from .vox_recipe_compare import compare, load_saved_base
+from .vox_recipe_compare import compare, compare_recovery_strength, load_saved_base
 from .vox_recipe_transfer import BASE_SHA, OUTPUT, paired_data, train, transfer_recipe
 
 
 STEPS = (100, 200, 300, 400)
 
 
-def fresh_recovery(dataset, source, reports):
+def fresh_recovery(dataset, source, reports, *, stronger_comb=False):
     dataset, source = dataset.resolve(), source.resolve()
-    print('[sweep] Recovery from original Base, updates 1–100. Checking saved Base results and training data.', flush=True)
+    config = vox_recovery.STRONGER_COMB if stronger_comb else vox_recovery.CONFIG
+    print(f"[sweep] Recovery from original Base, updates 1–100, comb_mix={config['comb_mix']:.2f}. "
+          "Checking saved Base results and training data.", flush=True)
     reports = [p.resolve() for p in reports]
     if not reports or len(set(reports)) != len(reports):
         raise ValueError('Supply distinct reports with saved Base results')
@@ -26,13 +28,15 @@ def fresh_recovery(dataset, source, reports):
         load_saved_base(p)
     _, _, selection = paired_data(dataset)
     recipe = dict(transfer_recipe('lora', selection['selection_sha256']),
-                  acoustic_recovery=vox_recovery.CONFIG, recovery_start_step=0)
+                  acoustic_recovery=config, recovery_start_step=0)
     steps = [50, 100]
     plan = dict(initialization='fresh LoRA on original Base', recipe=recipe, steps=steps,
                 level_report_sha256=file_digest(dataset / vox_recipe_levels.REPORT),
                 reports=[{'path': str(p), 'sha256': file_digest(p)} for p in reports])
-    return run_slices(dataset, source, source / 'lora-base-recovery-0100', plan, recipe,
-                      {step: reports for step in steps}, reuse_base=True)
+    standard = source / 'lora-base-recovery-0100'
+    run = source / 'lora-base-recovery-comb050-0100' if stronger_comb else standard
+    return run_slices(dataset, source, run, plan, recipe, {step: reports for step in steps},
+                      reuse_base=True, standard_run=standard if stronger_comb else None)
 
 
 def sweep(dataset, source, reports, *, until=STEPS[-1], control=None):
@@ -85,7 +89,7 @@ def sweep(dataset, source, reports, *, until=STEPS[-1], control=None):
     return run_slices(dataset, source, run, plan, recipe, comparisons, pilot=pilot)
 
 
-def run_slices(dataset, source, run, plan, recipe, comparisons, *, pilot=None, reuse_base=False):
+def run_slices(dataset, source, run, plan, recipe, comparisons, *, pilot=None, reuse_base=False, standard_run=None):
     run.mkdir(parents=True, exist_ok=True)
     with FileLock(str(run / '.run.lock'), timeout=0):
         manifest = run / 'replay.json'
@@ -103,7 +107,7 @@ def run_slices(dataset, source, run, plan, recipe, comparisons, *, pilot=None, r
                 print(f'[sweep] Training LoRA to update {step}', flush=True)
                 train(dataset, run, 'lora', step, resume=index > 0 or pilot is not None,
                       fork_from=pilot if index == 0 else None,
-                      shared_features=source / 'features', recovery='acoustic_recovery' in recipe)
+                      shared_features=source / 'features', recovery=recipe.get('acoustic_recovery', False))
             record = json.loads(checkpoint_info.read_text())
             if record['step'] != step or record['recipe'] != recipe:
                 raise ValueError(f'Unexpected replay checkpoint: {checkpoint}')
@@ -118,6 +122,16 @@ def run_slices(dataset, source, run, plan, recipe, comparisons, *, pilot=None, r
                     path.parent.rename(folder)
                 print(f'[sweep] Listening WAVs: {folder / "lora"}', flush=True)
                 print(f'[sweep] Report: {folder / "report.json"}', flush=True)
+                if standard_run is not None:
+                    standard = standard_run / folder.relative_to(run) / 'report.json'
+                    try:
+                        paired = compare_recovery_strength(standard, folder / 'report.json')
+                    except (OSError, KeyError, TypeError, ValueError) as exc:
+                        # A missing or incompatible old report should only affect the optional A/B comparison.
+                        paired = dict(complete=False, step=step, standard_report=str(standard), reason=str(exc), cases=[])
+                        print(f'[sweep] Could not pair these reports: {standard}: {exc}', flush=True)
+                    write_json(folder / 'paired-recovery.json', paired)
+                    print(f"[sweep] Paired recovery comparison: {folder / 'paired-recovery.json'}", flush=True)
     return run
 
 
@@ -133,11 +147,15 @@ if __name__ == '__main__':
                       help='Also train from the same pilot with damaged acoustic histories and compare to the clean run.')
     mode.add_argument('--recovery-from-base', action='store_true',
                       help='Train recovery LoRA from Base to 100. Save adapters and only adapted audio at 50 and 100.')
+    parser.add_argument('--stronger-comb', action='store_true',
+                        help='With --recovery-from-base, raise only the delayed signal coefficient from 0.35 to 0.50.')
     args = parser.parse_args()
+    if args.stronger_comb and not args.recovery_from_base:
+        parser.error('--stronger-comb requires --recovery-from-base')
     if args.recovery_from_base:
         if args.until not in (None, 100):
             parser.error('--recovery-from-base ends at update 100')
-        print(fresh_recovery(args.dataset, args.source, args.reports))
+        print(fresh_recovery(args.dataset, args.source, args.reports, stronger_comb=args.stronger_comb))
     else:
         until = STEPS[-1] if args.until is None else args.until
         control = sweep(args.dataset, args.source, args.reports, until=until)

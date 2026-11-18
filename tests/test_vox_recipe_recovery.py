@@ -64,3 +64,15 @@ class AcousticRecoveryTests(unittest.TestCase):
                 self.assertEqual(n, 1)
                 self.assertAlmostEqual(float(loss), 1., places=5)
                 self.assertTrue(14 <= lengths[0] < z.shape[1])
+                # The same draws give identical cuts, gain and delay. Only coloured windows differ.
+                self.assertEqual(vox_recovery.STRONGER_COMB, dict(vox_recovery.CONFIG, comb_mix=.50))
+                mixes = set()
+                with patch.object(vox_recovery, 'corrupt_tail', wraps=vox_recovery.corrupt_tail) as corrupt:
+                    for seed in range(8):
+                        for profile in (vox_recovery.CONFIG, vox_recovery.STRONGER_COMB):
+                            vox_recovery.recovery_loss(tts, [example], [{'audio': path}], seed, config=profile)
+                        a, b = [call.args for call in corrupt.call_args_list[-2:]]
+                        torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
+                        self.assertEqual(a[1:-1], b[1:-1])
+                        mixes.add((a[-1], b[-1]))
+                self.assertEqual(mixes, {(0., 0.), (.35, .50)})
