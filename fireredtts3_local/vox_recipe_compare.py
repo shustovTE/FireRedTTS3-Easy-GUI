@@ -40,12 +40,12 @@ def default_benchmark(validation):
     texts = {'question': 'Ничего страшного. Подскажите хотя бы город, чтобы я понимала, работаем ли мы в вашем регионе?'}
     for name in ('cities', 'timofey'):
         texts[name] = (ROOT / 'examples/diagnostics' / f'long-{name}.txt').read_text().strip()
-    return [dict(id=f'{name}_seed{seed}', text=text, reference_audio=reference['audio'],
+    return [dict(id=f'{name}_seed{seed}', text=text, reference_audio=reference.get('unlevelled_audio', reference['audio']),
                  reference_text=reference['text'], speaker_id=reference['speaker_id'], language='Russian', seed=seed)
             for name, text in texts.items() for seed in (1234, 1235)]
 
 
-def compare(dataset, output, step, benchmark, asr, speaker_model):
+def compare(dataset, output, step, benchmark, asr, speaker_model, against=None):
     from faster_whisper import WhisperModel
     from transformers import AutoFeatureExtractor, WavLMForXVector
     splits, _, selection = paired_data(dataset)
@@ -60,6 +60,18 @@ def compare(dataset, output, step, benchmark, asr, speaker_model):
                 step, BASE_SHA, selection['selection_sha256'], mode):
             raise ValueError(f'Checkpoint/data mismatch for {mode}')
         recipes[mode] = recipe
+    previous = None
+    if against is not None:
+        if 'original_selection_sha256' not in selection:
+            raise ValueError('--against requires the levelled dataset')
+        previous = json.loads(against.read_text(encoding='utf-8'))
+        if not previous['complete'] or previous['step'] != step:
+            raise ValueError('Expected a completed comparison at the same step')
+        for mode, recipe in recipes.items():
+            expected = dict(recipe, dataset_sha256=selection['original_selection_sha256'])
+            if previous['recipes'][mode] != expected:
+                raise ValueError(f'Original comparison recipe/selection mismatch for {mode}')
+        benchmark = against.parent / 'benchmark.jsonl'
     root = Path(tempfile.mkdtemp(prefix=f'comparison-{step:04d}-', dir=output))
     if benchmark is None:
         rows = default_benchmark(splits['validation'])
@@ -72,9 +84,14 @@ def compare(dataset, output, step, benchmark, asr, speaker_model):
     case_file.write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows))
     cases, fingerprint = load_benchmark(case_file)
     train_sha = {r['audio_sha256'] for pair in splits['train'] for r in pair[:2]}
+    train_sha.update(r['unlevelled_audio_sha256'] for pair in splits['train'] for r in pair[:2]
+                     if 'unlevelled_audio_sha256' in r)
     train_words = {lexical_key(pair[1]['text']) for pair in splits['train']}
     if any(row['reference_sha256'] in train_sha or lexical_key(row['text']) in train_words for row in cases):
         raise ValueError('Evaluation reference or target text occurs in training')
+    if previous and (previous['benchmark_sha256'], previous['settings'], previous['asr'], previous['speaker_model']) != (
+            fingerprint, SETTINGS, asr, speaker_model):
+        raise ValueError('Reference audio, cases, inference settings or scorers differ from the original comparison')
     (root / 'cases.json').write_text(json.dumps(cases, ensure_ascii=False, indent=2))
     recognizer = WhisperModel(asr, device='cpu', compute_type='int8', cpu_threads=4)
     extractor = AutoFeatureExtractor.from_pretrained(speaker_model)
@@ -88,6 +105,8 @@ def compare(dataset, output, step, benchmark, asr, speaker_model):
     baseline = {}
     report = dict(step=step, complete=False, benchmark_sha256=fingerprint, settings=SETTINGS,
                   recipes=recipes, asr=asr, speaker_model=speaker_model, results={})
+    if previous:
+        report['compared_to'] = str(against.resolve())
     for mode in ('base', *LR):
         folder = root / mode
         folder.mkdir()
@@ -120,6 +139,12 @@ def compare(dataset, output, step, benchmark, asr, speaker_model):
                 if not np.isfinite([result['voice_similarity'], result['final_voice_similarity']]).all():
                     raise FloatingPointError('Nonfinite speaker score')
                 result['flags'] = content_flags(result, baseline.get(row['id']))
+                if previous:
+                    before = next(r for r in previous['results'][mode] if r['id'] == row['id'])
+                    result['delta_vs_unlevelled'] = {
+                        'wer': result['asr']['wer'] - before['asr']['wer'],
+                        **{k: result[k] - before[k] for k in ('end_minus_start_rms_db', 'voice_similarity',
+                                                               'final_voice_similarity')}}
                 if mode == 'base':
                     baseline[row['id']] = result
                 results.append(result)

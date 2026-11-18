@@ -215,8 +215,9 @@ class TransferTests(unittest.TestCase):
                 hyp = text if Path(path).parent.name != 'full' else 'После обеда.'
                 return [SimpleNamespace(text=hyp)], None
             scorer = SimpleNamespace(eval=lambda: lambda **kw: SimpleNamespace(embeddings=torch.ones(1,8)))
+            selection = {'selection_sha256': 'audited'}
             for module, name, value in [
-                (comp,'paired_data',lambda d: ({'train':[]}, [], {'selection_sha256':'audited'})),
+                (comp,'paired_data',lambda d: ({'train':[]}, [], selection)),
                 (comp,'model_identity',lambda d: transfer.BASE_SHA), (comp,'generate_case',generate),
                 (comp,'ModelManager',lambda:manager), (comp,'configure',lambda core, *args:core),
             ]:
@@ -230,6 +231,21 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(len(set(seen)),1)
             self.assertEqual(report['passed_automatic_checks'],dict(base=True,lora=True,full=False))
             self.assertEqual(sf.info(path.parent/'full'/'case-000.wav').subtype,'FLOAT')
+            selection.update(original_selection_sha256='audited', selection_sha256='levelled')
+            for mode in ('lora', 'full'):
+                checkpoint = root/mode/'step-0030'/'checkpoint.json'
+                updated = json.loads(checkpoint.read_text())
+                updated['recipe']['dataset_sha256'] = 'levelled'
+                checkpoint.write_text(json.dumps(updated))
+            second = comp.compare(root, root, 30, None, 'stub', 'stub', against=path)
+            result = json.loads(second.read_text())
+            self.assertEqual(result['benchmark_sha256'], report['benchmark_sha256'])
+            self.assertEqual(result['compared_to'], str(path))
+            self.assertEqual(set(result['results']['full'][0]['delta_vs_unlevelled'].values()), {0.})
+            changed_ref = samples * .5
+            sf.write(audio, changed_ref, 24000, subtype='FLOAT')
+            with self.assertRaisesRegex(ValueError, 'differ from the original comparison'):
+                comp.compare(root, root, 30, None, 'stub', 'stub', against=path)
 
     def test_fluent_omission_and_voice_drift_block_candidate(self):
         base = dict(finish_reason='stop', fraction_at_or_above_full_scale=0., end_minus_start_rms_db=0.,

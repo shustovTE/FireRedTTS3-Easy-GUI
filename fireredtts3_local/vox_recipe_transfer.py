@@ -13,7 +13,7 @@ from filelock import FileLock
 import soundfile as sf
 import torch
 
-from . import voxcpm_balance, voxcpm_data
+from . import vox_recipe_levels, voxcpm_balance, voxcpm_data
 from .model_manager import ModelManager
 from .paths import MODEL_DIR
 from .training_batch import batch_flow_loss, set_training
@@ -82,18 +82,21 @@ def cap_training_speakers(rows):
 
 
 def paired_data(dataset):
-    report = voxcpm_data.audit(dataset)
+    source, levels = dataset, None
+    if (dataset / vox_recipe_levels.REPORT).is_file():
+        source, levels = vox_recipe_levels.read_report(dataset)
+    report = voxcpm_data.audit(source)
     if report['schema'] != voxcpm_data.FAIR_SCHEMA:
         raise ValueError('Expected the confirmed Dialogs + Spontaneous 1000-update preparation')
-    original = read_rows(dataset / 'train-provenance.jsonl')
+    original = read_rows(source / 'train-provenance.jsonl')
     train, speakers = cap_training_speakers(original)
     missing_corpora = {r['dataset_id'] for r in original} - {r['dataset_id'] for r in train}
     if missing_corpora:
         raise ValueError(f'No same-speaker pairs remain after the duration cap in {sorted(missing_corpora)}')
     repeats, balance = voxcpm_balance.even_repeats(train, [r['dataset_id'] for r in train],
                                                   draws=TOTAL * MICRO * ACCUM)
-    validation = read_rows(dataset / 'validation-provenance.jsonl')
-    source_sha = file_digest(dataset / 'report.json')
+    validation = read_rows(source / 'validation-provenance.jsonl')
+    source_sha = file_digest(source / 'report.json')
     identity = dict(source_sha256=source_sha, policy='longest-prefix-v1', cap_seconds=CAP_SECONDS,
                     seed=SEED, train=[(r['audio_sha256'], r['ref_sha256'], n)
                                      for r, n in zip(train, repeats, strict=True)])
@@ -102,10 +105,27 @@ def paired_data(dataset):
                      cap_seconds=CAP_SECONDS, speakers=speakers, balance=balance,
                      train_hours=sum(s['train_seconds'] for s in speakers.values()) / 3600,
                      validation_clips=len(validation))
+    if levels is not None:
+        vox_recipe_levels.verify_files(dataset, levels, {r['audio_sha256'] for r in original + validation})
+        selection['original_selection_sha256'] = fingerprint
+        selection['level_report_sha256'] = file_digest(dataset / vox_recipe_levels.REPORT)
+        selection['selection_sha256'] = voxcpm_data._digest_json([fingerprint, selection['level_report_sha256']])
+        selection['level_summary'] = {split: vox_recipe_levels.summarize(levels['files'], rows) for split, rows
+                                      in [('train', train), ('validation', validation)]}
     splits, unique = {}, {}
     for split, rows, counts in [('train', train, repeats), ('validation', validation, [1]*len(validation))]:
         native = {r['audio']: dict(r, audio=str(local_path(r['audio'])), text=plain_text(r['text']),
                                    language='Russian') for r in rows}
+        if levels is not None:
+            for row in native.values():
+                for field, sha_field, pcm_field in [('audio', 'audio_sha256', 'pcm_sha256'),
+                                                   ('ref_audio', 'ref_sha256', 'ref_pcm_sha256')]:
+                    sha = row[sha_field]
+                    record = levels['files'][sha]
+                    row['unlevelled_' + field] = str(local_path(row[field]))
+                    row['unlevelled_' + sha_field] = sha
+                    row[field] = str((dataset / 'audio' / f'{sha}.wav').resolve())
+                    row[sha_field], row[pcm_field] = record['audio_sha256'], record['pcm_sha256']
         unique.update((r['audio_sha256'], r) for r in native.values())
         pairs = []
         for target, n in zip(rows, counts, strict=True):
@@ -287,7 +307,9 @@ def main():
     p.add_argument('--resume', action='store_true', help='Continue from the last complete checkpoint for this mode')
     p = sub.add_parser('compare')
     p.add_argument('--step', type=int, default=TOTAL)
-    p.add_argument('--benchmark', type=Path, help='Optional JSONL with reference audio, text and seeds')
+    bench = p.add_mutually_exclusive_group()
+    bench.add_argument('--benchmark', type=Path, help='Optional JSONL with reference audio, text and seeds')
+    bench.add_argument('--against', type=Path, help='For levelled data, replay cases and measure deltas against the original report')
     p.add_argument('--asr', default='large-v3')
     p.add_argument('--speaker-model', default='microsoft/wavlm-base-plus-sv')
     for p in sub.choices.values():
@@ -306,7 +328,7 @@ def main():
             train(args.dataset, args.output, args.mode, args.until, args.resume)
         else:
             from .vox_recipe_compare import compare
-            print(compare(args.dataset, args.output, args.step, args.benchmark, args.asr, args.speaker_model))
+            print(compare(args.dataset, args.output, args.step, args.benchmark, args.asr, args.speaker_model, args.against))
 
 
 if __name__ == '__main__':
