@@ -42,7 +42,7 @@ def set_training(core, training=True):
         core.patch_encoder.eval()
 
 
-def sample_flow(example, patch_size, patches_per_example, cfg_dropout, generator=None):
+def sample_flow(example, patch_size, patches_per_example, cfg_dropout, generator=None, *, vox_time=False):
     count = example.target.shape[1] // patch_size
     if not count or example.target.shape[1] % patch_size or example.prompt.shape[1] % patch_size or example.prompt.shape[1] < patch_size:
         raise ValueError("Prompt/target must contain complete nonempty patches")
@@ -50,10 +50,13 @@ def sample_flow(example, patch_size, patches_per_example, cfg_dropout, generator
     selected = count if patches_per_example == "all" else min(count, patches_per_example)
     indices = torch.randperm(count, device=device, generator=generator)[:selected]
     shape = (len(indices), patch_size, example.target.shape[-1])
-    return FlowSample(indices,
-                      torch.randn(shape, dtype=example.target.dtype, device=device, generator=generator),
-                      torch.rand(len(indices), dtype=example.target.dtype, device=device, generator=generator),
-                      torch.rand(len(indices), device=device, generator=generator) < cfg_dropout)
+    noise = torch.randn(shape, dtype=example.target.dtype, device=device, generator=generator)
+    if vox_time:
+        # Vox t runs data -> noise; FireRed's velocity and ODE run noise -> data.
+        times = 1 - (torch.randn(len(indices), device=device, generator=generator) - .4).sigmoid()
+    else:
+        times = torch.rand(len(indices), dtype=example.target.dtype, device=device, generator=generator)
+    return FlowSample(indices, noise, times, torch.rand(len(indices), device=device, generator=generator) < cfg_dropout)
 
 
 def patch_embeddings(core, examples):
@@ -214,13 +217,13 @@ def stop_diagnostics(logits, targets, owners, count):
 def batch_flow_loss(tts, examples, patches_per_example=8, cfg_dropout=.1,
                     stop_weight=.05, samples=None, generator=None, dit_chunk_size=0,
                     include_stop_diagnostics=False, precision_policy="legacy_bf16",
-                    stop_loss_mode="mean", stop_gradient_to_backbone=True):
+                    stop_loss_mode="mean", stop_gradient_to_backbone=True, vox_recipe=False):
     if not examples:
         raise ValueError("Empty training batch")
     core = tts.tts_core
     device = examples[0].target.device
     if samples is None:
-        samples = [sample_flow(e, core.patch_size, patches_per_example, cfg_dropout, generator) for e in examples]
+        samples = [sample_flow(e, core.patch_size, patches_per_example, cfg_dropout, generator, vox_time=vox_recipe) for e in examples]
     if len(samples) != len(examples):
         raise ValueError("One FlowSample is required per example")
     frozen_patches = not any(p.requires_grad for p in core.patch_encoder.parameters())
@@ -254,6 +257,17 @@ def batch_flow_loss(tts, examples, patches_per_example=8, cfg_dropout=.1,
             core, examples, samples, embeddings, precision_policy, stop_gradient_to_backbone)
         pred = predict(core, cond, spk, tensors, dit_chunk_size)
     count = len(examples)
+    if vox_recipe:
+        if retained or stop_loss_mode != "mean" or patches_per_example != "all":
+            raise ValueError("Vox recipe requires all patches, ordinary STOP and no preservation")
+        # Upstream reduces over all valid positions in each microbatch.
+        flow = F.mse_loss(pred, (tensors[0]-tensors[2]).float())
+        end = F.binary_cross_entropy_with_logits(stop, targets)
+        total = flow + stop_weight * end
+        metrics = {"flow": flow.detach(), "stop": end.detach(), "loss": total.detach()}
+        if include_stop_diagnostics:
+            metrics.update(stop_diagnostics(stop, targets, stop_owner, count))
+        return total, metrics
     flow = example_mean((pred-(tensors[0]-tensors[2]).float()).square().mean((1, 2)), patch_owner, count)
     stop_loss = reduce_stop_loss(stop, targets, stop_owner, count, stop_loss_mode)
     preservation = flow.new_zeros(count)

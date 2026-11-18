@@ -198,7 +198,7 @@ def isolated_rng(seed):
         random.setstate(state)
 
 
-def to_examples(tts, loaded, precision_policy="legacy_bf16"):
+def to_examples(tts, loaded, precision_policy="legacy_bf16", *, use_cached_patches=True):
     texts = [f"<|{target['language']}|><|sot|>{prompt['text']}{target['text']}<|eot|>"
              for _, _, prompt, target, _ in loaded]
     if hasattr(tts, "text_tokenizer"):
@@ -223,7 +223,8 @@ def to_examples(tts, loaded, precision_policy="legacy_bf16"):
             transferred[id(tensor)] = tensor.to(tts.device, dtype=dtype, non_blocking=True)
         return transferred[id(tensor)]
     return [Example(token, move(pa, 'latents'), move(ta, 'latents'), move(pa, 'speaker'), keep,
-                    move(pa, 'patch_embeddings'), move(ta, 'patch_embeddings'))
+                    move(pa, 'patch_embeddings') if use_cached_patches else None,
+                    move(ta, 'patch_embeddings') if use_cached_patches else None)
             for token, (pa, ta, _, _, keep) in zip(tokens, loaded)]
 
 

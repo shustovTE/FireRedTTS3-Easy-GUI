@@ -1,0 +1,247 @@
+"""Compare the pinned VoxCPM2 LoRA/full SFT presets on native FireRedTTS3 Base."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import random
+import tempfile
+
+from filelock import FileLock
+import torch
+
+from . import voxcpm_balance, voxcpm_data
+from .model_manager import ModelManager
+from .paths import MODEL_DIR
+from .training_batch import batch_flow_loss, set_training
+from .training_data import file_digest, model_identity, plain_text
+from .training_features import BatchFeatures, BatchRequest, FeatureCache, precompute_features
+from .training_objective import adapter_targets
+from .training_run import isolated_rng, require_training_hardware, to_examples
+from .workspace_paths import local_path
+
+OUTPUT = 'training/outputs/firered-vox-recipe-12'
+BASE_SHA = 'd41f62029f89c6837d5f5b16248aceb695ea362136c54c2ea8011f4e41390f25'
+UPSTREAM = '300e4260b509066151d623dc9c0aa922cf82232b'
+SEED = 1234
+TOTAL, MICRO, ACCUM = 1000, 2, 8
+LR = {'lora': 1e-4, 'full': 1e-5}
+
+
+def read_rows(path):
+    return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+
+
+def paired_data(dataset):
+    report = voxcpm_data.audit(dataset)
+    if report['schema'] != voxcpm_data.FAIR_SCHEMA:
+        raise ValueError('Expected the confirmed Dialogs + Spontaneous 1000-update preparation')
+    draws = read_rows(dataset / voxcpm_balance.MANIFEST)
+    if len(draws) != TOTAL * MICRO * ACCUM:
+        raise ValueError('Expected exactly 16000 training draws')
+    splits, unique = {}, {}
+    for split in ('train', 'validation'):
+        rows = read_rows(dataset / f'{split}-provenance.jsonl')
+        by_path = {r['audio']: r for r in rows}
+        native = {r['audio']: dict(r, audio=str(local_path(r['audio'])), text=plain_text(r['text']),
+                                   language='Russian') for r in rows}
+        unique.update((r['audio_sha256'], r) for r in native.values())
+        pairs = []
+        for target in (draws if split == 'train' else rows):
+            t = by_path[target['audio']]
+            ref = by_path[t['ref_audio']]
+            if target['ref_audio'] != ref['audio'] or t['ref_text'] != ref['text']:
+                raise ValueError('Reference transcript/pair mismatch')
+            pairs.append((native[ref['audio']], native[t['audio']], 0.))
+        splits[split] = pairs
+    random.Random(SEED).shuffle(splits['train'])
+    return splits, list(unique.values()), file_digest(dataset / 'report.json')
+
+
+def configure(core, mode, checkpoint=None):
+    if mode == 'full':
+        if checkpoint:
+            from safetensors.torch import load_model
+            load_model(core, checkpoint / 'fireredtts3_base' / 'model.safetensors', strict=True)
+        return core.float().requires_grad_(True)
+    from peft import LoraConfig
+    from .hybrid import create_adapter, load_adapter
+    if checkpoint:
+        return load_adapter(core, checkpoint, is_trainable=True)
+    return create_adapter(core, LoraConfig(r=32, lora_alpha=32, lora_dropout=0.,
+                                          target_modules=adapter_targets(core, 'vox_attention'), bias='none'))
+
+
+def batches(pairs):
+    for i in range(0, len(pairs), MICRO):
+        yield BatchRequest(pairs[i:i+MICRO])
+
+
+def objective(tts, loaded, mode, seed, train):
+    examples = to_examples(tts, loaded, 'native', use_cached_patches=mode == 'lora')
+    generator = torch.Generator(device=tts.device).manual_seed(seed)
+    return batch_flow_loss(tts, examples, patches_per_example='all', cfg_dropout=.1 if train else 0.,
+                           stop_weight=1., generator=generator, dit_chunk_size=64,
+                           precision_policy='native', vox_recipe=True)
+
+
+@torch.no_grad()
+def validate(tts, loader, pairs, mode):
+    set_training(tts.tts_core, False)
+    totals = {}
+    with isolated_rng(SEED):
+        for i, (_, loaded) in enumerate(loader.iterate(batches(pairs))):
+            _, metrics = objective(tts, loaded, mode, SEED + i, False)
+            for k, value in metrics.items():
+                totals[k] = totals.get(k, 0.) + float(value) * len(loaded)
+    if not torch.isfinite(torch.tensor(list(totals.values()))).all():
+        raise FloatingPointError('Nonfinite validation loss')
+    return {k: v / len(pairs) for k, v in totals.items()}
+
+
+def save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics):
+    path = out / f'step-{step:04d}'
+    with tempfile.TemporaryDirectory(dir=out, prefix='.saving-') as tmp:
+        folder = Path(tmp) / 'checkpoint'
+        folder.mkdir()
+        full = recipe['mode'] == 'full'
+        if full:
+            core.save_pretrained(folder / 'fireredtts3_base', max_shard_size='100GB')
+        else:
+            core.save_pretrained(folder)
+            (folder / 'firered_lora_metadata.json').write_text(json.dumps(dict(
+                base_fingerprint=recipe['base_sha256'], step=step,
+                recipe={**recipe, 'options': {'profile': 'vox_attention'}})))
+        torch.save({'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
+                    'cpu_rng': torch.get_rng_state(), 'cuda_rng': torch.cuda.get_rng_state_all()},
+                   folder / 'training_state.pt')
+        (folder / 'checkpoint.json').write_text(json.dumps(dict(recipe=recipe, step=step, validation=metrics),
+                                                          indent=2, allow_nan=False))
+        folder.rename(path)
+    return path
+
+
+def train(dataset, output, mode, until, resume):
+    from transformers import get_cosine_schedule_with_warmup
+    if not 1 <= until <= TOTAL:
+        raise ValueError('--until must be between 1 and 1000')
+    require_training_hardware()
+    print(f'[transfer] Auditing prepared audio and transcripts in {dataset}', flush=True)
+    splits, rows, data_sha = paired_data(dataset)
+    print(f'[transfer] Verified {len(rows)} unique audio files; checking the original FireRed weights', flush=True)
+    fingerprint = model_identity(MODEL_DIR)
+    if fingerprint != BASE_SHA:
+        raise ValueError('This comparison requires the original unmerged FireRedTTS3 Base')
+    recipe = dict(version=1, mode=mode, upstream=UPSTREAM, dataset_sha256=data_sha, base_sha256=fingerprint,
+                  seed=SEED, updates=TOTAL, batch_size=MICRO, accumulation=ACCUM, lr=LR[mode],
+                  warmup=100, weight_decay=.01, max_grad_norm=1., flow_weight=1., stop_weight=1.)
+    out = output / mode
+    out.mkdir(parents=True, exist_ok=True)
+    checkpoints = sorted(p for p in out.glob('step-*') if (p / 'checkpoint.json').is_file())
+    prior = checkpoints[-1] if checkpoints else None
+    start = 0
+    if prior:
+        saved = json.loads((prior / 'checkpoint.json').read_text())
+        if not resume or saved['recipe'] != recipe:
+            raise ValueError(f'Existing checkpoint {prior}: use --resume with the same recipe and data')
+        start = saved['step']
+    elif resume:
+        raise ValueError('No completed checkpoint to resume')
+    if start == until:
+        print(f'[transfer] {mode} already completed {until} updates: {prior}', flush=True)
+        return
+    if start > until:
+        raise ValueError(f'Already completed {start} updates')
+    torch.manual_seed(SEED)
+    manager = ModelManager()
+    loader = None
+    try:
+        tts = manager.load_base(attention_backend='sdpa', torch_compile=False)
+        tts.redae.eval().requires_grad_(False)
+        tts.spk_extractor.eval().requires_grad_(False)
+        cache_dir = output / 'features'
+        cache = FeatureCache(tts, cache_dir, fingerprint, True, 'native')
+        if any(not cache.path(row).is_file() for row in rows):
+            precompute_features(tts, rows, cache_dir, fingerprint, precision_policy='native')
+        tts.redae.to('cpu')
+        tts.spk_extractor.to('cpu')
+        torch.cuda.empty_cache()
+        loader = BatchFeatures(cache)
+        core = tts.tts_core = configure(tts.tts_core, mode, prior)
+        core.backbone_llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+        params = [p for p in core.parameters() if p.requires_grad]
+        if torch.device(tts.device).type == "cuda":
+            torch.cuda.reset_peak_memory_stats(tts.device)
+        optimizer = torch.optim.AdamW(params, lr=LR[mode], weight_decay=.01)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, 100, TOTAL)
+        if prior:
+            state = torch.load(prior / 'training_state.pt', map_location='cpu', weights_only=True)
+            optimizer.load_state_dict(state['optimizer'])
+            scheduler.load_state_dict(state['scheduler'])
+            torch.set_rng_state(state['cpu_rng'])
+            torch.cuda.set_rng_state_all(state['cuda_rng'])
+            del state
+        print(f'[transfer] {mode}, trainable={sum(p.numel() for p in params):,}, updates {start+1}..{until}',
+              flush=True)
+        stream = loader.iterate(batches(splits['train'][start*MICRO*ACCUM:until*MICRO*ACCUM]))
+        if not prior:
+            metrics = validate(tts, loader, splits['validation'], mode)
+            print(f'[validation] base step=0 {metrics}', flush=True)
+        set_training(core)
+        for step in range(start+1, until+1):
+            optimizer.zero_grad(set_to_none=True)
+            loss_sum = 0.
+            for micro in range(ACCUM):
+                _, loaded = next(stream)
+                loss, _ = objective(tts, loaded, mode, SEED + (step-1)*ACCUM + micro, True)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f'Nonfinite {mode} loss at update {step}, microbatch {micro+1}')
+                (loss / ACCUM).backward()
+                loss_sum += float(loss.detach()) / ACCUM
+            norm = torch.nn.utils.clip_grad_norm_(params, 1., error_if_nonfinite=True)
+            optimizer.step()
+            scheduler.step()
+            if step % 10 == 0 or step == until:
+                print(f'[transfer] {mode} {step}/{TOTAL} loss={loss_sum:.6f} grad_norm={norm:.4f}', flush=True)
+            if step % 500 == 0 or step == until:
+                metrics = validate(tts, loader, splits['validation'], mode)
+                if torch.device(tts.device).type == 'cuda':
+                    print(f'[transfer] Peak allocated GPU memory: {torch.cuda.max_memory_allocated(tts.device)/2**30:.2f} GiB',
+                          flush=True)
+                print(f'[transfer] Saving {mode} at step {step}', flush=True)
+                path = save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics)
+                print(f'[validation] {metrics}; checkpoint={path}', flush=True)
+                set_training(core)
+    finally:
+        if loader:
+            loader.close()
+        manager.unload()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('train')
+    p.add_argument('mode', choices=LR)
+    p.add_argument('--until', type=int, default=TOTAL, help='Stop after this update without changing the LR schedule')
+    p.add_argument('--resume', action='store_true', help='Continue from the last complete checkpoint for this mode')
+    p = sub.add_parser('compare')
+    p.add_argument('--step', type=int, default=TOTAL)
+    p.add_argument('--benchmark', type=Path, help='Optional JSONL with reference audio, text and seeds')
+    p.add_argument('--asr', default='large-v3')
+    p.add_argument('--speaker-model', default='microsoft/wavlm-base-plus-sv')
+    for p in sub.choices.values():
+        p.add_argument('--dataset', type=Path, default=Path(voxcpm_data.FAIR_OUTPUT))
+        p.add_argument('--output', type=Path, default=Path(OUTPUT))
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(args.output / '.run.lock'), timeout=0):
+        if args.command == 'train':
+            train(args.dataset, args.output, args.mode, args.until, args.resume)
+        else:
+            from .vox_recipe_compare import compare
+            print(compare(args.dataset, args.output, args.step, args.benchmark, args.asr, args.speaker_model))
+
+
+if __name__ == '__main__':
+    main()

@@ -361,6 +361,8 @@ Prepared datasets and project metadata are kept separate from the original sourc
 
 ## 🧬 LoRA Training
 
+[FireRedTTS3 Base comparison using the VoxCPM2 LoRA and full SFT recipes](docs/FIRERED_VOX_RECIPE.md) includes launch commands and whole-utterance checks on Russian dialogues.
+
 For the separate official **VoxCPM2 LoRA** workflow using the existing Dialogs,
 confirmed Spontaneous and validated Common Voice Scripted 27 Russian corpora,
 see **[the complete setup and launch guide](docs/VOXCPM2_RUSSIAN_LORA.md)**.
