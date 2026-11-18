@@ -5,7 +5,7 @@ from pathlib import Path
 
 from filelock import FileLock
 
-from . import vox_recipe_levels
+from . import vox_recipe_levels, vox_recovery
 from .training_data import file_digest
 from .training_job import write_json
 from .training_monitor import SETTINGS, load_benchmark
@@ -16,7 +16,7 @@ from .vox_recipe_transfer import BASE_SHA, OUTPUT, train
 STEPS = (100, 200, 300, 400)
 
 
-def sweep(dataset, source, reports, *, until=STEPS[-1]):
+def sweep(dataset, source, reports, *, until=STEPS[-1], control=None):
     if not 30 < until <= STEPS[-1]:
         raise ValueError(f'--until must be an absolute update between 31 and {STEPS[-1]}')
     steps = [step for step in STEPS if step < until] + [until]
@@ -43,6 +43,23 @@ def sweep(dataset, source, reports, *, until=STEPS[-1]):
                 level_report_sha256=file_digest(dataset / vox_recipe_levels.REPORT),
                 steps=steps, reports=[{'path': str(p), 'sha256': file_digest(p)} for p in reports])
     run = source / f'lora-0030-to-{until:04d}'
+    if control is not None:
+        if control != run:
+            raise ValueError(f'Expected the matched control in {run}')
+        recipe = dict(recipe, acoustic_recovery=vox_recovery.CONFIG)
+        run = run.with_name(run.name + '-recovery')
+        plan['acoustic_recovery'] = vox_recovery.CONFIG
+        plan['controls'] = {}
+        for step in steps:
+            for i, p in enumerate(reports, 1):
+                report = control / 'audio' / f'step-{step:04d}' / f'series-{i}' / 'report.json'
+                baseline = json.loads(report.read_text())
+                pilot_report = json.loads(p.read_text())
+                if (not baseline['complete'] or baseline['step'] != step or baseline['compared_to'] != str(p)
+                        or baseline['benchmark_sha256'] != pilot_report['benchmark_sha256']
+                        or baseline['recipes']['lora'] != saved['recipe']):
+                    raise ValueError(f'Mismatched clean control: {report}')
+                plan['controls'][str(report)] = file_digest(report)
     run.mkdir(exist_ok=True)
     with FileLock(str(run / '.run.lock'), timeout=0):
         manifest = run / 'replay.json'
@@ -59,7 +76,7 @@ def sweep(dataset, source, reports, *, until=STEPS[-1]):
             if not checkpoint_info.is_file():
                 print(f'[sweep] Training LoRA to update {step}', flush=True)
                 train(dataset, run, 'lora', step, True, fork_from=pilot if step == steps[0] else None,
-                      shared_features=source / 'features')
+                      shared_features=source / 'features', recovery=control is not None)
             record = json.loads(checkpoint_info.read_text())
             if record['step'] != step or record['recipe'] != recipe:
                 raise ValueError(f'Unexpected replay checkpoint: {checkpoint}')
@@ -68,8 +85,9 @@ def sweep(dataset, source, reports, *, until=STEPS[-1]):
                 folder = run / 'audio' / checkpoint.name / f'series-{i}'
                 if not folder.exists():
                     old = json.loads(p.read_text())
+                    against = control / folder.relative_to(run) / 'report.json' if control is not None else p
                     path = compare(dataset, run, step, None, old['asr'], old['speaker_model'],
-                                   against=p, lora_only=True)
+                                   against=against, lora_only=True)
                     folder.parent.mkdir(parents=True, exist_ok=True)
                     path.parent.rename(folder)
                 print(f'[sweep] Listening WAVs: {folder / "lora"}', flush=True)
@@ -84,5 +102,10 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=Path, default=Path(vox_recipe_levels.OUTPUT))
     parser.add_argument('--until', type=int, default=STEPS[-1],
                         help='Absolute last update (31–400). Save and evaluate there and at earlier hundreds.')
+    parser.add_argument('--recovery', action='store_true',
+                        help='Also train from the same pilot with damaged acoustic histories and compare to the clean run.')
     args = parser.parse_args()
-    print(sweep(args.dataset, args.source, args.reports, until=args.until))
+    control = sweep(args.dataset, args.source, args.reports, until=args.until)
+    print(control, flush=True)
+    if args.recovery:
+        print(sweep(args.dataset, args.source, args.reports, until=args.until, control=control))

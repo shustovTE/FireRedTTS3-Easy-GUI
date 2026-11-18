@@ -17,6 +17,7 @@ from .sentence_diagnostics import ASR_SETTINGS, transcript_errors
 from .training_data import model_identity
 from .training_monitor import SETTINGS, failures, generate_case, load_benchmark
 from .vox_recipe_transfer import BASE_SHA, LR, configure, paired_data, read_rows
+from . import vox_recovery
 from .workspace_paths import local_path
 
 
@@ -66,7 +67,13 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, 
         previous = json.loads(against.read_text(encoding='utf-8'))
         if not previous['complete'] or not 0 < previous['step'] <= step:
             raise ValueError('Expected a completed comparison at the same or an earlier step')
-        if previous['step'] == step:
+        matched_recovery = (lora_only and previous['step'] == step
+                            and recipes['lora'].get('acoustic_recovery') == vox_recovery.CONFIG
+                            and 'acoustic_recovery' not in previous['recipes'].get('lora', {}))
+        if matched_recovery:
+            reference_dataset = selection['selection_sha256']
+            delta_field = 'delta_vs_clean_control'
+        elif previous['step'] == step:
             if 'original_selection_sha256' not in selection:
                 raise ValueError('Same-step --against requires the levelled dataset')
             reference_dataset = selection['original_selection_sha256']
@@ -76,6 +83,8 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, 
             delta_field = 'delta_vs_previous_step'
         for mode, recipe in recipes.items():
             expected = dict(recipe, dataset_sha256=reference_dataset)
+            if matched_recovery:
+                del expected['acoustic_recovery']
             if previous['recipes'].get(mode) != expected:
                 raise ValueError(f'Original comparison recipe/selection mismatch for {mode}')
         benchmark = against.parent / 'benchmark.jsonl'

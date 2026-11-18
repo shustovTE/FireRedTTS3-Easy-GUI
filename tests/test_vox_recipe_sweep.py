@@ -43,12 +43,13 @@ class ReplayTest(unittest.TestCase):
                 reports.append(path)
 
             updates, generations = [], []
-            def train(dataset, output, mode, step, resume, *, fork_from, shared_features):
+            def train(dataset, output, mode, step, resume, *, fork_from, shared_features, recovery):
                 self.assertEqual((dataset, mode, resume, shared_features), (data, 'lora', True, source/'features'))
                 self.assertEqual(fork_from, pilot if step in (50, 100) else None)
                 saved = output/'lora'/f'step-{step:04d}'
                 saved.mkdir(parents=True)
-                (saved/'checkpoint.json').write_text(json.dumps(dict(step=step, recipe=recipe)))
+                actual = dict(recipe, acoustic_recovery=replay.vox_recovery.CONFIG) if recovery else recipe
+                (saved/'checkpoint.json').write_text(json.dumps(dict(step=step, recipe=actual)))
                 updates.append(step)
 
             interrupted = False
@@ -63,7 +64,9 @@ class ReplayTest(unittest.TestCase):
                 folder = Path(tempfile.mkdtemp(dir=output))
                 (folder/'lora').mkdir()
                 sf.write(folder/'lora'/'case-000.wav', np.zeros(16000), 16000)
-                (folder/'report.json').write_text('{"complete":true}')
+                previous = json.loads(against.read_text())
+                (folder/'report.json').write_text(json.dumps(dict(complete=True, step=step, compared_to=str(against),
+                    benchmark_sha256=previous['benchmark_sha256'], recipes=previous['recipes'])))
                 return folder/'report.json'
 
             with patch.object(replay, 'train', train), patch.object(replay, 'compare', compare):
@@ -86,6 +89,12 @@ class ReplayTest(unittest.TestCase):
                 self.assertEqual(updates, [50])
                 self.assertEqual(generations, [(50, p) for p in reports])
                 self.assertTrue((short_run/'audio'/'step-0050'/'series-2'/'lora'/'case-000.wav').is_file())
+                recovered = replay.sweep(data, source, reports, until=50, control=short_run)
+                replay.sweep(data, source, reports, until=50, control=short_run)
+                self.assertEqual(recovered.name, 'lora-0030-to-0050-recovery')
+                self.assertEqual(updates, [50, 50])
+                self.assertEqual(generations[2:], [(50, short_run/'audio'/'step-0050'/f'series-{i}'/'report.json')
+                                                    for i in (1, 2)])
                 self.assertTrue((run/'lora'/'step-0100'/'checkpoint.json').is_file())
                 (pilot/'adapter_model.safetensors').write_bytes(b'different pilot')
                 with self.assertRaisesRegex(ValueError, 'Replay inputs differ'):

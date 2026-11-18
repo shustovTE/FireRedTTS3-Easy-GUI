@@ -155,10 +155,17 @@ class TransferTests(unittest.TestCase):
     def test_pilot_resume_reproduces_uninterrupted_training(self):
         rows = [dict(utt_id=str(i), audio_sha256=str(i), language="Russian", text=str(i)) for i in range(2)]
         pairs = [(rows[i], rows[1-i], 0.) for i in (0, 1)]
+        class Codec(torch.nn.Module):
+            sample_rate, downsample_rate = 1000, 16
+            def __init__(self):
+                super().__init__()
+                self.decoder = torch.nn.Identity()
+            def encode(self, wav, rate):
+                return wav.reshape(1, -1, 4, 4).mean(-1)
         def manager():
             core = tiny_core().eval()
             tts = SimpleNamespace(tts_core=core, device='cpu', _tokenize_text=lambda s: torch.tensor([1, 2]),
-                                  redae=torch.nn.Identity(), spk_extractor=torch.nn.Identity())
+                                  redae=Codec(), spk_extractor=torch.nn.Identity())
             return SimpleNamespace(load_base=lambda **kw: tts, unload=lambda: None)
         def cache(tts, *args):
             rng = torch.Generator().manual_seed(102)
@@ -170,9 +177,12 @@ class TransferTests(unittest.TestCase):
             return SimpleNamespace(path=lambda r: Path(__file__), read_only=True, device=torch.device('cpu'),
                                    read=lambda r: payloads[r['utt_id']])
         with tempfile.TemporaryDirectory() as tmp, ExitStack() as mocks:
+            for row in rows:
+                row['audio'] = str(Path(tmp) / f"{row['utt_id']}.wav")
+                sf.write(row['audio'], np.sin(np.arange(125))*.2, 1000)
             for name, val in (('ModelManager', manager), ('FeatureCache', cache),
                               ('require_training_hardware', lambda: None), ('model_identity', lambda d: transfer.BASE_SHA),
-                              ('paired_data', lambda d: ({'train': pairs*16, 'validation': pairs}, rows,
+                              ('paired_data', lambda d: ({'train': pairs*32, 'validation': pairs}, rows,
                                                         {'selection_sha256': 'toy'}))):
                 mocks.enter_context(patch.object(transfer, name, val))
             from safetensors.torch import load_file
@@ -197,6 +207,16 @@ class TransferTests(unittest.TestCase):
                     for key in wanted:
                         torch.testing.assert_close(wanted[key], replayed[key], rtol=0, atol=0, msg=key)
                     self.assertFalse((root/'fork'/mode/'step-0001').exists())
+                    transfer.train(root, root/'recover', mode, 2, True, fork_from=earlier, recovery=True)
+                    recovered = tensors('recover')
+                    self.assertTrue(any(not torch.equal(got[k], recovered[k]) for k in got))
+                    with self.assertRaisesRegex(ValueError, 'same recipe'):
+                        transfer.train(root, root/'recover', mode, 3, True)
+                    transfer.train(root, root/'recover', mode, 3, True, recovery=True)
+                    transfer.train(root, root/'recover-direct', mode, 3, True, fork_from=earlier, recovery=True)
+                    a, b = (load_file(root/r/mode/'step-0003'/name) for r in ('recover', 'recover-direct'))
+                    for key in a:
+                        torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
 
     def test_compare_uses_same_whole_cases_and_flags_bad_checkpoint(self):
         from fireredtts3_local import vox_recipe_compare as comp
@@ -269,6 +289,13 @@ class TransferTests(unittest.TestCase):
             self.assertNotIn('delta_vs_unlevelled', case)
             with self.assertRaisesRegex(ValueError, 'recipe/selection mismatch'):
                 comp.compare(root, root, 500, None, 'stub', 'stub', against=path, lora_only=True)
+            record['recipe']['acoustic_recovery'] = transfer.vox_recovery.CONFIG
+            (later/'checkpoint.json').write_text(json.dumps(record))
+            ab = comp.compare(root, root, 500, None, 'stub', 'stub', against=third, lora_only=True)
+            delta = json.loads(ab.read_text())['results']['lora'][0]['delta_vs_clean_control']
+            self.assertEqual(set(delta.values()), {0.})
+            del record['recipe']['acoustic_recovery']
+            (later/'checkpoint.json').write_text(json.dumps(record))
             changed_ref = samples * .5
             sf.write(audio, changed_ref, 24000, subtype='FLOAT')
             with self.assertRaisesRegex(ValueError, 'differ from the original comparison'):

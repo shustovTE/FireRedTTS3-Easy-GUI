@@ -14,6 +14,7 @@ import soundfile as sf
 import torch
 
 from . import vox_recipe_levels, voxcpm_balance, voxcpm_data
+from . import vox_recovery
 from .model_manager import ModelManager
 from .paths import MODEL_DIR
 from .training_batch import batch_flow_loss, set_training
@@ -198,10 +199,12 @@ def save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics):
     return path
 
 
-def train(dataset, output, mode, until, resume, *, fork_from=None, shared_features=None):
+def train(dataset, output, mode, until, resume, *, fork_from=None, shared_features=None, recovery=False):
     from transformers import get_cosine_schedule_with_warmup
     if not 1 <= until <= TOTAL:
         raise ValueError('--until must be between 1 and 1000')
+    if recovery and (mode != 'lora' or not resume):
+        raise ValueError('Acoustic recovery requires a resumed LoRA')
     require_training_hardware()
     print(f'[transfer] Auditing prepared audio and transcripts in {dataset}', flush=True)
     splits, rows, selection = paired_data(dataset)
@@ -213,6 +216,9 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
                   speaker_cap_seconds=CAP_SECONDS, base_sha256=fingerprint,
                   seed=SEED, updates=TOTAL, batch_size=MICRO, accumulation=ACCUM, lr=LR[mode],
                   warmup=100, weight_decay=.01, max_grad_norm=1., flow_weight=1., stop_weight=1.)
+    parent_recipe = recipe
+    if recovery:
+        recipe = dict(recipe, acoustic_recovery=vox_recovery.CONFIG)
     out = output / mode
     out.mkdir(parents=True, exist_ok=True)
     checkpoints = sorted(p for p in out.glob('step-*') if (p / 'checkpoint.json').is_file())
@@ -222,7 +228,8 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
     start = 0
     if prior:
         saved = json.loads((prior / 'checkpoint.json').read_text())
-        if not resume or saved['recipe'] != recipe:
+        expected = parent_recipe if fork_from is not None else recipe
+        if not resume or saved['recipe'] != expected:
             raise ValueError(f'Existing checkpoint {prior}: use --resume with the same recipe and data')
         start = saved['step']
     elif resume:
@@ -246,7 +253,10 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
             # A fork can read the old cache. Any new features belong to the fork.
             precompute_features(tts, rows, cache_dir, fingerprint, precision_policy='native')
             cache = FeatureCache(tts, cache_dir, fingerprint, True, 'native')
-        tts.redae.to('cpu')
+        if recovery:
+            tts.redae.decoder.to('cpu')  # Keep only the frozen waveform encoder on the training device.
+        else:
+            tts.redae.to('cpu')
         tts.spk_extractor.to('cpu')
         torch.cuda.empty_cache()
         loader = BatchFeatures(cache)
@@ -274,13 +284,30 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
         for step in range(start+1, until+1):
             optimizer.zero_grad(set_to_none=True)
             loss_sum = 0.
+            recovery_sum, windows = 0., 0
             for micro in range(ACCUM):
                 _, loaded = next(stream)
-                loss, _ = objective(tts, loaded, mode, SEED + (step-1)*ACCUM + micro, True)
+                seed = SEED + (step-1)*ACCUM + micro
+                loss, _ = objective(tts, loaded, mode, seed, True)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f'Nonfinite {mode} loss at update {step}, microbatch {micro+1}')
                 (loss / ACCUM).backward()
                 loss_sum += float(loss.detach()) / ACCUM
+                if recovery:
+                    # Backward separately so clean and recovery activations do not coexist.
+                    examples = to_examples(tts, loaded, 'native')
+                    with isolated_rng(seed + 100_000):
+                        extra, count = vox_recovery.recovery_loss(tts, examples, [r[3] for r in loaded], seed + 100_000)
+                        if not torch.isfinite(extra):
+                            raise FloatingPointError(f'Nonfinite recovery loss at update {step}')
+                        if count:
+                            (vox_recovery.CONFIG['weight'] * extra / ACCUM).backward()
+                    recovery_sum += float(extra.detach()) / ACCUM
+                    windows += count
+            if recovery:
+                print(f'[recovery] step={step} windows={windows} clean_loss={loss_sum:.6f} '
+                      f'recovery_flow={recovery_sum:.6f}', flush=True)
+                loss_sum += vox_recovery.CONFIG['weight'] * recovery_sum
             norm = torch.nn.utils.clip_grad_norm_(params, 1., error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
