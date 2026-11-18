@@ -45,7 +45,7 @@ class ReplayTest(unittest.TestCase):
             updates, generations = [], []
             def train(dataset, output, mode, step, resume, *, fork_from, shared_features):
                 self.assertEqual((dataset, mode, resume, shared_features), (data, 'lora', True, source/'features'))
-                self.assertEqual(fork_from, pilot if step == 100 else None)
+                self.assertEqual(fork_from, pilot if step in (50, 100) else None)
                 saved = output/'lora'/f'step-{step:04d}'
                 saved.mkdir(parents=True)
                 (saved/'checkpoint.json').write_text(json.dumps(dict(step=step, recipe=recipe)))
@@ -78,6 +78,15 @@ class ReplayTest(unittest.TestCase):
                         self.assertTrue((run/'audio'/f'step-{step:04d}'/f'series-{series}'/'lora'/'case-000.wav').is_file())
                 self.assertEqual((later/'checkpoint.json').read_text(), 'original 500')
                 self.assertEqual(sorted((source/'lora').iterdir()), [pilot, later])
+                updates.clear()
+                generations.clear()
+                short_run = replay.sweep(data, source, reports, until=50)
+                replay.sweep(data, source, reports, until=50)
+                self.assertEqual(short_run, source/'lora-0030-to-0050')
+                self.assertEqual(updates, [50])
+                self.assertEqual(generations, [(50, p) for p in reports])
+                self.assertTrue((short_run/'audio'/'step-0050'/'series-2'/'lora'/'case-000.wav').is_file())
+                self.assertTrue((run/'lora'/'step-0100'/'checkpoint.json').is_file())
                 (pilot/'adapter_model.safetensors').write_bytes(b'different pilot')
                 with self.assertRaisesRegex(ValueError, 'Replay inputs differ'):
                     replay.sweep(data, source, reports)

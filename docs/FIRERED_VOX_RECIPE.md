@@ -144,3 +144,31 @@ tail -n 30 -f training/logs/firered-lora-100-400.log
 ```
 
 Адаптер первого среза лежит в `$run/lora-0030-to-0400/lora/step-0100/`, его WAV — в `$run/lora-0030-to-0400/audio/step-0100/series-1/lora/` и `series-2/lora/`. Для следующих срезов подставьте `step-0200`, `step-0300` и `step-0400`. Номера серий соответствуют порядку переданных отчётов. Рядом с каждой папкой `lora/` лежит `report.json` с текстами, WER, сходством голоса в последней трети, изменением громкости и дельтами к шагу 30. Сопоставляйте один и тот же ID на разных шагах. Повтор команды после прерывания продолжает с завершённого среза и формирует оставшиеся серии.
+
+### Остановить прогон и проверить отдельно шаг 50
+
+Если уже слышно искажение на шаге 100, закройте просмотр `tail -f` через `Ctrl+C` и остановите фоновый процесс на Gauss по открытому файлу блокировки прогона. Дождитесь сообщения об остановке.
+
+```bash
+cd /opt/firered-tuning
+run=training/outputs/firered-vox-recipe-12-cap30m-levels
+lock="$run/lora-0030-to-0400/.run.lock"
+fuser -k -TERM "$lock"
+flock -w 60 "$lock" true && echo 'Прогон 100–400 остановлен'
+```
+
+Для отдельного сравнения задайте абсолютную границу `--until 50`. Обучение выполнит 20 обновлений от сохранённого шага 30 с тем же расписанием LR. Восстановите те же две серии запросов в прежнем порядке.
+
+```bash
+cd /opt/firered-tuning
+git pull --ff-only origin feat/russian-tts-adaptation
+run=training/outputs/firered-vox-recipe-12-cap30m-levels
+mkdir -p training/logs
+nohup .venv/bin/python -u -m fireredtts3_local.vox_recipe_sweep --until 50 \
+  "$run/comparison-0030-yrslvj2s/report.json" \
+  "$run/comparison-0030-ql21g14n/report.json" \
+  >> training/logs/firered-lora-0050.log 2>&1 < /dev/null &
+tail -n 30 -f training/logs/firered-lora-0050.log
+```
+
+Адаптер появится в `$run/lora-0030-to-0050/lora/step-0050/`. Для сравнения проблемного `cities` откройте одноимённые WAV в `$run/comparison-0030-ql21g14n/lora/`, `$run/lora-0030-to-0050/audio/step-0050/series-2/lora/` и сохранённой серии шага 100.

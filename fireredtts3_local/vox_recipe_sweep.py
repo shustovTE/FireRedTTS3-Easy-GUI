@@ -1,4 +1,4 @@
-"""Replay the levelled FireRed LoRA from update 30, saving adapters and matched audio every 100 updates."""
+"""Replay the levelled FireRed LoRA from update 30, saving adapters and matched audio."""
 import argparse
 import json
 from pathlib import Path
@@ -16,7 +16,10 @@ from .vox_recipe_transfer import BASE_SHA, OUTPUT, train
 STEPS = (100, 200, 300, 400)
 
 
-def sweep(dataset, source, reports):
+def sweep(dataset, source, reports, *, until=STEPS[-1]):
+    if not 30 < until <= STEPS[-1]:
+        raise ValueError(f'--until must be an absolute update between 31 and {STEPS[-1]}')
+    steps = [step for step in STEPS if step < until] + [until]
     dataset, source = dataset.resolve(), source.resolve()
     pilot = source / 'lora' / 'step-0030'
     saved = json.loads((pilot / 'checkpoint.json').read_text())
@@ -38,8 +41,8 @@ def sweep(dataset, source, reports):
     plan = dict(pilot=str(pilot), files={name: file_digest(pilot / name) for name in
                 ('checkpoint.json', 'adapter_config.json', 'adapter_model.safetensors', 'training_state.pt')},
                 level_report_sha256=file_digest(dataset / vox_recipe_levels.REPORT),
-                steps=list(STEPS), reports=[{'path': str(p), 'sha256': file_digest(p)} for p in reports])
-    run = source / 'lora-0030-to-0400'
+                steps=steps, reports=[{'path': str(p), 'sha256': file_digest(p)} for p in reports])
+    run = source / f'lora-0030-to-{until:04d}'
     run.mkdir(exist_ok=True)
     with FileLock(str(run / '.run.lock'), timeout=0):
         manifest = run / 'replay.json'
@@ -50,12 +53,12 @@ def sweep(dataset, source, reports):
             if (run / 'lora').exists() or (run / 'audio').exists():
                 raise ValueError(f'Existing sweep outputs have no replay metadata: {run}')
             write_json(manifest, plan)
-        for step in STEPS:
+        for step in steps:
             checkpoint = run / 'lora' / f'step-{step:04d}'
             checkpoint_info = checkpoint / 'checkpoint.json'
             if not checkpoint_info.is_file():
                 print(f'[sweep] Training LoRA to update {step}', flush=True)
-                train(dataset, run, 'lora', step, True, fork_from=pilot if step == STEPS[0] else None,
+                train(dataset, run, 'lora', step, True, fork_from=pilot if step == steps[0] else None,
                       shared_features=source / 'features')
             record = json.loads(checkpoint_info.read_text())
             if record['step'] != step or record['recipe'] != recipe:
@@ -79,5 +82,7 @@ if __name__ == '__main__':
     parser.add_argument('reports', type=Path, nargs='+', help='Completed levelled step-30 comparison reports')
     parser.add_argument('--source', type=Path, default=Path(OUTPUT + '-levels'))
     parser.add_argument('--dataset', type=Path, default=Path(vox_recipe_levels.OUTPUT))
+    parser.add_argument('--until', type=int, default=STEPS[-1],
+                        help='Absolute last update (31–400). Save and evaluate there and at earlier hundreds.')
     args = parser.parse_args()
-    print(sweep(args.dataset, args.source, args.reports))
+    print(sweep(args.dataset, args.source, args.reports, until=args.until))
