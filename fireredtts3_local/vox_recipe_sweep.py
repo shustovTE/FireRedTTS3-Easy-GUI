@@ -1,11 +1,12 @@
 """Train and evaluate FireRed LoRA checkpoints on the levelled Russian data."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
 from filelock import FileLock
 
-from . import vox_recipe_levels, vox_recovery, vox_recovery_probe
+from . import vox_recipe_levels, vox_recovery, vox_recovery_probe, vox_rise_gate
 from .training_data import file_digest
 from .training_job import write_json
 from .training_monitor import SETTINGS, load_benchmark
@@ -16,7 +17,8 @@ from .vox_recipe_transfer import BASE_SHA, OUTPUT, paired_data, train, transfer_
 STEPS = (100, 200, 300, 400)
 
 
-def fresh_recovery(dataset, source, reports, *, stronger_comb=False, four_patch=False):
+def fresh_recovery(dataset, source, reports, *, stronger_comb=False, four_patch=False,
+                   rise_limit_percent=None, rise_cases=None):
     dataset, source = dataset.resolve(), source.resolve()
     config = vox_recovery.STRONGER_COMB if stronger_comb else vox_recovery.CONFIG
     steps = [100, 500] if four_patch else [50, 100]
@@ -27,18 +29,29 @@ def fresh_recovery(dataset, source, reports, *, stronger_comb=False, four_patch=
     reports = [p.resolve() for p in reports]
     if not reports or len(set(reports)) != len(reports):
         raise ValueError('Supply distinct reports with saved Base results')
-    for p in reports:
-        load_saved_base(p)
+    if rise_limit_percent is None:
+        for p in reports:
+            load_saved_base(p)
+        gate = None
+    else:
+        ids = rise_cases or [vox_rise_gate.DEFAULT_CASE]
+        gate = vox_rise_gate.configuration(rise_limit_percent, ids, reports)
     splits, _, selection = paired_data(dataset)
     recipe = dict(transfer_recipe('lora', selection['selection_sha256']),
                   acoustic_recovery=config, recovery_start_step=0)
+    suffix = ''
+    if gate:
+        recipe['rise_gate'] = gate
+        suffix = f'-rise{rise_limit_percent:g}pct'
+        if ids != [vox_rise_gate.DEFAULT_CASE]:
+            suffix += '-' + hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:10]
     plan = dict(initialization='fresh LoRA on original Base', recipe=recipe, steps=steps,
                 level_report_sha256=file_digest(dataset / vox_recipe_levels.REPORT),
                 reports=[{'path': str(p), 'sha256': file_digest(p)} for p in reports])
-    standard = source / 'lora-base-recovery-0100'
-    run = source / 'lora-base-recovery-comb050-0100' if stronger_comb else standard
+    standard = source / ('lora-base-recovery-0100' + suffix)
+    run = source / ('lora-base-recovery-comb050-0100' + suffix) if stronger_comb else standard
     if four_patch:
-        run = source / 'lora-base-recovery-4patch-0500'
+        run = source / ('lora-base-recovery-4patch-0500' + suffix)
         voice = vox_recovery_probe.select_voice(splits)
         plan['prefix_test'] = dict(voice=voice, texts=vox_recovery_probe.TEXTS, seeds=list(vox_recovery_probe.SEEDS),
                                    damage=vox_recovery_probe.DAMAGE)
@@ -117,7 +130,8 @@ def run_slices(dataset, source, run, plan, recipe, comparisons, *, pilot=None, r
                 print(f'[sweep] Training LoRA to update {step}', flush=True)
                 train(dataset, run, 'lora', step, resume=index > 0 or pilot is not None,
                       fork_from=pilot if index == 0 else None,
-                      shared_features=source / 'features', recovery=recipe.get('acoustic_recovery', False))
+                      shared_features=source / 'features', recovery=recipe.get('acoustic_recovery', False),
+                      **({'rise_gate': recipe['rise_gate']} if 'rise_gate' in recipe else {}))
             record = json.loads(checkpoint_info.read_text())
             if record['step'] != step or record['recipe'] != recipe:
                 raise ValueError(f'Unexpected replay checkpoint: {checkpoint}')
@@ -166,17 +180,27 @@ if __name__ == '__main__':
                       help='Fresh four-patch recovery LoRA from Base. Save and test at 100 and 500.')
     parser.add_argument('--stronger-comb', action='store_true',
                         help='With --recovery-from-base, raise only the delayed signal coefficient from 0.35 to 0.50.')
+    parser.add_argument('--rise-limit-percent', type=float, metavar='PERCENT',
+                        help='Reject proposed LoRA updates exceeding Base tail/head RMS ratio by this percentage.')
+    parser.add_argument('--rise-case', action='append', metavar='ID',
+                        help='Check this saved Base case every update. Repeat for multiple cases. Default: cities_seed1237.')
     args = parser.parse_args()
     if args.stronger_comb and not args.recovery_from_base:
         parser.error('--stronger-comb requires --recovery-from-base')
+    if args.rise_case and args.rise_limit_percent is None:
+        parser.error('--rise-case requires --rise-limit-percent')
+    if args.rise_limit_percent is not None and not (args.recovery_from_base or args.multistep_from_base):
+        parser.error('--rise-limit-percent requires --recovery-from-base or --multistep-from-base')
     if args.multistep_from_base:
         if args.until not in (None, 500):
             parser.error('--multistep-from-base saves at 100 and 500')
-        print(fresh_recovery(args.dataset, args.source, args.reports, four_patch=True))
+        print(fresh_recovery(args.dataset, args.source, args.reports, four_patch=True,
+                             rise_limit_percent=args.rise_limit_percent, rise_cases=args.rise_case))
     elif args.recovery_from_base:
         if args.until not in (None, 100):
             parser.error('--recovery-from-base ends at update 100')
-        print(fresh_recovery(args.dataset, args.source, args.reports, stronger_comb=args.stronger_comb))
+        print(fresh_recovery(args.dataset, args.source, args.reports, stronger_comb=args.stronger_comb,
+                             rise_limit_percent=args.rise_limit_percent, rise_cases=args.rise_case))
     else:
         until = STEPS[-1] if args.until is None else args.until
         control = sweep(args.dataset, args.source, args.reports, until=until)

@@ -14,7 +14,7 @@ import soundfile as sf
 import torch
 
 from . import vox_recipe_levels, voxcpm_balance, voxcpm_data
-from . import vox_recovery
+from . import vox_recovery, vox_rise_gate
 from .model_manager import ModelManager
 from .paths import MODEL_DIR
 from .training_batch import batch_flow_loss, set_training
@@ -206,12 +206,14 @@ def transfer_recipe(mode, dataset_sha256):
                 warmup=100, weight_decay=.01, max_grad_norm=1., flow_weight=1., stop_weight=1.)
 
 
-def train(dataset, output, mode, until, resume, *, fork_from=None, shared_features=None, recovery=False):
+def train(dataset, output, mode, until, resume, *, fork_from=None, shared_features=None, recovery=False, rise_gate=None):
     from transformers import get_cosine_schedule_with_warmup
     if not 1 <= until <= TOTAL:
         raise ValueError('--until must be between 1 and 1000')
     if recovery and mode != 'lora':
         raise ValueError('Acoustic recovery requires LoRA')
+    if rise_gate and (mode != 'lora' or fork_from is not None):
+        raise ValueError('Per-update RMS acceptance requires a fresh or matching resumed LoRA run')
     if recovery is True:
         recovery = vox_recovery.CONFIG
     require_training_hardware()
@@ -223,6 +225,8 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
         raise ValueError('This comparison requires the original unmerged FireRedTTS3 Base')
     parent_recipe = transfer_recipe(mode, selection['selection_sha256'])
     recipe = dict(parent_recipe, acoustic_recovery=recovery) if recovery else parent_recipe
+    if rise_gate:
+        recipe['rise_gate'] = rise_gate
     out = output / mode
     out.mkdir(parents=True, exist_ok=True)
     checkpoints = sorted(p for p in out.glob('step-*') if (p / 'checkpoint.json').is_file())
@@ -259,11 +263,12 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
             # A fork can read the old cache. Any new features belong to the fork.
             precompute_features(tts, rows, cache_dir, fingerprint, precision_policy='native')
             cache = FeatureCache(tts, cache_dir, fingerprint, True, 'native')
-        if recovery:
-            tts.redae.decoder.to('cpu')  # Keep only the frozen waveform encoder on the training device.
-        else:
-            tts.redae.to('cpu')
-        tts.spk_extractor.to('cpu')
+        if not rise_gate:
+            if recovery:
+                tts.redae.decoder.to('cpu')  # Keep only the frozen waveform encoder on the training device.
+            else:
+                tts.redae.to('cpu')
+            tts.spk_extractor.to('cpu')
         torch.cuda.empty_cache()
         loader = BatchFeatures(cache)
         core = tts.tts_core = configure(tts.tts_core, mode, prior)
@@ -282,6 +287,10 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
             del state
         print(f'[transfer] {mode}, trainable={sum(p.numel() for p in params):,}, updates {start+1}..{until}',
               flush=True)
+        if rise_gate:
+            decisions = vox_rise_gate.RiseLog(output, start)
+            print(f"[rise] Checking every proposed update; margin={rise_gate['margin_db']:.4f} dB; "
+                  f"cases={[c['id'] for c in rise_gate['cases']]}", flush=True)
         stream = loader.iterate(batches(splits['train'][start*MICRO*ACCUM:until*MICRO*ACCUM]))
         if not prior:
             metrics = validate(tts, loader, splits['validation'], mode)
@@ -318,12 +327,20 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
                       f'recovery_flow={recovery_sum:.6f}{counts}', flush=True)
                 loss_sum += recovery['weight'] * recovery_sum
             norm = torch.nn.utils.clip_grad_norm_(params, 1., error_if_nonfinite=True)
-            optimizer.step()
-            scheduler.step()
+            if rise_gate:
+                decision = vox_rise_gate.try_update(optimizer, params, tts, rise_gate)
+                if decision['accepted']:
+                    scheduler.step()
+                decisions.record(step, scheduler.last_epoch, decision)
+            else:
+                optimizer.step()
+                scheduler.step()
             if step % 10 == 0 or step == until:
                 print(f'[transfer] {mode} {step}/{TOTAL} loss={loss_sum:.6f} grad_norm={norm:.4f}', flush=True)
             if step % 500 == 0 or step == until:
                 metrics = validate(tts, loader, splits['validation'], mode)
+                if rise_gate:
+                    metrics.update(accepted_updates=scheduler.last_epoch, rejected_updates=step-scheduler.last_epoch)
                 if torch.device(tts.device).type == 'cuda':
                     print(f'[transfer] Peak allocated GPU memory: {torch.cuda.max_memory_allocated(tts.device)/2**30:.2f} GiB',
                           flush=True)

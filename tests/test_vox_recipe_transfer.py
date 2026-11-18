@@ -239,6 +239,29 @@ class TransferTests(unittest.TestCase):
                     self.assertTrue(any(not torch.equal(fresh[k], stronger_split[k]) for k in fresh))
                     for key in stronger_split:
                         torch.testing.assert_close(stronger_split[key], stronger_direct[key], rtol=0, atol=0)
+                    # A rejected attempt consumes its batch. Resume restores AdamW and its
+                    # accepted-update LR clock, while replaying from the next attempted batch.
+                    gate = dict(margin_db=1.58, cases=[{'id':'long'}])
+                    decisions = [[dict(passed=ok, excess_db=0. if ok else 2., id='long')]
+                                 for ok in (True, False, True)]
+                    folder = root/'gated'
+                    with patch.object(transfer.vox_rise_gate, 'evaluate', side_effect=decisions):
+                        transfer.train(root, folder, mode, 2, False, recovery=stronger, rise_gate=gate)
+                        log = folder/'rise_decisions.json'
+                        log.write_text(json.dumps(json.loads(log.read_text()) + [{'attempt':3,'stale':True}]))
+                        transfer.train(root, folder, mode, 3, True, recovery=stronger, rise_gate=gate)
+                    with patch.object(transfer.vox_rise_gate, 'evaluate', side_effect=decisions):
+                        transfer.train(root, root/'gated-direct', mode, 3, False, recovery=stronger, rise_gate=gate)
+                    rows_logged = json.loads(log.read_text())
+                    self.assertEqual([r['attempt'] for r in rows_logged], [1,2,3])
+                    self.assertEqual([r['accepted_total'] for r in rows_logged], [1,1,2])
+                    checkpoint = folder/mode/'step-0003'
+                    state = torch.load(checkpoint/'training_state.pt', weights_only=True)
+                    self.assertEqual(state['scheduler']['last_epoch'], 2)
+                    self.assertEqual(json.loads((checkpoint/'checkpoint.json').read_text())['validation']['rejected_updates'], 1)
+                    split, direct = (load_file(root/run/mode/'step-0003'/name) for run in ('gated','gated-direct'))
+                    for key in split:
+                        torch.testing.assert_close(split[key], direct[key], atol=0, rtol=0)
 
     def test_compare_uses_same_whole_cases_and_flags_bad_checkpoint(self):
         from fireredtts3_local import vox_recipe_compare as comp
