@@ -53,9 +53,10 @@ class ReplayTest(unittest.TestCase):
                 updates.append(step)
 
             interrupted = False
-            def compare(dataset, output, step, benchmark, asr, speaker_model, *, against, lora_only):
+            def compare(dataset, output, step, benchmark, asr, speaker_model, *, against, lora_only, reuse_base):
                 nonlocal interrupted
                 self.assertTrue(lora_only)
+                self.assertFalse(reuse_base)
                 self.assertEqual((dataset, asr, speaker_model), (data, 'same-asr', 'same-voice'))
                 if not interrupted and step == 200 and against == reports[1]:
                     interrupted = True
@@ -66,7 +67,7 @@ class ReplayTest(unittest.TestCase):
                 sf.write(folder/'lora'/'case-000.wav', np.zeros(16000), 16000)
                 previous = json.loads(against.read_text())
                 (folder/'report.json').write_text(json.dumps(dict(complete=True, step=step, compared_to=str(against),
-                    benchmark_sha256=previous['benchmark_sha256'], recipes=previous['recipes'])))
+                    benchmark_sha256=previous['benchmark_sha256'], recipes=previous['recipes'], asr=asr, speaker_model=speaker_model)))
                 return folder/'report.json'
 
             with patch.object(replay, 'train', train), patch.object(replay, 'compare', compare):
@@ -99,3 +100,44 @@ class ReplayTest(unittest.TestCase):
                 (pilot/'adapter_model.safetensors').write_bytes(b'different pilot')
                 with self.assertRaisesRegex(ValueError, 'Replay inputs differ'):
                     replay.sweep(data, source, reports)
+
+    def test_fresh_recovery_without_a_pilot_and_restart_after_first_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            (source/replay.vox_recipe_levels.REPORT).write_text('{}')
+            path = source/'report.json'
+            path.write_text(json.dumps(dict(asr='asr', speaker_model='speaker')))
+            recipe = dict(replay.transfer_recipe('lora', 'data'), acoustic_recovery=replay.vox_recovery.CONFIG,
+                          recovery_start_step=0)
+            updates, samples = [], []
+            def train(dataset, run, mode, step, resume, *, fork_from, shared_features, recovery):
+                self.assertEqual((mode, recovery, fork_from, resume), ('lora', True, None, step != 50))
+                if resume:
+                    self.assertTrue((run/'lora'/'step-0050'/'checkpoint.json').is_file())
+                checkpoint = run/'lora'/f'step-{step:04d}'
+                checkpoint.mkdir(parents=True)
+                (checkpoint/'checkpoint.json').write_text(json.dumps(dict(step=step, recipe=recipe)))
+                updates.append(step)
+
+            def compare(dataset, run, step, benchmark, asr, speaker_model, *, against, lora_only, reuse_base):
+                self.assertEqual((against, lora_only, reuse_base), (path, True, True))
+                samples.append(step)
+                if len(samples) == 1:
+                    raise RuntimeError('evaluation interrupted')
+                folder = Path(tempfile.mkdtemp(dir=run))
+                (folder/'lora').mkdir()
+                (folder/'lora'/'case-000.wav').touch()
+                (folder/'report.json').write_text('{"complete":true}')
+                return folder/'report.json'
+
+            with patch.object(replay, 'paired_data', return_value=({}, [], {'selection_sha256':'data'})), \
+                    patch.object(replay, 'load_saved_base'), patch.object(replay, 'train', train), \
+                    patch.object(replay, 'compare', compare):
+                with self.assertRaisesRegex(RuntimeError, 'evaluation interrupted'):
+                    replay.fresh_recovery(source, source, [path])
+                run = replay.fresh_recovery(source, source, [path])
+                replay.fresh_recovery(source, source, [path])
+            self.assertEqual(updates, [50, 100])
+            self.assertEqual(samples, [50, 50, 100])
+            for n in (50, 100):
+                self.assertTrue((run/'audio'/f'step-{n:04d}'/'series-1'/'lora'/'case-000.wav').is_file())

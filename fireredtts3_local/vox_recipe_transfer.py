@@ -199,12 +199,19 @@ def save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics):
     return path
 
 
+def transfer_recipe(mode, dataset_sha256):
+    return dict(version=2, mode=mode, upstream=UPSTREAM, dataset_sha256=dataset_sha256,
+                speaker_cap_seconds=CAP_SECONDS, base_sha256=BASE_SHA,
+                seed=SEED, updates=TOTAL, batch_size=MICRO, accumulation=ACCUM, lr=LR[mode],
+                warmup=100, weight_decay=.01, max_grad_norm=1., flow_weight=1., stop_weight=1.)
+
+
 def train(dataset, output, mode, until, resume, *, fork_from=None, shared_features=None, recovery=False):
     from transformers import get_cosine_schedule_with_warmup
     if not 1 <= until <= TOTAL:
         raise ValueError('--until must be between 1 and 1000')
-    if recovery and (mode != 'lora' or not resume):
-        raise ValueError('Acoustic recovery requires a resumed LoRA')
+    if recovery and mode != 'lora':
+        raise ValueError('Acoustic recovery requires LoRA')
     require_training_hardware()
     print(f'[transfer] Auditing prepared audio and transcripts in {dataset}', flush=True)
     splits, rows, selection = paired_data(dataset)
@@ -212,22 +219,19 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
     fingerprint = model_identity(MODEL_DIR)
     if fingerprint != BASE_SHA:
         raise ValueError('This comparison requires the original unmerged FireRedTTS3 Base')
-    recipe = dict(version=2, mode=mode, upstream=UPSTREAM, dataset_sha256=selection['selection_sha256'],
-                  speaker_cap_seconds=CAP_SECONDS, base_sha256=fingerprint,
-                  seed=SEED, updates=TOTAL, batch_size=MICRO, accumulation=ACCUM, lr=LR[mode],
-                  warmup=100, weight_decay=.01, max_grad_norm=1., flow_weight=1., stop_weight=1.)
-    parent_recipe = recipe
-    if recovery:
-        recipe = dict(recipe, acoustic_recovery=vox_recovery.CONFIG)
+    parent_recipe = transfer_recipe(mode, selection['selection_sha256'])
+    recipe = dict(parent_recipe, acoustic_recovery=vox_recovery.CONFIG) if recovery else parent_recipe
     out = output / mode
     out.mkdir(parents=True, exist_ok=True)
     checkpoints = sorted(p for p in out.glob('step-*') if (p / 'checkpoint.json').is_file())
     if checkpoints and fork_from is not None:
         raise ValueError('Fork into a separate output without existing checkpoints')
     prior = checkpoints[-1] if checkpoints else fork_from
+    saved = json.loads((prior / 'checkpoint.json').read_text()) if prior else None
+    if recovery and (prior is None or 'recovery_start_step' in saved['recipe']):
+        recipe['recovery_start_step'] = 0
     start = 0
     if prior:
-        saved = json.loads((prior / 'checkpoint.json').read_text())
         expected = parent_recipe if fork_from is not None else recipe
         if not resume or saved['recipe'] != expected:
             raise ValueError(f'Existing checkpoint {prior}: use --resume with the same recipe and data')

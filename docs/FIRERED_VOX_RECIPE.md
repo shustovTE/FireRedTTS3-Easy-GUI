@@ -199,3 +199,30 @@ jq -r '.results.lora[] | [.id, .audio, .asr.wer, .delta_vs_clean_control.wer, .d
 ```
 
 Колонки содержат ID, WAV, WER эксперимента и три разницы (WER, дрейф уровня в дБ, сходство голоса в последней трети). Проверьте одни и те же WAV на полноту перечислений и сохранение тембра до финального вопроса. Сокращение реплики из-за пропуска слов тоже может уменьшить измеренный дрейф.
+
+## Новая recovery-LoRA от исходной Base до шага 100
+
+Режим `--recovery-from-base` создаёт новую LoRA на исходной FireRedTTS3-Base с новым AdamW и включает задачу восстановления акустической истории с первого шага. Он использует ту же нормализованную выборку Dialogs и Spontaneous, лимит 30 минут на диктора, кэш чистых признаков и первые 100 обновлений прежнего расписания LR (100 шагов разогрева). На шагах 50 и 100 сохраняются веса и состояние обучения, затем синтезируются полные реплики с соответствующим адаптером.
+
+Два отчёта прошлого прогона задают серии запросов и содержат готовые результаты Base. Программа сверяет отпечаток модели, тексты, seed, референсы и настройки, затем использует метрики из `results.base` для сравнения. Сами WAV исходной Base уже лежат возле этих отчётов. В новом каталоге будут только WAV адаптера. Наличие старого чекпойнта LoRA для этого режима не требуется.
+
+```bash
+cd /opt/firered-tuning
+git pull --ff-only origin feat/russian-tts-adaptation
+run=training/outputs/firered-vox-recipe-12-cap30m-levels
+mkdir -p training/logs
+nohup .venv/bin/python -u -m fireredtts3_local.vox_recipe_sweep \
+  --recovery-from-base \
+  "$run/comparison-0030-yrslvj2s/report.json" \
+  "$run/comparison-0030-ql21g14n/report.json" \
+  >> training/logs/firered-recovery-base-0100.log 2>&1 < /dev/null &
+tail -n 30 -f training/logs/firered-recovery-base-0100.log
+```
+
+```bash
+out=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-base-recovery-0100
+ls "$out"/lora/step-{0050,0100}/adapter_model.safetensors
+ls "$out"/audio/step-{0050,0100}/series-2/lora/
+```
+
+Каждая завершённая серия сразу доступна для прослушивания. В `series-1` шесть запросов, в `series-2` четыре варианта длинного `cities`; сравнивайте одноимённые WAV внутри одной серии. Рядом с каждой папкой `lora/` лежит `report.json`. Поле `delta_vs_base` даёт разницу с исходной Base для того же запроса, а `compared_to` указывает на исходный отчёт. Повтор команды с теми же отчётами после прерывания использует последний завершённый срез и достраивает его прослушивание перед дальнейшим обучением.

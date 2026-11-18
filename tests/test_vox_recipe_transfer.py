@@ -217,6 +217,18 @@ class TransferTests(unittest.TestCase):
                     a, b = (load_file(root/r/mode/'step-0003'/name) for r in ('recover', 'recover-direct'))
                     for key in a:
                         torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
+                    # Fresh recovery applies the new loss from the first microbatch.
+                    with patch.object(transfer.vox_recovery, 'recovery_loss',
+                                      wraps=transfer.vox_recovery.recovery_loss) as recovery_loss:
+                        transfer.train(root, root/'fresh', mode, 1, False, recovery=True)
+                        self.assertEqual(recovery_loss.call_count, transfer.ACCUM)
+                    transfer.train(root, root/'fresh', mode, 2, True, recovery=True)
+                    transfer.train(root, root/'fresh-direct', mode, 2, False, recovery=True)
+                    info = json.loads((root/'fresh'/mode/'step-0002'/'checkpoint.json').read_text())
+                    self.assertEqual(info['recipe']['recovery_start_step'], 0)
+                    fresh, direct = tensors('fresh'), tensors('fresh-direct')
+                    for key in fresh:
+                        torch.testing.assert_close(fresh[key], direct[key], rtol=0, atol=0)
 
     def test_compare_uses_same_whole_cases_and_flags_bad_checkpoint(self):
         from fireredtts3_local import vox_recipe_compare as comp
@@ -294,6 +306,27 @@ class TransferTests(unittest.TestCase):
             ab = comp.compare(root, root, 500, None, 'stub', 'stub', against=third, lora_only=True)
             delta = json.loads(ab.read_text())['results']['lora'][0]['delta_vs_clean_control']
             self.assertEqual(set(delta.values()), {0.})
+            seen.clear()
+            # The old report has LoRA and Base with different metrics. Only Base should be used.
+            cached = json.loads(second.read_text())
+            cached['results']['base'][0]['final_voice_similarity'] = .75
+            cached_path = second.with_name('cached-base.json')
+            cached_path.write_text(json.dumps(cached))
+            cached_eval = comp.compare(root, root, 500, None, 'stub', 'stub', against=cached_path,
+                                       lora_only=True, reuse_base=True)
+            reused = json.loads(cached_eval.read_text())
+            self.assertEqual(len(seen), 1)
+            self.assertFalse((cached_eval.parent/'base').exists())
+            self.assertEqual((set(reused['results']), reused['reference_step']), ({'lora'}, 0))
+            adapted = reused['results']['lora'][0]
+            self.assertEqual(adapted['delta_vs_base']['final_voice_similarity'], adapted['final_voice_similarity'] - .75)
+            self.assertEqual(reused['compared_to'], str(cached_path))
+            cached['results']['base'][0]['seed'] += 1
+            cached_path.write_text(json.dumps(cached))
+            with self.assertRaisesRegex(ValueError, 'Invalid saved Base case'):
+                comp.compare(root, root, 500, None, 'stub', 'stub', against=cached_path,
+                             lora_only=True, reuse_base=True)
+            self.assertEqual(len(seen), 1)
             del record['recipe']['acoustic_recovery']
             (later/'checkpoint.json').write_text(json.dumps(record))
             changed_ref = samples * .5

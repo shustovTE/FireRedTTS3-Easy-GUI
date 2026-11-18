@@ -46,7 +46,26 @@ def default_benchmark(validation):
             for name, text in texts.items() for seed in (1234, 1235)]
 
 
-def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, *, lora_only=False):
+def load_saved_base(path):
+    report = json.loads(path.read_text(encoding='utf-8'))
+    cases, fingerprint = load_benchmark(path.parent / 'benchmark.jsonl')
+    recipes = report.get('recipes', {})
+    if (not report['complete'] or report['benchmark_sha256'] != fingerprint or report['settings'] != SETTINGS
+            or not recipes or any(recipe['base_sha256'] != BASE_SHA for recipe in recipes.values())):
+        raise ValueError(f'Saved Base model, benchmark or settings mismatch: {path}')
+    rows = report['results'].get('base', [])
+    baseline = {row['id']: row for row in rows}
+    if len(rows) != len(cases) or baseline.keys() != {case['id'] for case in cases}:
+        raise ValueError(f'Missing or duplicate saved Base cases: {path}')
+    for case in cases:
+        row = baseline[case['id']]
+        metrics = [row['asr']['wer'], row['voice_similarity'], row['final_voice_similarity'], row['end_minus_start_rms_db']]
+        if (row['text'], row['seed']) != (case['text'], case['seed']) or not np.isfinite(metrics).all():
+            raise ValueError(f'Invalid saved Base case {case["id"]}: {path}')
+    return report, baseline
+
+
+def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, *, lora_only=False, reuse_base=False):
     from faster_whisper import WhisperModel
     from transformers import AutoFeatureExtractor, WavLMForXVector
     splits, _, selection = paired_data(dataset)
@@ -63,7 +82,13 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, 
             raise ValueError(f'Checkpoint/data mismatch for {mode}')
         recipes[mode] = recipe
     previous = None
-    if against is not None:
+    baseline = {}
+    if reuse_base:
+        if against is None:
+            raise ValueError('Reusing Base needs a completed baseline report')
+        previous, baseline = load_saved_base(against)
+        delta_field = 'delta_vs_base'
+    elif against is not None:
         previous = json.loads(against.read_text(encoding='utf-8'))
         if not previous['complete'] or not 0 < previous['step'] <= step:
             raise ValueError('Expected a completed comparison at the same or an earlier step')
@@ -87,6 +112,7 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, 
                 del expected['acoustic_recovery']
             if previous['recipes'].get(mode) != expected:
                 raise ValueError(f'Original comparison recipe/selection mismatch for {mode}')
+    if against is not None:
         benchmark = against.parent / 'benchmark.jsonl'
     root = Path(tempfile.mkdtemp(prefix=f'comparison-{step:04d}-', dir=output))
     if benchmark is None:
@@ -118,13 +144,14 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, 
         with torch.inference_mode():
             return F.normalize(scorer(**inputs).embeddings, dim=-1)
     refs = {}
-    baseline = {}
     report = dict(step=step, complete=False, benchmark_sha256=fingerprint, settings=SETTINGS,
                   recipes=recipes, asr=asr, speaker_model=speaker_model, results={})
     if previous:
         report['compared_to'] = str(against.resolve())
-        report['reference_step'] = previous['step']
-    for mode in ('base', *modes):
+        report['reference_step'] = 0 if reuse_base else previous['step']
+        if reuse_base:
+            report['reference_mode'] = 'base'
+    for mode in (modes if reuse_base else ('base', *modes)):
         folder = root / mode
         folder.mkdir()
         manager = ModelManager()
@@ -157,7 +184,7 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, 
                     raise FloatingPointError('Nonfinite speaker score')
                 result['flags'] = content_flags(result, baseline.get(row['id']))
                 if previous:
-                    before = next(r for r in previous['results'][mode] if r['id'] == row['id'])
+                    before = baseline[row['id']] if reuse_base else next(r for r in previous['results'][mode] if r['id'] == row['id'])
                     result[delta_field] = {
                         'wer': result['asr']['wer'] - before['asr']['wer'],
                         **{k: result[k] - before[k] for k in ('end_minus_start_rms_db', 'voice_similarity',
