@@ -307,9 +307,10 @@ def main():
     p.add_argument('--resume', action='store_true', help='Continue from the last complete checkpoint for this mode')
     p = sub.add_parser('compare')
     p.add_argument('--step', type=int, default=TOTAL)
+    p.add_argument('--lora-only', action='store_true', help='Generate with the original base and the LoRA checkpoint')
     bench = p.add_mutually_exclusive_group()
     bench.add_argument('--benchmark', type=Path, help='Optional JSONL with reference audio, text and seeds')
-    bench.add_argument('--against', type=Path, help='For levelled data, replay cases and measure deltas against the original report')
+    bench.add_argument('--against', type=Path, help='Replay a report from an earlier step of the same recipe or from the original data at the same step')
     p.add_argument('--asr', default='large-v3')
     p.add_argument('--speaker-model', default='microsoft/wavlm-base-plus-sv')
     for p in sub.choices.values():
@@ -328,7 +329,8 @@ def main():
             train(args.dataset, args.output, args.mode, args.until, args.resume)
         else:
             from .vox_recipe_compare import compare
-            print(compare(args.dataset, args.output, args.step, args.benchmark, args.asr, args.speaker_model, args.against))
+            print(compare(args.dataset, args.output, args.step, args.benchmark, args.asr, args.speaker_model,
+                          args.against, lora_only=args.lora_only))
 
 
 if __name__ == '__main__':

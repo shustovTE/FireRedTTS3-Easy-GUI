@@ -109,3 +109,20 @@ jq -r '.results.full[] | [.id, .delta_vs_unlevelled.end_minus_start_rms_db, .del
 ```
 
 Колонки — ID, изменение дрейфа громкости в дБ, изменение WER и изменение сходства голоса в конце. Дельты считаются относительно прошлого прогона того же режима и seed. Для положительного исходного дрейфа уменьшение в сторону нуля означает более ровный уровень. Сопоставляйте это с полнотой текста и звучанием концовки. Все три версии, включая Base, генерируются повторно. Дельты Base служат контролем воспроизводимости.
+
+## Продолжить выбранную LoRA с шага 30 до 500
+
+Параметр `--resume-levelled-lora` продолжает сохранённую LoRA на тех же нормализованных WAV. Из последнего чекпойнта восстанавливаются адаптер, AdamW, расписание LR и состояние генераторов случайных чисел. При старте с `lora/step-0030` выполняются ещё 470 обновлений. Обе серии проверок генерируют Base и LoRA на тех же голосе, текстах и seed, что и в указанных отчётах пилота.
+
+```bash
+cd /opt/firered-tuning
+git pull --ff-only origin feat/russian-tts-adaptation
+run=training/outputs/firered-vox-recipe-12-cap30m-levels
+nohup bash scripts/firered_vox_pair.sh --resume-levelled-lora 500 \
+  "$run/comparison-0030-yrslvj2s/report.json" \
+  "$run/comparison-0030-ql21g14n/report.json" \
+  > training/logs/firered-vox-levels-lora-500.log 2>&1 < /dev/null &
+tail -n 30 -f training/logs/firered-vox-levels-lora-500.log
+```
+
+Результат обучения — `lora/step-0500` внутри `$run`. Каждая серия сравнения печатает путь к своему `comparison-0500-…/report.json`. WAV адаптера лежат в соседней папке `lora/`. Поле `compared_to` указывает соответствующий отчёт шага 30. В `delta_vs_previous_step` значения равны разнице «шаг 500 минус шаг 30» для данного режима и запроса. Флаги в `flags` используют исходную Base при текущем сравнении.

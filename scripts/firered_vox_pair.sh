@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Train both independent FireRed candidates up to a matched checkpoint, then compare.
+# Train the selected FireRed candidates up to a checkpoint, then replay the benchmarks.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/.."
 levels=0
-if [[ ${1:-} == --levels ]]; then
-    levels=1
-    shift
-fi
+modes=(lora full)
+operation=${1:-}
+case "$operation" in
+    --levels) levels=1; shift ;;
+    --resume-levelled-lora) levels=1; modes=(lora); shift ;;
+esac
 if [[ $# -eq 0 || ! $1 =~ ^(30|500|1000)$ ]] || (( !levels && $# > 2 )); then
-    echo "Usage: $0 {30|500|1000} [benchmark.jsonl] | --levels {30|500|1000} [original-report.json ...]" >&2
+    echo "Usage: $0 {30|500|1000} [benchmark.jsonl] | {--levels|--resume-levelled-lora} {30|500|1000} [report.json ...]" >&2
     exit 2
 fi
 step=$1
@@ -26,12 +28,17 @@ if (( levels )); then
     done
     dataset=training/datasets/firered-vox-cap30m-levels
     output=training/outputs/firered-vox-recipe-12-cap30m-levels
-    "$python" -u -m fireredtts3_local.vox_recipe_levels --output "$dataset"
+    if [[ $operation == --levels ]]; then
+        "$python" -u -m fireredtts3_local.vox_recipe_levels --output "$dataset"
+    elif [[ ! -f "$dataset/level_report.json" ]]; then
+        echo "Missing the levelled dataset used by the LoRA pilot: $dataset" >&2
+        exit 2
+    fi
     data=(--dataset "$dataset")
 fi
 printf -v checkpoint 'step-%04d' "$step"
 shopt -s nullglob
-for mode in lora full; do
+for mode in "${modes[@]}"; do
     if [[ -f "$output/$mode/$checkpoint/checkpoint.json" ]]; then
         continue
     fi
@@ -39,10 +46,16 @@ for mode in lora full; do
     resume=()
     if (( ${#saved[@]} )); then
         resume=(--resume)
+    elif [[ $operation == --resume-levelled-lora ]]; then
+        echo "No saved LoRA checkpoint to resume in $output/$mode" >&2
+        exit 2
     fi
     "$python" -u -m "$module" train "$mode" --output "$output" --until "$step" "${data[@]}" "${resume[@]}"
 done
 compare=("$python" -u -m "$module" compare --output "$output" --step "$step" "${data[@]}")
+if [[ $operation == --resume-levelled-lora ]]; then
+    compare+=(--lora-only)
+fi
 if (( $# == 0 )); then
     "${compare[@]}"
 elif (( levels )); then

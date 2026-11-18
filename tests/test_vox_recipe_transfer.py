@@ -242,6 +242,24 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(result['benchmark_sha256'], report['benchmark_sha256'])
             self.assertEqual(result['compared_to'], str(path))
             self.assertEqual(set(result['results']['full'][0]['delta_vs_unlevelled'].values()), {0.})
+            # Continue LoRA on the same data. There is no Full checkpoint at step 500.
+            later = root/'lora'/'step-0500'
+            later.mkdir()
+            record = json.loads((later.parent/'step-0030'/'checkpoint.json').read_text())
+            record['step'] = 500
+            (later/'checkpoint.json').write_text(json.dumps(record))
+            seen.clear()
+            third = comp.compare(root, root, 500, None, 'stub', 'stub', against=second, lora_only=True)
+            resumed = json.loads(third.read_text())
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(set(resumed['results']), {'base', 'lora'})
+            self.assertEqual(resumed['benchmark_sha256'], result['benchmark_sha256'])
+            self.assertEqual(resumed['reference_step'], 30)
+            case = resumed['results']['lora'][0]
+            self.assertEqual(set(case['delta_vs_previous_step'].values()), {0.})
+            self.assertNotIn('delta_vs_unlevelled', case)
+            with self.assertRaisesRegex(ValueError, 'recipe/selection mismatch'):
+                comp.compare(root, root, 500, None, 'stub', 'stub', against=path, lora_only=True)
             changed_ref = samples * .5
             sf.write(audio, changed_ref, 24000, subtype='FLOAT')
             with self.assertRaisesRegex(ValueError, 'differ from the original comparison'):

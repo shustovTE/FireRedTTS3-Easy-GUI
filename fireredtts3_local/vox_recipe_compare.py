@@ -45,13 +45,14 @@ def default_benchmark(validation):
             for name, text in texts.items() for seed in (1234, 1235)]
 
 
-def compare(dataset, output, step, benchmark, asr, speaker_model, against=None):
+def compare(dataset, output, step, benchmark, asr, speaker_model, against=None, *, lora_only=False):
     from faster_whisper import WhisperModel
     from transformers import AutoFeatureExtractor, WavLMForXVector
     splits, _, selection = paired_data(dataset)
     if model_identity(MODEL_DIR) != BASE_SHA:
         raise ValueError('Compare with the original training base')
-    checkpoints = {mode: output / mode / f'step-{step:04d}' for mode in LR}
+    modes = ('lora',) if lora_only else tuple(LR)
+    checkpoints = {mode: output / mode / f'step-{step:04d}' for mode in modes}
     recipes = {}
     for mode, path in checkpoints.items():
         record = json.loads((path / 'checkpoint.json').read_text())
@@ -62,14 +63,20 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None):
         recipes[mode] = recipe
     previous = None
     if against is not None:
-        if 'original_selection_sha256' not in selection:
-            raise ValueError('--against requires the levelled dataset')
         previous = json.loads(against.read_text(encoding='utf-8'))
-        if not previous['complete'] or previous['step'] != step:
-            raise ValueError('Expected a completed comparison at the same step')
+        if not previous['complete'] or not 0 < previous['step'] <= step:
+            raise ValueError('Expected a completed comparison at the same or an earlier step')
+        if previous['step'] == step:
+            if 'original_selection_sha256' not in selection:
+                raise ValueError('Same-step --against requires the levelled dataset')
+            reference_dataset = selection['original_selection_sha256']
+            delta_field = 'delta_vs_unlevelled'
+        else:
+            reference_dataset = selection['selection_sha256']
+            delta_field = 'delta_vs_previous_step'
         for mode, recipe in recipes.items():
-            expected = dict(recipe, dataset_sha256=selection['original_selection_sha256'])
-            if previous['recipes'][mode] != expected:
+            expected = dict(recipe, dataset_sha256=reference_dataset)
+            if previous['recipes'].get(mode) != expected:
                 raise ValueError(f'Original comparison recipe/selection mismatch for {mode}')
         benchmark = against.parent / 'benchmark.jsonl'
     root = Path(tempfile.mkdtemp(prefix=f'comparison-{step:04d}-', dir=output))
@@ -107,7 +114,8 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None):
                   recipes=recipes, asr=asr, speaker_model=speaker_model, results={})
     if previous:
         report['compared_to'] = str(against.resolve())
-    for mode in ('base', *LR):
+        report['reference_step'] = previous['step']
+    for mode in ('base', *modes):
         folder = root / mode
         folder.mkdir()
         manager = ModelManager()
@@ -141,7 +149,7 @@ def compare(dataset, output, step, benchmark, asr, speaker_model, against=None):
                 result['flags'] = content_flags(result, baseline.get(row['id']))
                 if previous:
                     before = next(r for r in previous['results'][mode] if r['id'] == row['id'])
-                    result['delta_vs_unlevelled'] = {
+                    result[delta_field] = {
                         'wer': result['asr']['wer'] - before['asr']['wer'],
                         **{k: result[k] - before[k] for k in ('end_minus_start_rms_db', 'voice_similarity',
                                                                'final_voice_similarity')}}
