@@ -188,6 +188,15 @@ class TransferTests(unittest.TestCase):
                 self.assertEqual(wanted.keys(), got.keys())
                 for key in wanted:
                     torch.testing.assert_close(wanted[key], got[key], rtol=0, atol=0, msg=key)
+                if mode == 'lora':
+                    # The original already has a later checkpoint. Fork from the explicit pilot.
+                    earlier = root/'pilot'/mode/'step-0001'
+                    transfer.train(root, root/'fork', mode, 2, True, fork_from=earlier,
+                                   shared_features=root/'pilot'/'features')
+                    replayed = tensors('fork')
+                    for key in wanted:
+                        torch.testing.assert_close(wanted[key], replayed[key], rtol=0, atol=0, msg=key)
+                    self.assertFalse((root/'fork'/mode/'step-0001').exists())
 
     def test_compare_uses_same_whole_cases_and_flags_bad_checkpoint(self):
         from fireredtts3_local import vox_recipe_compare as comp

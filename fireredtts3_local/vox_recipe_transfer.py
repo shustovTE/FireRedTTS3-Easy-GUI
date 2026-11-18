@@ -198,7 +198,7 @@ def save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics):
     return path
 
 
-def train(dataset, output, mode, until, resume):
+def train(dataset, output, mode, until, resume, *, fork_from=None, shared_features=None):
     from transformers import get_cosine_schedule_with_warmup
     if not 1 <= until <= TOTAL:
         raise ValueError('--until must be between 1 and 1000')
@@ -216,7 +216,9 @@ def train(dataset, output, mode, until, resume):
     out = output / mode
     out.mkdir(parents=True, exist_ok=True)
     checkpoints = sorted(p for p in out.glob('step-*') if (p / 'checkpoint.json').is_file())
-    prior = checkpoints[-1] if checkpoints else None
+    if checkpoints and fork_from is not None:
+        raise ValueError('Fork into a separate output without existing checkpoints')
+    prior = checkpoints[-1] if checkpoints else fork_from
     start = 0
     if prior:
         saved = json.loads((prior / 'checkpoint.json').read_text())
@@ -239,9 +241,11 @@ def train(dataset, output, mode, until, resume):
         tts.redae.eval().requires_grad_(False)
         tts.spk_extractor.eval().requires_grad_(False)
         cache_dir = output / 'features'
-        cache = FeatureCache(tts, cache_dir, fingerprint, True, 'native')
+        cache = FeatureCache(tts, shared_features or cache_dir, fingerprint, True, 'native')
         if any(not cache.path(row).is_file() for row in rows):
+            # A fork can read the old cache. Any new features belong to the fork.
             precompute_features(tts, rows, cache_dir, fingerprint, precision_policy='native')
+            cache = FeatureCache(tts, cache_dir, fingerprint, True, 'native')
         tts.redae.to('cpu')
         tts.spk_extractor.to('cpu')
         torch.cuda.empty_cache()
