@@ -291,6 +291,7 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
             optimizer.zero_grad(set_to_none=True)
             loss_sum = 0.
             recovery_sum, windows = 0., 0
+            patch_counts = [0] * recovery['prediction_patches'] if recovery and 'prediction_patches' in recovery else None
             for micro in range(ACCUM):
                 _, loaded = next(stream)
                 seed = SEED + (step-1)*ACCUM + micro
@@ -304,7 +305,7 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
                     examples = to_examples(tts, loaded, 'native')
                     with isolated_rng(seed + 100_000):
                         extra, count = vox_recovery.recovery_loss(tts, examples, [r[3] for r in loaded],
-                                                                  seed + 100_000, config=recovery)
+                                                                  seed + 100_000, config=recovery, patch_counts=patch_counts)
                         if not torch.isfinite(extra):
                             raise FloatingPointError(f'Nonfinite recovery loss at update {step}')
                         if count:
@@ -312,8 +313,9 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
                     recovery_sum += float(extra.detach()) / ACCUM
                     windows += count
             if recovery:
+                counts = f' targets_by_hop={patch_counts}' if patch_counts is not None else ''
                 print(f'[recovery] step={step} windows={windows} clean_loss={loss_sum:.6f} '
-                      f'recovery_flow={recovery_sum:.6f}', flush=True)
+                      f'recovery_flow={recovery_sum:.6f}{counts}', flush=True)
                 loss_sum += recovery['weight'] * recovery_sum
             norm = torch.nn.utils.clip_grad_norm_(params, 1., error_if_nonfinite=True)
             optimizer.step()
