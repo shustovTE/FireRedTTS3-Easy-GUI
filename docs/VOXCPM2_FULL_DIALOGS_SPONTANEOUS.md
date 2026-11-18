@@ -71,3 +71,14 @@ tail -n 30 -f training/jobs/voxcpm2-dialogs-spontaneous-full-1000/job.log
 ```
 
 Итоговые веса и логи TensorBoard находятся в `training/outputs/voxcpm2-dialogs-spontaneous-full-1000/`. Для автоматической валидации официальный тренер использует до десяти батчей за проверку.
+
+## Публикация финальных весов
+
+После завершения обучения выполните на Gauss с сохранённым HF-токеном с правом записи в `shustov-te/VoxCPM2-Russian`.
+
+```bash
+cd /opt/firered-tuning
+bash scripts/publish_voxcpm2_dialogs_spontaneous.sh
+```
+
+Скрипт сверяет `step_0001000` с рецептом выполненного задания и берёт перечень корпусов для карточки из отчёта о данных. Локальный экспорт находится в `training/exports/voxcpm2-dialogs-spontaneous-full-1000/`. Скрипт обновляет приватный `main` одним коммитом и проверяет файлы по полученному SHA. Хеш в конце ссылки `Verified private release` можно использовать в параметре `--revision` vLLM Omni. Если идентичная версия уже опубликована, повторный запуск возвращает ссылку на неё.

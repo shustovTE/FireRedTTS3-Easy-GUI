@@ -73,13 +73,27 @@ class VoxCPMReleaseTest(unittest.TestCase):
                   patch.object(release, "verify_source", return_value=root),
                   patch.object(release, "hf_hub_download", return_value=code),
                   patch.object(release, "TOKENIZER_SHA", release.digest(code))):
-                receipt = release.prepare(output, full_checkpoint=checkpoint)
-                self.assertEqual(release.prepare(output, full_checkpoint=checkpoint), receipt)
+                release.write_json(root / "report.json", {"sources": {"dialogs": {}, "spontaneous": {}}})
+                audit = {"schema": release.FULL_SCHEMA, "dataset": str(root), "recipe_sha256": "1" * 64,
+                         "dataset_report_sha256": release.digest(root / "report.json")}
+                recipe = {"save_path": str(root), "num_iters": 1000}
+                recipe_path = root / "recipe.yaml"
+                with patch.object(release, "verify_recipe", return_value=(recipe, audit)) as verify:
+                    receipt = release.prepare(output, full_checkpoint=checkpoint, full_recipe=recipe_path)
+                    self.assertEqual(release.prepare(output, full_checkpoint=checkpoint, full_recipe=recipe_path), receipt)
+                    verify.assert_called_with(recipe_path, check_data=False)
+                    recipe["save_path"] = str(root / "other-run")
+                    with self.assertRaisesRegex(ValueError, "final checkpoint"):
+                        release.prepare(output, full_checkpoint=checkpoint, full_recipe=recipe_path)
             self.assertEqual(receipt["source"]["step"], 1000)
             self.assertEqual(receipt["files"][release.WEIGHTS], release.digest(checkpoint / release.WEIGHTS))
             self.assertEqual({p.name for p in output.iterdir()}, release.PAYLOAD | {release.RECEIPT})
             self.assertNotIn("merge", receipt)
-            self.assertIn("Full fine-tuning", (output / "README.md").read_text())
+            card = (output / "README.md").read_text()
+            self.assertIn("Full fine-tuning", card)
+            self.assertIn("Dialogs and Russian Common Voice Spontaneous", card)
+            self.assertNotIn("Scripted", card)
+            self.assertEqual(receipt["source"]["dataset_report_sha256"], audit["dataset_report_sha256"])
 
             changed = {release.WEIGHTS, "README.md", release.RECEIPT}
             def snapshot(sha, modified):

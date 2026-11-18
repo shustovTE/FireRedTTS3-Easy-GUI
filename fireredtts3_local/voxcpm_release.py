@@ -16,8 +16,9 @@ import torch
 
 from .release import matches_hub_file, remote_matches
 from .voxcpm_eval import adapter_info, full_checkpoint_info
-from .voxcpm_training import (DEFAULT_MODEL, DEFAULT_SOURCE, LORA, MODEL_FILES, MODEL_ID, MODEL_MARKER,
-                              MODEL_REVISION, ROOT, digest, verify_model, verify_source, write_json)
+from .voxcpm_training import (DEFAULT_MODEL, DEFAULT_SOURCE, FULL_SCHEMA, LORA, MODEL_FILES, MODEL_ID,
+                              MODEL_MARKER, MODEL_REVISION, ROOT, digest, verify_model, verify_recipe,
+                              verify_source, write_json)
 
 CHECKPOINT = ROOT / "training/outputs/voxcpm2-ru-lora/latest"
 OUTPUT = ROOT / "training/exports/VoxCPM2-Russian"
@@ -28,6 +29,8 @@ TOKENIZER_CODE = "tokenization_voxcpm2.py"
 TOKENIZER_SHA = "84489ea32b6ee0cae22ed5480cacb6df85c46624c3119be9a2021c3649a12729"
 PAYLOAD = {*MODEL_FILES, TOKENIZER_CODE, "README.md", "UPSTREAM_MODEL_CARD.md", "LICENSE"}
 RECEIPT = "export_provenance.json"
+CORPUS_NAMES = {"dialogs": "Dialogs", "spontaneous": "Russian Common Voice Spontaneous",
+                "scripted": "Russian Common Voice Scripted"}
 
 
 def merge_weights(base, adapter, config, output):
@@ -74,7 +77,9 @@ def merge_weights(base, adapter, config, output):
     return {"target_layers": len(targets), "changed_layers": changed}
 
 
-def prepare(output, *, full_checkpoint=None):
+def prepare(output, *, full_checkpoint=None, full_recipe=None):
+    if full_recipe is not None and full_checkpoint is None:
+        raise ValueError("A Full recipe needs its final Full checkpoint")
     verify_model(DEFAULT_MODEL)
     source = verify_source(DEFAULT_SOURCE)
     base_receipt = json.loads((DEFAULT_MODEL / MODEL_MARKER).read_text())
@@ -89,6 +94,17 @@ def prepare(output, *, full_checkpoint=None):
     else:
         checkpoint, step, trained = full_checkpoint_info(full_checkpoint, DEFAULT_MODEL, base_receipt["files"])
         identity.update(step=step, training_mode="full", weights_sha256=trained[WEIGHTS])
+        if full_recipe is not None:
+            recipe, audit = verify_recipe(full_recipe, check_data=False)
+            if (audit["schema"] != FULL_SCHEMA or Path(recipe["save_path"]) != checkpoint.parent
+                    or recipe["num_iters"] != step):
+                raise ValueError("The supplied checkpoint must be the final checkpoint of this Full recipe")
+            report = json.loads((Path(audit["dataset"]) / "report.json").read_text(encoding="utf-8"))
+            corpora = sorted(report["sources"])
+            if not corpora or set(corpora) - CORPUS_NAMES.keys():
+                raise ValueError("Unknown training corpus in the audited dataset report")
+            identity.update(corpora=corpora, dataset_report_sha256=audit["dataset_report_sha256"],
+                            recipe_sha256=audit["recipe_sha256"])
     if output.exists():
         receipt = json.loads((output / RECEIPT).read_text())
         if (receipt["source"] != identity or set(receipt["files"]) != PAYLOAD
@@ -116,10 +132,13 @@ def prepare(output, *, full_checkpoint=None):
                 raise ValueError("Adapter changed during export")
             receipt["merge"] = stats
             training = f"Russian LoRA merged into {stats['target_layers']} layers after {STEP} updates"
+            training += " on Dialogs, Russian Common Voice Spontaneous and Scripted"
         else:
             print(f"Copying full checkpoint, step {step} ...", flush=True)
             shutil.copyfile(checkpoint / WEIGHTS, staging / WEIGHTS)
             training = f"Full fine-tuning from the original base for {step} optimizer updates"
+            if "corpora" in identity:
+                training += " on " + " and ".join(CORPUS_NAMES[k] for k in identity["corpora"])
         files = {k: digest(staging / k) for k in sorted(PAYLOAD - {"README.md"})}
         if full_checkpoint is not None and files[WEIGHTS] != trained[WEIGHTS]:
             raise ValueError("Exported weights differ from the full checkpoint")
@@ -129,8 +148,7 @@ def prepare(output, *, full_checkpoint=None):
             f"---\nlanguage: [ru]\nbase_model: {MODEL_ID}\npipeline_tag: text-to-speech\n"
             "library_name: voxcpm\nlicense: apache-2.0\n---\n\n# VoxCPM2 Russian\n\n"
             f"Complete VoxCPM2 checkpoint derived from {MODEL_ID} at `{MODEL_REVISION}`. "
-            f"{training} on Dialogs, "
-            "Russian Common Voice Spontaneous and Scripted. AudioVAE and tokenizer are from the base. "
+            f"{training}. AudioVAE and tokenizer are from the base. "
             "Use as a standalone VoxCPM2 model, including with vLLM-Omni. "
             "See UPSTREAM_MODEL_CARD.md for base model attribution and usage.\n", encoding="utf-8")
         files["README.md"] = digest(staging / "README.md")
@@ -179,6 +197,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--full-checkpoint", type=Path, help="Official full fine-tuning checkpoint directory")
+    parser.add_argument("--full-recipe", type=Path, help="Audited recipe to identify the final checkpoint and training corpora")
     parser.add_argument("--expected-parent", help="Current private main commit for a full checkpoint update")
     parser.add_argument("--publish", action="store_true", help=f"Upload to private {DESTINATION}")
     args = parser.parse_args()
@@ -191,7 +210,7 @@ def main():
     output = (args.output or default_output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(output) + ".lock"):
-        receipt = prepare(output, full_checkpoint=args.full_checkpoint)
+        receipt = prepare(output, full_checkpoint=args.full_checkpoint, full_recipe=args.full_recipe)
         print(f"Complete model: {output} (step {receipt['source']['step']})", flush=True)
         if args.publish:
             commit = upload_private(output, HfApi(token=True), expected_parent=args.expected_parent)
