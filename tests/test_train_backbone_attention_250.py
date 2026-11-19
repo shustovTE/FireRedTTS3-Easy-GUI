@@ -11,29 +11,82 @@ from fireredtts3_local import train_backbone_attention_250 as job
 from test_training_batch import tiny_core
 
 
+def prepare_pilots(source):
+    reference = source/'voice.wav'
+    sf.write(reference, np.zeros(800), 16000)
+    specs = [[(text, s) for text in ('question', 'cities', 'timofey') for s in (1234, 1235)],
+             [('cities', s) for s in range(1236, 1240)]]
+    for folder, controls in zip(job.PILOTS, specs, strict=True):
+        pilot = source/folder
+        pilot.mkdir()
+        cases = [dict(id=f'{text}_seed{seed}', text=text, seed=seed, reference_audio=str(reference),
+                      reference_text='Голос.') for text, seed in controls]
+        benchmark = pilot/'benchmark.jsonl'
+        benchmark.write_text('\n'.join(map(json.dumps, cases)))
+        _, digest = job.load_benchmark(benchmark)
+        baseline = [dict(c, asr={'wer': 0}, voice_similarity=1, final_voice_similarity=1,
+                         end_minus_start_rms_db=0) for c in cases]
+        job.write_json(pilot/'report.json', dict(complete=True, settings=job.listening.SETTINGS,
+            recipes={'lora': job.vox_recipe_transfer.transfer_recipe('lora', 'data')},
+            benchmark_sha256=digest, results={'base': baseline}))
+
+
 class BackboneRunTests(unittest.TestCase):
+    def test_stronger_resonant_starts_from_base_and_renders_only_after_500(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            prepare_pilots(source)
+            output = source/job.STRONG_RUN
+            profile = dict(job.vox_recovery.RESONANT, weight=.30)
+            # Existing clean checkpoints, including 500, must not be resumed.
+            for name, step in [(job.RUN, 250), (job.CONTINUATION, 500)]:
+                old = source/name/'lora'/f'step-{step:04d}'
+                old.mkdir(parents=True)
+                (old/'checkpoint.json').write_text('{}')
+
+            def train(dataset, out, mode, until, *, resume, **kwargs):
+                self.assertEqual((out, mode, until), (output, 'lora', 500))
+                self.assertEqual(kwargs, dict(fork_from=None, shared_features=source/'features', recovery=profile,
+                    backbone_only=True, checkpoint_steps=(100, 250), expected_dataset_sha256='data'))
+                replay = json.loads((out/'replay.json').read_text())
+                self.assertEqual(replay['recipe']['acoustic_recovery'], profile)
+                self.assertEqual(replay['recipe']['recovery_start_step'], 0)
+                self.assertNotIn('rise_gate', replay['recipe'])
+                self.assertEqual(replay['audio_steps'], [500])
+                self.assertNotIn('parent_checkpoint', replay)
+                self.assertEqual(resume, (out/'lora/step-0250/checkpoint.json').exists())
+                step = 500 if resume else 250
+                checkpoint = out/'lora'/f'step-{step:04d}'
+                checkpoint.mkdir(parents=True)
+                job.write_json(checkpoint/'checkpoint.json', dict(step=step, recipe=replay['recipe']))
+                if step == 250:
+                    raise InterruptedError
+                (checkpoint/'adapter_config.json').write_text('{}')
+                (checkpoint/'adapter_model.safetensors').write_bytes(b'weights')
+
+            with (patch.object(job.vox_recipe_transfer, 'train', side_effect=train) as trainer,
+                  patch.object(job.listening, 'render') as render):
+                with self.assertRaises(ValueError):
+                    job.run(source, source/'data', continue_to_500=True, stronger_recovery_loss=True)
+                trainer.assert_not_called()
+                with self.assertRaises(InterruptedError):
+                    job.run(source, source/'data', stronger_recovery_loss=True)
+                render.assert_not_called()
+                job.run(source, source/'data', stronger_recovery_loss=True)
+                render.assert_called_once()
+                path, plan = render.call_args.args
+                self.assertEqual(path, output/'audio/step-0500/backbone-complete')
+                self.assertEqual(list(plan['checkpoints']), ['step-0500'])
+                self.assertEqual(plan['variants'], ['backbone'])
+                self.assertFalse(plan['include_base'])
+                self.assertEqual(len(plan['cases']), 58)
+
     def test_interrupted_training_has_no_audio_then_renders_only_final_suite(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp)
             dataset = source/'data'
             run = source/job.RUN
-            reference = source/'voice.wav'
-            sf.write(reference, np.zeros(800), 16000)
-            specs = [[(text, s) for text in ('question', 'cities', 'timofey') for s in (1234, 1235)],
-                     [('cities', s) for s in range(1236, 1240)]]
-            for folder, controls in zip(job.PILOTS, specs, strict=True):
-                pilot = source/folder
-                pilot.mkdir()
-                cases = [dict(id=f'{text}_seed{seed}', text=text, seed=seed, reference_audio=str(reference),
-                              reference_text='Голос.') for text, seed in controls]
-                benchmark = pilot/'benchmark.jsonl'
-                benchmark.write_text('\n'.join(map(json.dumps, cases)))
-                _, digest = job.load_benchmark(benchmark)
-                baseline = [dict(c, asr={'wer': 0}, voice_similarity=1, final_voice_similarity=1,
-                                 end_minus_start_rms_db=0) for c in cases]
-                job.write_json(pilot/'report.json', dict(complete=True, settings=job.listening.SETTINGS,
-                    recipes={'lora': job.vox_recipe_transfer.transfer_recipe('lora', 'data')},
-                    benchmark_sha256=digest, results={'base': baseline}))
+            prepare_pilots(source)
 
             def train(data, out, mode, until, *, resume, **kwargs):
                 self.assertIn(until, (250, 500))

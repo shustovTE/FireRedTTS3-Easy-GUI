@@ -1,4 +1,4 @@
-"""Train backbone Q/K/V/O LoRA to 250 or continue its saved state from 250 to 500."""
+"""Train FireRed backbone Q/K/V/O LoRA and render the listening set at the final step."""
 import argparse
 import json
 from importlib.metadata import version
@@ -20,6 +20,7 @@ SOURCE = ROOT / (vox_recipe_transfer.OUTPUT + '-levels')
 PILOTS = ('comparison-0030-yrslvj2s', 'comparison-0030-ql21g14n')
 RUN = 'lora-backbone-only-recovery-4patch-0250'
 CONTINUATION = 'lora-backbone-only-recovery-4patch-0500'
+STRONG_RUN = 'lora-backbone-only-recovery-4patch-0500-resonant-w030'
 
 
 def check_step(checkpoint, step, recipe):
@@ -28,10 +29,19 @@ def check_step(checkpoint, step, recipe):
         raise ValueError(f'Unexpected backbone-only checkpoint at step {step}: {checkpoint}')
 
 
-def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_500=False):
+def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_500=False, stronger_recovery_loss=False):
+    if continue_to_500 and stronger_recovery_loss:
+        raise ValueError('The stronger resonant recipe starts from Base and has its own checkpoints')
     source, dataset = Path(source).resolve(), Path(dataset).resolve()
-    final_step = 500 if continue_to_500 else 250
-    output = source / (CONTINUATION if continue_to_500 else RUN)
+    final_step = 500 if continue_to_500 or stronger_recovery_loss else 250
+    run_name = CONTINUATION if continue_to_500 else RUN
+    recovery = vox_recovery.FOUR_PATCH
+    checkpoint_steps = [100, 250]
+    if stronger_recovery_loss:
+        run_name = STRONG_RUN
+        recovery = vox_recovery.STRONGER_RESONANT
+        checkpoint_steps = [100, 250, 500]
+    output = source / run_name
     output.mkdir(parents=True, exist_ok=True)
     with FileLock(str(output / '.run.lock'), timeout=0):
         controls, datasets = [], set()
@@ -48,8 +58,9 @@ def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_5
         plan['adapter_profile'] = BACKBONE_ATTENTION
         dataset_sha = datasets.pop()
         recipe = dict(vox_recipe_transfer.transfer_recipe('lora', dataset_sha), adapter_profile=BACKBONE_ATTENTION,
-                      acoustic_recovery=vox_recovery.FOUR_PATCH, recovery_start_step=0)
-        replay = dict(recipe=recipe, checkpoint_steps=[100, 250], audio_steps=[250], listening_plan=plan)
+                      acoustic_recovery=recovery, recovery_start_step=0)
+        replay = dict(recipe=recipe, checkpoint_steps=checkpoint_steps, audio_steps=[checkpoint_steps[-1]],
+                      listening_plan=plan)
         parent = None
         if continue_to_500:
             parent = source / RUN / 'lora' / 'step-0250'
@@ -70,11 +81,12 @@ def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_5
             write_json(manifest, replay)
 
         local_resume = any((output / 'lora').glob('step-*/checkpoint.json'))
-        print(f'[backbone] Target step {final_step}, weights at {replay["checkpoint_steps"]}, '
+        print(f'[backbone] {recovery["schema"]}, recovery weight {recovery["weight"]:.2f}. '
+              f'Target step {final_step}, weights at {replay["checkpoint_steps"]}, '
               f'{len(plan["cases"])} WAVs at {final_step}.', flush=True)
         vox_recipe_transfer.train(dataset, output, 'lora', final_step, resume=local_resume or parent is not None,
                                   fork_from=None if local_resume else parent, shared_features=source / 'features',
-                                  recovery=vox_recovery.FOUR_PATCH, backbone_only=True,
+                                  recovery=recovery, backbone_only=True,
                                   checkpoint_steps=tuple(replay['checkpoint_steps'][:-1]),
                                   expected_dataset_sha256=dataset_sha)
         checkpoint = output / 'lora' / f'step-{final_step:04d}'
@@ -87,6 +99,10 @@ def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_5
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--continue-to-500', action='store_true',
-                        help='Restore the completed backbone-only step 250 and train updates 251 through 500.')
-    run(continue_to_500=parser.parse_args().continue_to_500)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--continue-to-500', action='store_true',
+                      help='Restore the completed backbone-only step 250 and train updates 251 through 500.')
+    mode.add_argument('--stronger-recovery-loss', action='store_true',
+                      help='Start from Base, train 500 steps with resonant history and recovery weight 0.30, '
+                           'and render the listening WAVs only at step 500.')
+    run(**vars(parser.parse_args()))

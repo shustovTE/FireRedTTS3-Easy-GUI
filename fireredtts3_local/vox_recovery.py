@@ -23,6 +23,7 @@ RESONANT = dict(schema='wav-prefix-resonances-v1', weight=.15, gain_db=[3., 6.],
                 bell_gain_db=[6., 15.], trough_hz=[3850, 4150], trough_gain_db=[-16., -8.],
                 trough_q_range=[2.5, 4.], ramp_range_patches=[24, 100],
                 resonance_probability=.5, gain_only_ramp_patches=8)
+STRONGER_RESONANT = dict(RESONANT, weight=.30)
 
 
 def read_prefix(path, samples, padded_length, stride, rate):

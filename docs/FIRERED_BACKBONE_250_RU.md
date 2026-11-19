@@ -100,3 +100,29 @@ pack="$run/audio/step-0500/backbone-complete"
 ls "$run/lora/step-0500/adapter_model.safetensors"
 jq '{audio_complete, asr_complete, wavs: (.results | length)}' "$pack/report.json"
 ```
+
+### От Base до 500 с усиленным восстановлением после резонансов
+
+`--stronger-recovery-loss` запускает отдельную LoRA rank 32 на Q/K/V/O backbone исходной Base. Чтобы имитировать измеренный «металл», в половине окон восстановления код постепенно поднимает громкость на 3–6 дБ и усиливает узкие полосы 2,20–2,27, 2,95–2,985 и 5,09–5,31 кГц с провалом в области 3,85–4,15 кГц. Для остальных окон используется только нарастание громкости. Целевые патчи берутся из чистой записи. Модель учится продолжать фразу после такой истории на горизонте до четырёх патчей. Вес ошибки восстановления повышен с 0,15 до 0,30. Каждое обновление применяется.
+
+```bash
+cd /opt/firered-tuning
+git pull --ff-only origin feat/russian-tts-adaptation
+mkdir -p training/logs
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 nohup .venv/bin/python -u \
+  -m fireredtts3_local.train_backbone_attention_250 --stronger-recovery-loss \
+  >> training/logs/firered-backbone-resonant-w030-500.log 2>&1 < /dev/null &
+```
+
+```bash
+tail -n 30 -f /opt/firered-tuning/training/logs/firered-backbone-resonant-w030-500.log
+```
+
+При первом запуске в логе появятся `wav-prefix-resonances-v1, recovery weight 0.30` и `updates 1..500`. На шагах 100 и 250 сохраняются веса и состояние обучения для перезапуска той же командой. После шага 500 записываются те же 58 WAV, затем Whisper считает WER. Сравнивать с обычным backbone-only на шаге 500 удобно по одноимённым файлам в `controls/` и `listening-ru-calls/long/`.
+
+```bash
+cd /opt/firered-tuning
+run=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-backbone-only-recovery-4patch-0500-resonant-w030
+pack="$run/audio/step-0500/backbone-complete"
+jq '{audio_complete, asr_complete, wavs: (.results | length)}' "$pack/report.json"
+```

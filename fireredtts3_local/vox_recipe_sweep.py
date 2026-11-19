@@ -31,7 +31,7 @@ def fresh_recovery(dataset, source, reports, *, stronger_comb=False, four_patch=
     if resonant:
         if not four_patch or stronger_comb:
             raise ValueError('Resonant history needs four-patch recovery from Base')
-        config = dict(vox_recovery.RESONANT, weight=.30 if stronger_recovery_loss else .15)
+        config = vox_recovery.STRONGER_RESONANT if stronger_recovery_loss else vox_recovery.RESONANT
     print(f"[sweep] Recovery from original Base, updates 1–{steps[-1]}, recipe={config}. "
           "Checking saved Base results and training data.", flush=True)
     reports = [p.resolve() for p in reports]
