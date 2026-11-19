@@ -122,6 +122,28 @@ def series_plan(series):
                 runtime={p:version(p) for p in ('torch','torchaudio','peft','transformers')})
 
 
+def listening_plan(folder):
+    """Use the checkpoint, active variant and first case's voice from a saved listening series."""
+    if folder.name not in VARIANTS:
+        raise ValueError('Expected a backbone, dit or both folder inside a saved listening series')
+    plan = series_plan(folder.parent)
+    saved = json.loads((folder/'report.json').read_text(encoding='utf-8'))['plan']
+    if (saved['variants'] != [folder.name] or saved['checkpoints'] != plan['checkpoints']
+            or saved['benchmark_sha256'] != plan['benchmark_sha256']):
+        raise ValueError(f'Saved variant, checkpoint or benchmark differs from {folder}')
+    first = plan['cases'][0]
+    reference = {key: first[key] for key in ('reference_audio', 'reference_sha256', 'reference_text', 'language')}
+    phrases = json.loads((ROOT/'examples/diagnostics/listening-ru-calls.json').read_text(encoding='utf-8'))
+    cases = []
+    for length in ('short', 'long'):
+        for name, text in phrases[length].items():
+            for seed in (1236, 1237):
+                stem = f'{name}-seed{seed}'
+                cases.append(dict(id=f'{length}-{stem}', text=text, seed=seed, filename=f'{length}/{stem}.wav'))
+    return dict(plan, schema='series-listening-calls-v1', variants=[folder.name], reference=reference,
+                reference_case=first['id'], cases=cases)
+
+
 def generate(root, plan, report):
     results = report['results']
     stages = list(plan['checkpoints'])
@@ -135,7 +157,6 @@ def generate(root, plan, report):
             for variant in (('base',) if checkpoint is None else plan['variants']):
                 group = 'base' if checkpoint is None else f'{label}/{variant}'
                 folder = Path() if 'series' in plan else Path(group)
-                (root/folder).mkdir(parents=True, exist_ok=True)
                 pending = []
                 for case in plan['cases']:
                     name = (folder / case.get('filename', f"{case['id']}.wav")).as_posix()
@@ -155,6 +176,7 @@ def generate(root, plan, report):
                     measured = levels(samples, rate)
                     scores = contrast_windows(samples, rate)
                     wav = root/name
+                    wav.parent.mkdir(parents=True, exist_ok=True)
                     tmp = wav.with_suffix('.tmp.wav')
                     sf.write(tmp, samples, rate, subtype='FLOAT')
                     tmp.replace(wav)
@@ -241,12 +263,18 @@ def main():
                         help='Compare only the two DiT adapters on the original cities and timofey texts')
     mode.add_argument('--series', '--dit-series', type=Path,
                       help='Replay an existing series-N or series-N/lora folder (default variant: dit)')
+    mode.add_argument('--listen-from', type=Path, metavar='VARIANT_DIR',
+                      help='Generate new short and long calls using the voice and adapter of a saved series variant')
     parser.add_argument('--variants', nargs='+', choices=VARIANTS,
                         help='LoRA components to enable in separate renders of --series')
     parser.add_argument('--audio-only', action='store_true', help='Save WAVs and spectral results; skip Whisper')
     args = parser.parse_args()
     if args.variants and not args.series:
         parser.error('--variants requires --series')
+    if args.listen_from:
+        folder = args.listen_from.resolve()
+        render((args.output or folder/'listening').resolve(), listening_plan(folder), args.audio_only)
+        return
     if args.series:
         series = args.series.resolve()
         if series.name == 'lora':

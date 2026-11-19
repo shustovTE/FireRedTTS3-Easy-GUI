@@ -437,3 +437,14 @@ run=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-base-recovery-4pat
 ```
 
 В `series-2/backbone/` появятся записи с LoRA только в backbone. В `series-2/both/` обе части адаптера включены, как и в исходных записях `series-2/lora/`. В каждой папке номера WAV соответствуют тем же примерам в `series-2/dit/`.
+
+Чтобы услышать backbone шага 500 на новых репликах, передайте программе папку этого варианта.
+
+```bash
+cd /opt/firered-tuning
+run=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-base-recovery-4patch-0500
+.venv/bin/python -u -m fireredtts3_local.vox_attention_ablation \
+  --listen-from "$run/audio/step-0500/series-2/backbone" --audio-only
+```
+
+Папки `backbone/listening/short/` и `backbone/listening/long/` содержат соответственно 16 и 8 WAV. Двенадцать фраз из `examples/diagnostics/listening-ru-calls.json` генерируются целиком с seed 1236 и 1237. Голос и транскрипт референса берутся из первого примера серии. Тексты, seed и пути к файлам записаны в `listening/report.json`, фактические длительности — в `listening/summary.csv`.

@@ -73,6 +73,29 @@ class AblationTests(unittest.TestCase):
                 with patch('sys.argv', ['ablation', '--dit-series', str(originals), '--audio-only']):
                     ablate.main()
                 self.assertEqual(gen.call_count, 4)
+                backbone = series/'backbone'
+                saved_report = (backbone/'report.json').read_bytes()
+                route.reset_mock()
+                gen.reset_mock()
+                with patch('sys.argv', ['ablation', '--listen-from', str(backbone), '--audio-only']):
+                    ablate.main()
+                    ablate.main()
+                route.assert_called_once_with(manager.return_value.load_base.return_value.tts_core, 'backbone')
+                pack = backbone/'listening'
+                self.assertEqual(len(list((pack/'short').glob('*.wav'))), 16)
+                self.assertEqual(len(list((pack/'long').glob('*.wav'))), 8)
+                plan = json.loads((pack/'report.json').read_text())['plan']
+                self.assertEqual(plan['reference_case'], rows[0]['id'])
+                self.assertEqual(plan['checkpoints']['step-0500']['path'], str(ckpt))
+                self.assertEqual(len(gen.call_args_list), 24)
+                for call, case in zip(gen.call_args_list, plan['cases'], strict=True):
+                    generated = call.args[1]
+                    self.assertEqual((generated['text'], generated['seed']), (case['text'], case['seed']))
+                    self.assertIn(generated['seed'], (1236, 1237))
+                    for key in ('reference_audio', 'reference_text', 'language'):
+                        self.assertEqual(generated[key], rows[0][key])
+                    self.assertFalse(call.kwargs['settings']['do_split'])
+                self.assertEqual((backbone/'report.json').read_bytes(), saved_report)
                 sf.write(rows[0]['reference_audio'], np.ones(1000), 24000)
                 with self.assertRaisesRegex(ValueError, 'benchmark or reference'):
                     ablate.series_plan(series)
