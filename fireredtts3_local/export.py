@@ -50,7 +50,7 @@ def validate_export_config(core, template):
         raise ValueError("SGLang/backbone config mismatch: rope_theta")
 
 
-def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, log=print):
+def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, backbone_only=False, log=print):
     from safetensors import safe_open
     from .model_manager import ModelManager
     from .training_objective import adapter_targets, validate_adapter_targets, dense_targets
@@ -68,6 +68,8 @@ def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, l
     metadata = json.loads((adapter / "firered_lora_metadata.json").read_text())
     config = json.loads((adapter / "adapter_config.json").read_text())
     profile = metadata.get("recipe", {}).get("options", {}).get("profile")
+    if backbone_only and profile != "vox_attention":
+        raise ValueError("Selective backbone merge requires a vox_attention checkpoint")
     initial = initial_adapter_info(adapter, config["r"], config["lora_alpha"], config["lora_dropout"], profile)
     log("[export] Checking original base/tokenizer fingerprint")
     if metadata.get("base_fingerprint") != model_identity(base):
@@ -97,6 +99,11 @@ def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, l
     from .hybrid import load_adapter
     model = load_adapter(core, adapter)
     model.eval()
+    merge_targets = targets
+    if backbone_only:
+        from .vox_attention_ablation import route
+        route(model, "backbone")  # The same forward path used for the listening WAVs.
+        merge_targets = [name for name in targets if name.startswith("backbone_llm.")]
     # Full modules are independently serialized by PEFT. Check their exact
     # tensors after merge as well as the existing LoRA forward probes.
     dense = dense_targets(profile)
@@ -112,7 +119,12 @@ def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, l
             layer = model.get_base_model().get_submodule(name)
             x = torch.randn(2, layer.in_features, generator=generator) * .1
             probes[name] = (x, layer(x).clone())
-    log(f"[export] Merging {len(targets)} LoRA modules in FP32 on CPU")
+    if backbone_only:
+        # PEFT can merge disabled adapters too. Remove their wrappers before merging.
+        for name in set(targets) - set(merge_targets):
+            layer = core.get_submodule(name)
+            core.set_submodule(name, layer.get_base_layer())
+    log(f"[export] Merging {len(merge_targets)} LoRA modules in FP32 on CPU")
     merged = model.merge_and_unload(safe_merge=True)
     actual = {k: tuple(v.shape) for k, v in merged.state_dict().items()}
     if actual != expected:
@@ -127,9 +139,11 @@ def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, l
     if any(final.get(key) != value for key, value in dense_expected.items()):
         raise ValueError("Merge changed or lost trained dense-module tensors")
     changed = {key for key in original if original[key] != final[key]}
-    allowed = {name + ".weight" for name in targets} | set(dense_expected)
+    allowed = {name + ".weight" for name in merge_targets} | set(dense_expected)
     if changed - allowed:
         raise ValueError("Merge changed weights outside the declared LoRA target modules")
+    if backbone_only and not changed:
+        raise ValueError("The selected backbone LoRA made no change to the base weights")
     provenance = {"base": str(base.resolve()), "adapter": str(adapter.resolve()),
                   "sglang_config_sha256": file_digest(sglang_config), "base_fingerprint": metadata["base_fingerprint"],
                   "merged_tensor_count": len(actual),
@@ -141,6 +155,9 @@ def export_merged(base, adapter, sglang_config, output, *, tokenizer_dir=None, l
                   "merge_dtype": "float32", "saved_tensor_hashes_verified": True,
                   "sglang_runtime_validated": False,
                   "note": "FP32 PEFT layer probes passed. End-to-end GPU/SGLang synthesis parity is not asserted."}
+    if backbone_only:
+        provenance.update(merged_variant="backbone", merged_lora_modules=len(merge_targets),
+                          checkpoint_step=metadata.get("step"))
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".merge-", dir=output.parent) as temporary:
         staging = Path(temporary) / "model"

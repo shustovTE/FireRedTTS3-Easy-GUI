@@ -448,3 +448,14 @@ run=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-base-recovery-4pat
 ```
 
 Папки `backbone/listening/short/` и `backbone/listening/long/` содержат соответственно 16 и 8 WAV. Двенадцать фраз из `examples/diagnostics/listening-ru-calls.json` генерируются целиком с seed 1236 и 1237. Голос и транскрипт референса берутся из первого примера серии. Тексты, seed и пути к файлам записаны в `listening/report.json`, фактические длительности — в `listening/summary.csv`.
+
+### Публикация выбранного backbone шага 500
+
+На Gauss войдите в Hugging Face под `shustov-te` с правом записи в приватный `shustov-te/FireRedTTS3-Base-Russian`. Если вход уже выполнен, запустите команду из репозитория.
+
+```bash
+cd /opt/firered-tuning
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 .venv/bin/python -u -m fireredtts3_local.publish_backbone
+```
+
+Команда сверяет контрольные суммы адаптера с отчётом `lora-base-recovery-4patch-0500/audio/step-0500/series-2/backbone/report.json`, сливает на CPU только LoRA внимания backbone и проверяет тензоры полного пакета для SGLang Omni. Публикация создаёт коммит в `main` существующего приватного репозитория. Повтор после обрыва загрузки использует уже собранный пакет. Новый SHA и ссылка на проверенную ревизию сохраняются в `training/exports/FireRedTTS3-Base-Russian-4patch-0500-backbone.published.json`.

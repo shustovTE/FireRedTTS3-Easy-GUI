@@ -169,6 +169,11 @@ The adaptation profile is `{provenance['profile']}`. Fully trained modules inclu
 in the merge: `{provenance.get('dense_modules', [])}`. Training audio, reference recordings,
 optimizer state and authentication credentials are not part of this release.
 """
+    if provenance.get("merged_variant") == "backbone":
+        text += ("\nThe listening variant uses only backbone attention LoRA. "
+                 "All DiT tensors match the original Base.\n")
+        if provenance.get("checkpoint_step") is not None:
+            text += f"The training checkpoint was saved at step {provenance['checkpoint_step']}.\n"
     if evaluation is not None:
         text += f"""
 ## Reported evaluation before merging
@@ -244,7 +249,8 @@ def validated_manifest_files(manifest):
 
 
 def build_release(base, adapter, output, *, template_repo=TEMPLATE_REPO, template_revision=TEMPLATE_REVISION,
-                  template_cache=".runtime/export-templates", evaluation_baseline=None, evaluation_adapted=None, log=print):
+                  template_cache=".runtime/export-templates", evaluation_baseline=None, evaluation_adapted=None,
+                  backbone_only=False, log=print):
     from filelock import FileLock
     from .evaluation import compare_reports
     base, adapter, output = Path(base).resolve(), Path(adapter).resolve(), Path(output).resolve()
@@ -252,6 +258,8 @@ def build_release(base, adapter, output, *, template_repo=TEMPLATE_REPO, templat
         raise ValueError("Export output must not exist")
     if bool(evaluation_baseline) != bool(evaluation_adapted):
         raise ValueError("Supply both baseline and adapted evaluation reports, or neither")
+    if backbone_only and evaluation_adapted:
+        raise ValueError("Full-adapter evaluation reports cannot describe a selective backbone merge")
     # Check the local adapter before any Hub requests or large base hashing.
     for name in ("adapter_config.json", "adapter_model.safetensors", "firered_lora_metadata.json"):
         if not (adapter / name).is_file():
@@ -271,7 +279,8 @@ def build_release(base, adapter, output, *, template_repo=TEMPLATE_REPO, templat
             evaluation = compare_reports(evaluation_baseline, evaluation_adapted)
         with tempfile.TemporaryDirectory(prefix=".release-", dir=output.parent) as temporary:
             staging = Path(temporary) / "package"
-            export_merged(base, adapter, template / "config.json", staging, tokenizer_dir=template, log=log)
+            export_merged(base, adapter, template / "config.json", staging, tokenizer_dir=template,
+                          backbone_only=backbone_only, log=log)
             for name in ("redae/model.safetensors", "campp/campplus_voxceleb.bin"):
                 if file_digest(staging / name) != verified[name]["sha256"]:
                     raise ValueError(f"Copied acoustic asset differs from the verified template: {name}")
@@ -401,7 +410,7 @@ def publish_release(output, repo_name="FireRedTTS3-Base-Russian", *, public=Fals
                 commit_message=f"Publish merged FireRedTTS3 release {manifest['release_id'][:12]}")
         commit = result.oid
         info = api.model_info(repo_id, revision=commit, files_metadata=True)
-        if not remote_matches(info, root, names):
+        if info.private != (not public) or info.sha != commit or not remote_matches(info, root, names):
             raise ValueError("Hub commit exists but remote content verification failed; inspect before serving")
     result = {"repo_id": repo_id, "url": f"https://huggingface.co/{repo_id}", "commit": commit,
               "revision_url": f"https://huggingface.co/{repo_id}/tree/{commit}", "public": public,

@@ -124,6 +124,79 @@ class ReleaseTests(unittest.TestCase):
                 prepare_template(self.base, TEMPLATE_REPO, TEMPLATE_REVISION, self.root / "cache", lambda _: None)
             download.assert_not_called()
 
+    def test_private_step500_release_matches_backbone_route_of_joint_adapter(self):
+        from fireredtts3.llm.fireredtts3_base import FireRedTTS3BaseCore
+        from fireredtts3_local import publish_backbone as selected
+
+        self.build("previous")
+        old = self.root / "previous"
+        run, out = self.root / "run", self.root / "selected"
+        ckpt = run / "lora/step-0500"
+        listen = run / "audio/step-0500/series-2/backbone"
+        listen.mkdir(parents=True)
+        base_id = model_identity(self.base)
+        recipe = dict(mode="lora", base_sha256=base_id, acoustic_recovery=selected.FOUR_PATCH)
+        core = FireRedTTS3BaseCore.from_pretrained(self.base / "fireredtts3_base")
+        names = adapter_targets(core, "vox_attention")
+        model = get_peft_model(core, LoraConfig(r=2, lora_alpha=4, target_modules=names))
+        expected = dict(self.original)
+        for name in names:
+            layer = core.get_submodule(name)
+            layer.lora_B["default"].weight.data.fill_(.04)
+            if name.startswith("backbone_llm."):
+                key = name + ".weight"
+                expected[key] = self.original[key] + layer.get_delta_weight("default").detach()
+        model.save_pretrained(ckpt)
+        write_json(ckpt/"checkpoint.json", dict(step=500, recipe=recipe))
+        write_json(ckpt/"firered_lora_metadata.json", dict(step=500, base_fingerprint=base_id,
+                   recipe=dict(recipe, options=dict(profile="vox_attention"))))
+        hashes = {n: file_digest(ckpt/n) for n in ("adapter_config.json", "adapter_model.safetensors", "checkpoint.json")}
+        plan = dict(variants=["backbone"], base_sha256=base_id,
+                    checkpoints={"step-0500": dict(path=str(ckpt), hashes=hashes)})
+        write_json(listen/"report.json", dict(audio_complete=True, plan=plan))
+        def info(repo, revision=None, **kwargs):
+            if repo == TEMPLATE_REPO:
+                return SimpleNamespace(sha=TEMPLATE_REVISION, siblings=self.inventory)
+            self.assertEqual(repo, selected.REPO)
+            if revision == "b"*40:
+                return self.remote(out, private=True)
+            previous = self.remote(old, private=True)
+            previous.sha = "a"*40
+            return previous
+        with (patch.object(selected, "BASE_SHA", base_id), patch.object(selected, "MODEL_DIR", self.base),
+              patch.object(selected, "build_release", side_effect=lambda *a, **kw:
+                           build_release(*a, **kw, template_cache=self.root/"cache")),
+              patch("fireredtts3_local.release.verify_tokenizer", return_value={"backend_equal": True}),
+              patch("fireredtts3_local.release.download_files", side_effect=self.download),
+              patch("huggingface_hub.HfApi") as client):
+            api = client.return_value
+            api.model_info.side_effect = info
+            api.whoami.return_value = {"name": "shustov-te"}
+            api.hf_hub_download.side_effect = lambda **kw: str(old/kw["filename"])
+            api.create_commit.return_value = SimpleNamespace(oid="b"*40)
+            result = selected.publish(run, out)
+            self.assertFalse(result["public"])
+            self.assertTrue(result["remote_files_verified"])
+            self.assertEqual(result["previous_commit"], "a"*40)
+            api.create_repo.assert_not_called()
+            api.create_commit.assert_called_once()
+            weights = load_file(out/"model.safetensors")
+            self.assertEqual(set(weights), set(expected))
+            for key, value in weights.items():
+                torch.testing.assert_close(value, expected[key], atol=0, rtol=0)
+            self.assertTrue(any(not torch.equal(weights[k], self.original[k]) for k in weights))
+            self.assertIn("only backbone attention", (out/"README.md").read_text())
+            api.model_info.side_effect = None
+            api.model_info.return_value = self.remote(out, private=True)
+            self.assertEqual(selected.publish(run, out), result)
+            api.model_info.return_value = self.remote(out, private=False)
+            with self.assertRaisesRegex(ValueError, "must be private"):
+                selected.publish(run, out)
+            api.create_commit.assert_called_once()
+            (ckpt/"adapter_model.safetensors").write_bytes(b"replaced checkpoint")
+            with self.assertRaisesRegex(ValueError, "differs from the backbone listening run"):
+                selected.publish(run, out)
+
     def test_native_comparison_loads_the_same_merged_tensors_with_native_config(self):
         from fireredtts3_local.native_comparison import prepare_native_view
         from fireredtts3.llm.fireredtts3_base import FireRedTTS3BaseCore
