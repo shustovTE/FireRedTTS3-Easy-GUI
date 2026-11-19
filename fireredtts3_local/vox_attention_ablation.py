@@ -24,6 +24,7 @@ from .training_objective import vox_attention_names
 from .vox_recipe_transfer import BASE_SHA
 
 OUTPUT = ROOT / 'training/eval/attention-resonant100-previous500'
+DIT_OUTPUT = ROOT / 'training/eval/dit-cities-timofey-resonant100-previous500'
 VARIANTS = ('backbone', 'dit', 'both')
 STAGES = ('resonant-0100', 'previous-0500')
 
@@ -54,7 +55,7 @@ def route(core, variant):
     return counts
 
 
-def make_plan(current_run, previous_run):
+def make_plan(current_run, previous_run, *, dit_cities_timofey=False):
     data = {}
     reference = None
     for label, run, step, profile in zip(STAGES, (current_run, previous_run), (100, 500),
@@ -73,22 +74,30 @@ def make_plan(current_run, previous_run):
                            ('adapter_config.json','adapter_model.safetensors','checkpoint.json')})
     if len({d['dataset'] for d in data.values()}) != 1 or model_identity(MODEL_DIR) != BASE_SHA:
         raise ValueError('Mismatched training selections or local Base model')
-    texts = json.loads(vox_listen.PHRASES.read_text(encoding='utf-8'))['long']
+    if dit_cities_timofey:
+        texts = {name: (ROOT / 'examples/diagnostics' / f'long-{name}.txt').read_text(encoding='utf-8').strip()
+                 for name in ('cities', 'timofey')}
+    else:
+        texts = json.loads(vox_listen.PHRASES.read_text(encoding='utf-8'))['long']
     cases = [dict(id=f'{name}-seed{seed}', text=text, seed=seed)
              for name, text in texts.items() for seed in (1234, 1235)]
-    return dict(schema='attention-ablation-v1', checkpoints=data, base_sha256=BASE_SHA,
+    plan = dict(schema='attention-ablation-v1', checkpoints=data, base_sha256=BASE_SHA,
                 reference=reference, cases=cases, settings=SETTINGS, attention='sdpa', variants=list(VARIANTS),
                 runtime={p:version(p) for p in ('torch','torchaudio','peft','transformers')})
+    if dit_cities_timofey:
+        plan.update(variants=['dit'], include_base=False)
+    return plan
 
 
 def generate(root, plan, report):
     results = report['results']
-    for label in ('base', *STAGES):
+    stages = ('base', *STAGES) if plan.get('include_base', True) else STAGES
+    for label in stages:
         checkpoint = None if label == 'base' else plan['checkpoints'][label]['path']
         manager = ModelManager()
         tts = None
         try:
-            for variant in (('base',) if checkpoint is None else VARIANTS):
+            for variant in (('base',) if checkpoint is None else plan['variants']):
                 group = 'base' if checkpoint is None else f'{label}/{variant}'
                 (root/group).mkdir(parents=True, exist_ok=True)
                 pending = []
@@ -146,8 +155,8 @@ def summary(root, results):
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for name, row in sorted(results.items(), key=lambda item:(item[1]['case'], item[1]['group'])):
-            base = results[f"base/{row['case']}.wav"]
-            tail, base_tail = row['tail_contrast_db'], base['tail_contrast_db']
+            base = results.get(f"base/{row['case']}.wav", {})
+            tail, base_tail = row['tail_contrast_db'], base.get('tail_contrast_db')
             asr = row.get('asr', {})
             writer.writerow({**{k:row.get(k) for k in fields}, 'wav':name, 'wer':asr.get('wer'),
                              'wer_delta_vs_base':asr['wer']-base['asr']['wer'] if asr and 'asr' in base else None,
@@ -156,8 +165,8 @@ def summary(root, results):
     tmp.replace(root/'summary.csv')
 
 
-def run(root, current_run, previous_run, audio_only=False):
-    plan = make_plan(current_run, previous_run)
+def run(root, current_run, previous_run, audio_only=False, *, dit_cities_timofey=False):
+    plan = make_plan(current_run, previous_run, dit_cities_timofey=dit_cities_timofey)
     root.mkdir(parents=True, exist_ok=True)
     with FileLock(str(root/'.ablation.lock'), timeout=0):
         path = root/'report.json'
@@ -185,11 +194,15 @@ def run(root, current_run, previous_run, audio_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=OUTPUT)
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--dit-cities-timofey', action='store_true',
+                        help='Compare only the two DiT adapters on the original cities and timofey texts')
     parser.add_argument('--audio-only', action='store_true', help='Save WAVs and spectral results; skip Whisper')
     args = parser.parse_args()
     previous = vox_listen.RUN
-    run(args.output.resolve(), previous.with_name(previous.name+'-resonant-w015'), previous, args.audio_only)
+    output = args.output or (DIT_OUTPUT if args.dit_cities_timofey else OUTPUT)
+    run(output.resolve(), previous.with_name(previous.name+'-resonant-w015'), previous, args.audio_only,
+        dit_cities_timofey=args.dit_cities_timofey)
 
 
 if __name__ == '__main__':

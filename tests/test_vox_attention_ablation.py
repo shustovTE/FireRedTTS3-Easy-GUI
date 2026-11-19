@@ -64,7 +64,7 @@ class AblationTests(unittest.TestCase):
                 generated.append((row['text'], row['seed']))
                 return np.ones(3000, dtype=np.float32)*1.1, 24000, {'finish_reason':'stop'}
             with (patch.object(ablate, 'model_identity', return_value=ablate.BASE_SHA),
-                  patch.object(ablate, 'ModelManager') as manager, patch.object(ablate, 'route', return_value={}),
+                  patch.object(ablate, 'ModelManager') as manager, patch.object(ablate, 'route', return_value={}) as route,
                   patch.object(ablate, 'generate_case', side_effect=gen)):
                 ablate.run(output, parent/'current', parent/'prev', audio_only=True)
                 self.assertEqual(manager.return_value.load_base.call_count, 3)
@@ -93,6 +93,23 @@ class AblationTests(unittest.TestCase):
                     self.assertTrue(scored['asr_complete'])
                     self.assertEqual(scored['results'][name]['transcript'], 'Тест.')
                     self.assertEqual(len(generated), 57)
+                focused = parent/'dit-cities-timofey'
+                route.reset_mock()
+                manager.return_value.load_base.reset_mock()
+                ablate.run(focused, parent/'current', parent/'prev', audio_only=True, dit_cities_timofey=True)
+                report = json.loads((focused/'report.json').read_text())
+                expected = [(f'{name}-seed{seed}', (ablate.ROOT/'examples/diagnostics'/f'long-{name}.txt').read_text().strip(), seed)
+                            for name in ('cities', 'timofey') for seed in (1234, 1235)]
+                self.assertEqual(generated[57:], [(text, seed) for _, text, seed in expected]*2)
+                self.assertEqual({p.relative_to(focused).as_posix() for p in focused.rglob('*.wav')},
+                                 {f'{stage}/dit/{case}.wav' for stage in ablate.STAGES for case, _, _ in expected})
+                self.assertEqual([call.args[1] for call in route.call_args_list], ['dit', 'dit'])
+                self.assertEqual([call.kwargs['adapter_path'] for call in manager.return_value.load_base.call_args_list],
+                                 [report['plan']['checkpoints'][stage]['path'] for stage in ablate.STAGES])
+                with (focused/'summary.csv').open() as stream:
+                    self.assertTrue(all(row['tail_contrast_delta_vs_base_db'] == '' for row in csv.DictReader(stream)))
+                ablate.run(focused, parent/'current', parent/'prev', audio_only=True, dit_cities_timofey=True)
+                self.assertEqual(len(generated), 65)
                 with self.assertRaisesRegex(ValueError, 'training recipe'):
                     conf = fixtures[0][0]/'lora/step-0100/checkpoint.json'
                     rec = json.loads(conf.read_text())
