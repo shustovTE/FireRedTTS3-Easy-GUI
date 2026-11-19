@@ -376,6 +376,8 @@ Commands use `/opt/firered-tuning`. If the existing workspace was moved from
 `/home/firered-tuning`, follow the [relocation instructions](docs/WORKSPACE_RELOCATION.md)
 to read historical metadata without a compatibility symlink or changing dataset fingerprints.
 
+The selected Russian FireRed checkpoint uses the backbone attention updates from step 500 of a joint backbone/DiT LoRA run. The [backbone-500 recipe and listening results](docs/FIRERED_BACKBONE_500_RU.md) record how to reproduce it and how earlier runs behaved on complete calls.
+
 **Research status (2026-11-17):** the joint/hybrid and sampled-history experiments
 have not resolved long-utterance omissions or acoustic drift. Read the
 **[training strategy review](docs/TRAINING_STRATEGY_REVIEW_2026_11.md)** before
