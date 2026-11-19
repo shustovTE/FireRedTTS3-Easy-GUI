@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
+import soundfile as sf
 import torch
 
 from fireredtts3_local import vox_attention_ablation as ablate
@@ -15,6 +16,51 @@ from test_training_batch import tiny_core
 
 
 class AblationTests(unittest.TestCase):
+    def test_dit_series_uses_original_cases_and_ungated_weights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)/'lora-base-recovery-4patch-0500'
+            series = run/'audio/step-0500/series-2'
+            originals = series/'lora'
+            originals.mkdir(parents=True)
+            ckpt = run/'lora/step-0500'
+            ckpt.mkdir(parents=True)
+            recipe = dict(mode='lora', base_sha256=ablate.BASE_SHA, acoustic_recovery=ablate.vox_recovery.FOUR_PATCH)
+            (ckpt/'checkpoint.json').write_text(json.dumps(dict(step=500, recipe=recipe)))
+            (ckpt/'adapter_config.json').write_text('{}')
+            (ckpt/'adapter_model.safetensors').write_bytes(b'checkpoint')
+            rows, prior = [], []
+            for i, seed in enumerate((1236, 1239)):
+                ref = run/f'ref-{i}.wav'
+                sf.write(ref, np.zeros(1000), 24000)
+                row = dict(id=f'cities_seed{seed}', seed=seed, text='Смотрите, по городам.', reference_audio=str(ref),
+                           language='Russian', reference_text=f'Референс {i}.')
+                rows.append(row)
+                filename = f'case-{i:03d}.wav'
+                (originals/filename).write_bytes(b'original')
+                prior.append(dict(id=row['id'], text=row['text'], seed=seed, audio=f'lora/{filename}'))
+            benchmark = series/'benchmark.jsonl'
+            benchmark.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+            _, digest = ablate.load_benchmark(benchmark)
+            (series/'report.json').write_text(json.dumps(dict(complete=True, step=500, settings=ablate.SETTINGS,
+                benchmark_sha256=digest, recipes={'lora': recipe}, results={'lora': prior})))
+            with (patch.object(ablate, 'model_identity', return_value=ablate.BASE_SHA),
+                  patch.object(ablate, 'ModelManager') as manager, patch.object(ablate, 'route') as route,
+                  patch.object(ablate, 'generate_case', return_value=(np.zeros(3000), 24000, {'finish_reason':'stop'})) as gen):
+                route.return_value = {'backbone':0, 'dit':8}
+                plan = ablate.series_plan(series)
+                output = series/'dit'
+                ablate.render(output, plan, audio_only=True)
+                ablate.render(output, plan, audio_only=True)
+                manager.return_value.load_base.assert_called_once_with(attention_backend='sdpa', adapter_path=str(ckpt))
+                route.assert_called_once_with(manager.return_value.load_base.return_value.tts_core, 'dit')
+                self.assertEqual([{k:c.args[1][k] for k in rows[0]} for c in gen.call_args_list], rows)
+                self.assertTrue(all(c.kwargs['settings'] == ablate.SETTINGS for c in gen.call_args_list))
+                self.assertEqual(sorted(p.name for p in output.glob('*.wav')), sorted(p.name for p in originals.iterdir()))
+                self.assertTrue(all(p.read_bytes() == b'original' for p in originals.iterdir()))
+                sf.write(rows[0]['reference_audio'], np.ones(1000), 24000)
+                with self.assertRaisesRegex(ValueError, 'benchmark or reference'):
+                    ablate.series_plan(series)
+
     def test_routes_only_the_requested_lora_deltas_and_restores_both(self):
         core = configure(tiny_core(), 'lora')
         layers = dict(core.get_base_model().named_modules())

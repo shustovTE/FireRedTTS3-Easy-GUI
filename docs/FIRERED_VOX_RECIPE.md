@@ -418,3 +418,13 @@ tail -n 20 -f training/logs/attention-resonant100-previous500.log
 ```
 
 В `training/eval/dit-cities-timofey-resonant100-previous500/` появятся папки `resonant-0100/dit/` и `previous-0500/dit/`. Каждая содержит четыре WAV для двух текстов и seed 1234 и 1235.
+
+Для повтора конкретной серии передайте её папку `lora`. Скрипт берёт тексты, референсы и seed из её `benchmark.jsonl`, сверяет их с отчётом и загружает веса того же прогона и шага.
+
+```bash
+run=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-base-recovery-4patch-0500
+.venv/bin/python -u -m fireredtts3_local.vox_attention_ablation \
+  --dit-series "$run/audio/step-0500/series-2/lora" --audio-only
+```
+
+Для прослушивания по парам откройте одноимённые файлы `case-000.wav`, `case-001.wav` и следующие в соседних папках `series-2/lora/` и `series-2/dit/`.

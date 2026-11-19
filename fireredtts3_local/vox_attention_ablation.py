@@ -1,4 +1,4 @@
-"""Compare two gated FireRed checkpoints by routing their existing LoRA attention layers."""
+"""Render FireRed listening comparisons with selected LoRA attention layers."""
 import argparse
 import csv
 from importlib.metadata import version
@@ -19,7 +19,7 @@ from .sentence_diagnostics import ASR_SETTINGS, load_asr, transcript_errors
 from .tail_contrast import contrast_windows
 from .training_data import model_identity, file_digest
 from .training_job import write_json
-from .training_monitor import generate_case, SETTINGS
+from .training_monitor import generate_case, load_benchmark, SETTINGS
 from .training_objective import vox_attention_names
 from .vox_recipe_transfer import BASE_SHA
 
@@ -89,9 +89,44 @@ def make_plan(current_run, previous_run, *, dit_cities_timofey=False):
     return plan
 
 
+def series_plan(series):
+    """Read the same rows and load the sibling training checkpoint used by vox_recipe_sweep."""
+    step_dir = series.parent
+    if not series.name.startswith('series-') or step_dir.parent.name != 'audio':
+        raise ValueError('Expected RUN/audio/step-NNNN/series-N or its lora subdirectory')
+    source = json.loads((series/'report.json').read_text(encoding='utf-8'))
+    step = source['step']
+    if not source['complete'] or step_dir.name != f'step-{step:04d}' or source['settings'] != SETTINGS:
+        raise ValueError(f'Incomplete or incompatible listening series: {series}')
+    checkpoint = step_dir.parent.parent/'lora'/step_dir.name
+    record = json.loads((checkpoint/'checkpoint.json').read_text(encoding='utf-8'))
+    recipe = record['recipe']
+    if (record['step'] != step or recipe != source['recipes']['lora'] or recipe['mode'] != 'lora'
+            or recipe['base_sha256'] != BASE_SHA or model_identity(MODEL_DIR) != BASE_SHA):
+        raise ValueError(f'Checkpoint or Base differs from the saved series: {checkpoint}')
+    cases, digest = load_benchmark(series/'benchmark.jsonl')
+    originals = source['results']['lora']
+    if digest != source['benchmark_sha256'] or len(cases) != len(originals):
+        raise ValueError('Saved benchmark or reference differs from the series report')
+    for index, (case, original) in enumerate(zip(cases, originals, strict=True)):
+        filename = f'case-{index:03d}.wav'
+        if (original['audio'] != f'lora/{filename}' or
+                any(original[key] != case[key] for key in ('id', 'text', 'seed'))):
+            raise ValueError(f'Case differs from the saved LoRA result: {filename}')
+        case['filename'] = filename
+    files = ('adapter_config.json', 'adapter_model.safetensors', 'checkpoint.json')
+    weights = dict(path=str(checkpoint), hashes={name: file_digest(checkpoint/name) for name in files})
+    return dict(schema='dit-series-v1', series=str(series), checkpoints={step_dir.name: weights},
+                base_sha256=BASE_SHA, benchmark_sha256=digest, cases=cases, settings=source['settings'],
+                variants=['dit'], include_base=False, attention='sdpa',
+                runtime={p:version(p) for p in ('torch','torchaudio','peft','transformers')})
+
+
 def generate(root, plan, report):
     results = report['results']
-    stages = ('base', *STAGES) if plan.get('include_base', True) else STAGES
+    stages = list(plan['checkpoints'])
+    if plan.get('include_base', True):
+        stages.insert(0, 'base')
     for label in stages:
         checkpoint = None if label == 'base' else plan['checkpoints'][label]['path']
         manager = ModelManager()
@@ -99,10 +134,11 @@ def generate(root, plan, report):
         try:
             for variant in (('base',) if checkpoint is None else plan['variants']):
                 group = 'base' if checkpoint is None else f'{label}/{variant}'
-                (root/group).mkdir(parents=True, exist_ok=True)
+                folder = Path() if 'series' in plan else Path(group)
+                (root/folder).mkdir(parents=True, exist_ok=True)
                 pending = []
                 for case in plan['cases']:
-                    name = f"{group}/{case['id']}.wav"
+                    name = (folder / case.get('filename', f"{case['id']}.wav")).as_posix()
                     saved = results.get(name)
                     if saved and (root/name).is_file() and file_digest(root/name) == saved['wav_sha256']:
                         continue
@@ -114,7 +150,8 @@ def generate(root, plan, report):
                     tts.tts_core.eval()
                 counts = route(tts.tts_core, variant) if checkpoint else {'backbone':0, 'dit':0}
                 for case, name in pending:
-                    samples, rate, run = generate_case(tts, {**plan['reference'], **case}, settings=plan['settings'])
+                    row = {**plan.get('reference', {}), **case}
+                    samples, rate, run = generate_case(tts, row, settings=plan['settings'])
                     measured = levels(samples, rate)
                     scores = contrast_windows(samples, rate)
                     wav = root/name
@@ -167,12 +204,16 @@ def summary(root, results):
 
 def run(root, current_run, previous_run, audio_only=False, *, dit_cities_timofey=False):
     plan = make_plan(current_run, previous_run, dit_cities_timofey=dit_cities_timofey)
+    render(root, plan, audio_only)
+
+
+def render(root, plan, audio_only):
     root.mkdir(parents=True, exist_ok=True)
     with FileLock(str(root/'.ablation.lock'), timeout=0):
         path = root/'report.json'
         if path.exists():
             report = json.loads(path.read_text(encoding='utf-8'))
-            if report['plan'] != plan:
+            if report.get('plan') != plan:
                 raise ValueError(f'Inputs changed; use a new output directory: {root}')
         else:
             if any(p.name != '.ablation.lock' for p in root.iterdir()):
@@ -195,10 +236,18 @@ def run(root, current_run, previous_run, audio_only=False, *, dit_cities_timofey
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path)
-    parser.add_argument('--dit-cities-timofey', action='store_true',
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--dit-cities-timofey', action='store_true',
                         help='Compare only the two DiT adapters on the original cities and timofey texts')
+    mode.add_argument('--dit-series', type=Path, help='Replay an existing series-N/lora folder using only DiT LoRA')
     parser.add_argument('--audio-only', action='store_true', help='Save WAVs and spectral results; skip Whisper')
     args = parser.parse_args()
+    if args.dit_series:
+        series = args.dit_series.resolve()
+        if series.name == 'lora':
+            series = series.parent
+        render((args.output or series/'dit').resolve(), series_plan(series), args.audio_only)
+        return
     previous = vox_listen.RUN
     output = args.output or (DIT_OUTPUT if args.dit_cities_timofey else OUTPUT)
     run(output.resolve(), previous.with_name(previous.name+'-resonant-w015'), previous, args.audio_only,
