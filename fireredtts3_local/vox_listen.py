@@ -20,19 +20,19 @@ PHRASES = ROOT / 'examples/diagnostics/listening-ru-500.json'
 OUTPUT = ROOT / 'training/eval/listening-rise20-step0500'
 
 
-def listen(output, seeds):
+def listen(output, seeds, *, run=None, step=500):
     if len(set(seeds)) != len(seeds) or not seeds or any(not 0 <= n < 2**32 for n in seeds):
         raise ValueError('Supply distinct seeds between 0 and 4294967295')
     if output.exists():
         raise FileExistsError(f'{output} already exists. Choose a fresh folder with --output.')
 
-    checkpoint = RUN / 'lora/step-0500'
+    checkpoint = (run or RUN) / 'lora' / f'step-{step:04d}'
     record = json.loads((checkpoint / 'checkpoint.json').read_text(encoding='utf-8'))
     recipe = record['recipe']
     gate = recipe['rise_gate']
-    if (record['step'] != 500 or recipe['mode'] != 'lora' or gate['percent'] != 20
+    if (record['step'] != step or recipe['mode'] != 'lora' or gate['percent'] != 20
             or gate['settings'] != SETTINGS or SETTINGS['do_split']):
-        raise ValueError(f'Expected the gated step-0500 LoRA and its unsplit inference settings: {checkpoint}')
+        raise ValueError(f'Expected the gated LoRA and its unsplit inference settings: {checkpoint}')
     # The gate saved the actual reference bytes' hash and transcript alongside its training recipe.
     control = next(row for row in gate['cases'] if row['id'] == DEFAULT_CASE)
     ref = local_path(control['reference_audio']).resolve(strict=True)
@@ -86,9 +86,11 @@ def listen(output, seeds):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=OUTPUT)
+    parser.add_argument('--run', type=Path, default=RUN, help='Directory of a gated recovery experiment')
+    parser.add_argument('--step', type=int, choices=[100, 500], default=500)
     parser.add_argument('--seeds', nargs='+', type=int, default=[1234, 1235])
     args = parser.parse_args()
-    listen(args.output.resolve(), args.seeds)
+    listen(args.output.resolve(), args.seeds, run=args.run, step=args.step)
 
 
 if __name__ == '__main__':

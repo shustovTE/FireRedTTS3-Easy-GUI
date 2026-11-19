@@ -334,3 +334,53 @@ jq '.[-1] | {attempt,accepted,accepted_total,rejected_total,check_seconds,cases}
 Скрипт читает восемь коротких и четыре длинных текста из `examples/diagnostics/listening-ru-500.json` и синтезирует каждый целиком с seed 1234 и 1235. Голосовой образец и его транскрипт берутся из контрольного примера `cities_seed1237` в сохранённом чекпойнте.
 
 WAV появляются в `training/eval/listening-rise20-step0500/{short,long}/`. В `texts.txt` лежат исходные реплики, в `report.json` для каждого файла записаны длительность, причина остановки и разница RMS между концом и началом. Целевая длительность длинных ответов составляет 40–50 секунд. Сохраняются все результаты синтеза с исходной амплитудой, в том числе более короткие и длинные. Для отдельного повторного прогона можно указать, например, `--seeds 1236 --output training/eval/listening-rise20-seed1236`.
+
+### Узкие резонансы в конце длинных реплик
+
+В восьми WAV одного голоса из прогона `rise20pct` к концу усилились полосы около 2,22, 2,96 и 5,19 кГц. Вырос и контраст с соседними частотами, в том числе вследствие спада в области 3,4–4,6 кГц. Частоты подобраны по этим восьми файлам. Проверьте обобщение на других текстах и голосах.
+
+Спектрограммы, таблицу и три варианта последних восьми секунд каждого файла можно собрать на CPU. Команда использует отдельное окружение uv.
+
+```bash
+cd /opt/firered-tuning
+uv run --no-project --with numpy --with scipy --with matplotlib python \
+  scripts/inspect_tail_resonances.py \
+  training/eval/listening-rise20-step0500/long \
+  training/eval/spectrum-rise20-step0500
+```
+
+В `AB/` сравните `original.wav`, `reduced.wav` и `rebalanced.wav` с одинаковым префиксом имени. У всех трёх одинаковый RMS и общий запас до перегруза. В `reduced` ослаблены три резонанса, в `rebalanced` дополнительно приподнята область 4 кГц. Исходные FLOAT WAV остаются в папке прослушивания.
+
+Для спектрального обучения используется оригинальная Base и та же чистая выборка. В половине окон на конец реальной акустической истории накладываются три плавно усиливающихся узких пика (+6…+15 дБ), широкая впадина (−8…−16 дБ) и рост уровня (+3…+6 дБ). Частоты и ширина фильтров слегка меняются. Длина нарастания 24–100 патчей, ограничена доступным префиксом. В остальных окнах воспроизводится только рост уровня. Цели — до четырёх следующих настоящих патчей; при обучении на последующих позициях сеть получает собственные предсказания в историю. Основная задача на чистой речи остаётся в функции потерь. При обычном синтезе фильтры не применяются.
+
+Первый эксперимент сохраняет вес вспомогательной ошибки 0,15 и прежний порог RMS. Срезы после попыток 100 и 500 попадают в отдельный каталог.
+
+```bash
+cd /opt/firered-tuning
+git pull --ff-only origin feat/russian-tts-adaptation
+run=training/outputs/firered-vox-recipe-12-cap30m-levels
+mkdir -p training/logs
+nohup .venv/bin/python -u -m fireredtts3_local.vox_recipe_sweep \
+  --multistep-from-base --resonant-history --rise-limit-percent 20 \
+  "$run/comparison-0030-yrslvj2s/report.json" \
+  "$run/comparison-0030-ql21g14n/report.json" \
+  >> training/logs/firered-resonant-w015.log 2>&1 < /dev/null &
+tail -n 20 -f training/logs/firered-resonant-w015.log
+```
+
+В папке `prefix-test/` исходная Base и оба среза получают один и тот же реальный префикс в чистом и резонансно искажённом варианте. Сравнивайте продолжение после метки `prefix_seconds`.
+
+После сохранения нужного среза сравните новые WAV со старыми при тех же тексте, референсе и seed. Для прослушивания среза 100 укажите `--step 100` и отдельное имя в `--output`.
+
+```bash
+cd /opt/firered-tuning
+run=training/outputs/firered-vox-recipe-12-cap30m-levels
+.venv/bin/python -u -m fireredtts3_local.vox_listen \
+  --run "$run/lora-base-recovery-4patch-0500-rise20pct-resonant-w015" \
+  --step 500 --output training/eval/listening-resonant-w015-0500
+uv run --no-project --with numpy --with scipy --with matplotlib python \
+  scripts/inspect_tail_resonances.py training/eval/listening-resonant-w015-0500/long \
+  training/eval/spectrum-resonant-w015-0500
+```
+
+Для отдельного сравнения веса ошибки можно добавить `--stronger-recovery-loss` к команде обучения и использовать новый лог. Вес удвоится до 0,30, каталог будет оканчиваться на `-resonant-w030`. Сверяйте число принятых обновлений, контраст полос, дословность последней фразы и сходство голоса. На длинном независимом тексте проверяйте всю запись одним вызовом. На коротких репликах слушайте, сохранились ли звонкость и разборчивость согласных.

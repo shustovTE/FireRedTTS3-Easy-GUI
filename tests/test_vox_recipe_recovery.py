@@ -1,3 +1,4 @@
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,30 @@ from fireredtts3_local.training_batch import Example
 
 
 class AcousticRecoveryTests(unittest.TestCase):
+    def test_resonant_history_is_causal_level_selective_and_unclipped(self):
+        rate = 24000
+        t = torch.arange(3*rate, dtype=torch.float32) / rate
+        # Matched integer-period probes inside and outside one resonance band.
+        wav = (0.6*torch.cos(2*torch.pi*3000*t) + 0.2*torch.cos(2*torch.pi*1000*t))[None]
+        original = wav.clone()
+        config = dict(vox_recovery.RESONANT, bands_hz=[[3000, 3000]], q_range=[25., 25.],
+                      bell_gain_db=[12., 12.], trough_gain_db=[0., 0.], gain_db=[0., 0.], resonance_probability=1.,
+                      ramp_range_patches=[5, 5])
+        def apply(x):
+            return vox_recovery.resonant_tail(x, rate//5, rate, random.Random(8), config)
+        wet = apply(wav)
+        torch.testing.assert_close(wav, original, rtol=0, atol=0)
+        torch.testing.assert_close(wet[:, :2*rate], wav[:, :2*rate], rtol=0, atol=0)
+        late = torch.fft.rfft(wet[0, -rate//10:]).abs()
+        dry = torch.fft.rfft(wav[0, -rate//10:]).abs()
+        self.assertGreater(float(late[300]/dry[300]), 3.5)
+        self.assertAlmostEqual(float(late[100]/dry[100]), 1., places=2)
+        self.assertGreater(float(wet.abs().max()), 1.)
+        changed = wav.clone()
+        changed[:, -100:] = 0
+        torch.testing.assert_close(wet[:, :-100], apply(changed)[:, :-100], atol=1e-5, rtol=0)
+        torch.testing.assert_close(apply(torch.zeros_like(wav)), torch.zeros_like(wav))
+
     def test_prefix_excludes_future_and_uses_native_left_padding(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / 'source.wav'

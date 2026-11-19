@@ -1,5 +1,6 @@
 """Aligned acoustic-history augmentation for the FireRed attention LoRA."""
 from dataclasses import replace
+import math
 import random
 
 import soundfile as sf
@@ -16,6 +17,12 @@ CONFIG = dict(schema='wav-prefix-recovery-v1', weight=.15, gain_db=[3., 6.],
 STRONGER_COMB = dict(CONFIG, comb_mix=.50)
 FOUR_PATCH = dict(STRONGER_COMB, schema='wav-prefix-own-history-v1', prediction_patches=4,
                   n_timesteps=10, inference_cfg=2., stop_threshold=.5)
+RESONANT = dict(schema='wav-prefix-resonances-v1', weight=.15, gain_db=[3., 6.],
+                prediction_patches=4, n_timesteps=10, inference_cfg=2., stop_threshold=.5,
+                bands_hz=[[2200, 2270], [2950, 2985], [5090, 5310]], q_range=[18., 50.],
+                bell_gain_db=[6., 15.], trough_hz=[3850, 4150], trough_gain_db=[-16., -8.],
+                trough_q_range=[2.5, 4.], ramp_range_patches=[24, 100],
+                resonance_probability=.5, gain_only_ramp_patches=8)
 
 
 def read_prefix(path, samples, padded_length, stride, rate):
@@ -45,6 +52,32 @@ def corrupt_tail(wav, ramp_samples, gain_db, delay, mix):
     wet = (dry + mix * delayed) / (1. + mix)
     tail = torch.lerp(dry, wet, ramp) * torch.pow(10., gain_db * ramp / 20.)
     return torch.cat((wav[:, :-size], tail), dim=1)
+
+
+def resonant_tail(wav, stride, rate, rng, config):
+    """Add causal speech-driven resonances. Targets and the unselected prefix stay clean."""
+    gain_db = rng.uniform(*config['gain_db'])
+    if rng.random() >= config['resonance_probability']:
+        return corrupt_tail(wav, stride*config['gain_only_ramp_patches'], gain_db, 1, 0.)
+    n = min(wav.shape[-1], stride*rng.randint(*config['ramp_range_patches']))
+    dry = wav[..., -n:]
+    wet = dry
+    filters = [(band, config['q_range'], config['bell_gain_db']) for band in config['bands_hz']]
+    filters.append((config['trough_hz'], config['trough_q_range'], config['trough_gain_db']))
+    for interval, q_range, gain_range in filters:
+        hz = rng.uniform(*interval)
+        if hz >= rate/2:
+            raise ValueError(f'Resonance frequency {hz} exceeds Nyquist at {rate} Hz')
+        w = 2*math.pi*hz/rate
+        alpha = math.sin(w)/(2*rng.uniform(*q_range))
+        a = 10**(rng.uniform(*gain_range)/40)
+        mid = -2*math.cos(w)
+        num = wav.new_tensor([1+alpha*a, mid, 1-alpha*a])
+        den = wav.new_tensor([1+alpha/a, mid, 1-alpha/a])
+        wet = torchaudio.functional.lfilter(wet, den, num, clamp=False)
+    ramp = torch.linspace(0., 1., n, device=wav.device, dtype=wav.dtype)
+    tail = torch.lerp(dry, wet, ramp) * torch.pow(10., gain_db*ramp/20)
+    return torch.cat([wav[..., :-n], tail], dim=-1)
 
 
 @torch.no_grad()
@@ -91,10 +124,13 @@ def recovery_loss(tts, examples, target_rows, seed, *, config=CONFIG, patch_coun
                 continue
             anchor = rng.randint(max(3, count // 2), count - 1)
             wav = read_prefix(row['audio'], anchor * stride, count * stride, stride, rate)
-            delay = max(1, round(rate * rng.uniform(*config['delay_ms']) / 1000))
-            # Half the windows isolate loudness drift; the others also have spectral coloration.
-            mix = config['comb_mix'] if rng.random() < .5 else 0.
-            damaged = corrupt_tail(wav, stride * config['ramp_patches'], rng.uniform(*config['gain_db']), delay, mix)
+            if config['schema'] == RESONANT['schema']:
+                damaged = resonant_tail(wav, stride, rate, rng, config)
+            else:
+                delay = max(1, round(rate * rng.uniform(*config['delay_ms']) / 1000))
+                # Half the windows isolate loudness drift; the others also have spectral coloration.
+                mix = config['comb_mix'] if rng.random() < .5 else 0.
+                damaged = corrupt_tail(wav, stride * config['ramp_patches'], rng.uniform(*config['gain_db']), delay, mix)
             history = codec.encode(damaged.to(e.target.device), rate).float()
             if history.shape != e.target[:, :anchor * patch].shape or not torch.isfinite(history).all():
                 raise ValueError(f'Invalid re-encoded recovery history: {row["audio"]}')

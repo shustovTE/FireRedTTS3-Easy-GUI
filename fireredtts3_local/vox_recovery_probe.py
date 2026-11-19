@@ -1,6 +1,7 @@
 """Paired whole-utterance continuations from a shared clean or metallic target prefix."""
 from difflib import SequenceMatcher
 import json
+import random
 from pathlib import Path
 import tempfile
 
@@ -17,7 +18,7 @@ from .training_data import file_digest
 from .training_job import write_json
 from .training_monitor import SETTINGS
 from .training_run import isolated_rng
-from .vox_recovery import corrupt_tail
+from .vox_recovery import RESONANT, corrupt_tail, resonant_tail
 
 
 TEXTS = {
@@ -37,6 +38,14 @@ DAMAGE = dict(gain_db=6., delay_ms=3., comb_mix=.50, ramp_patches=8)
 MAX_PATCHES = 400
 
 
+def probe_damage(recipe):
+    if recipe.get('acoustic_recovery', {}).get('schema') == RESONANT['schema']:
+        # Identical prefix across Base, both loss weights, and all tested checkpoints.
+        profile = dict(RESONANT, resonance_probability=1.)
+        return dict(profile=profile, seed=4)
+    return DAMAGE
+
+
 def select_voice(splits):
     train_hashes = {r['audio_sha256'] for pair in splits['train'] for r in pair[:2]}
     train_text = {lexical_key(row['text']) for _, row, _ in splits['train']}
@@ -54,14 +63,17 @@ def select_voice(splits):
 
 
 @torch.inference_mode()
-def prepare_history(tts, voice, root):
+def prepare_history(tts, voice, root, damage=DAMAGE):
     codec = tts.redae
     rate = codec.sample_rate
     stride = tts.tts_core.patch_size * codec.downsample_rate
     _, reference, _ = read_audio(tts, voice['reference'])
     source, clean, left = read_audio(tts, voice['prefix'])
-    altered = corrupt_tail(clean.cpu(), stride * DAMAGE['ramp_patches'], DAMAGE['gain_db'],
-                           max(1, round(rate * DAMAGE['delay_ms'] / 1000)), DAMAGE['comb_mix'])
+    if 'profile' in damage:
+        altered = resonant_tail(clean.cpu(), stride, rate, random.Random(damage['seed']), damage['profile'])
+    else:
+        altered = corrupt_tail(clean.cpu(), stride * damage['ramp_patches'], damage['gain_db'],
+                               max(1, round(rate * damage['delay_ms'] / 1000)), damage['comb_mix'])
     if torch.equal(altered, clean.cpu()) or not torch.isfinite(altered).all():
         raise ValueError('The intervention produced an identical or nonfinite waveform')
     variants = {}
@@ -188,7 +200,7 @@ def probe_stage(root, label, adapter, voice, recipe):
     folder = root / label
     folder.mkdir(parents=True, exist_ok=True)
     plan = dict(schema='matched-prefix-continuation-v1', voice=voice, texts=TEXTS, seeds=list(SEEDS),
-                settings=SETTINGS, damage=DAMAGE, max_target_patches=MAX_PATCHES, asr='large-v3',
+                settings=SETTINGS, damage=probe_damage(recipe), max_target_patches=MAX_PATCHES, asr='large-v3',
                 asr_settings=ASR_SETTINGS, base_sha256=recipe['base_sha256'],
                 dataset_sha256=recipe['dataset_sha256'], stage=label,
                 checkpoint={f: file_digest(adapter/f) for f in
@@ -214,7 +226,7 @@ def probe_stage(root, label, adapter, voice, recipe):
                                                 adapter_path=str(adapter) if adapter else None)
                         for module in (tts.tts_core, tts.redae, tts.spk_extractor):
                             module.eval()
-                        history = prepare_history(tts, voice, root)
+                        history = prepare_history(tts, voice, root, plan['damage'])
                         recognizer = WhisperModel(plan['asr'], device='cpu', compute_type='int8', cpu_threads=4)
                     print(f'[prefix-test] {label} {case} seed={seed}', flush=True)
                     row = run_pair(tts, history, voice, case, seed, root, directory, recognizer)

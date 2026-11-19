@@ -18,13 +18,19 @@ STEPS = (100, 200, 300, 400)
 
 
 def fresh_recovery(dataset, source, reports, *, stronger_comb=False, four_patch=False,
-                   rise_limit_percent=None, rise_cases=None):
+                   rise_limit_percent=None, rise_cases=None, resonant=False, stronger_recovery_loss=False):
     dataset, source = dataset.resolve(), source.resolve()
     config = vox_recovery.STRONGER_COMB if stronger_comb else vox_recovery.CONFIG
     steps = [100, 500] if four_patch else [50, 100]
     if four_patch:
         config = vox_recovery.FOUR_PATCH
-    print(f"[sweep] Recovery from original Base, updates 1–{steps[-1]}, comb_mix={config['comb_mix']:.2f}. "
+    if stronger_recovery_loss and not resonant:
+        raise ValueError('A doubled auxiliary loss needs the resonant-history experiment')
+    if resonant:
+        if not four_patch or stronger_comb:
+            raise ValueError('Resonant history needs four-patch recovery from Base')
+        config = dict(vox_recovery.RESONANT, weight=.30 if stronger_recovery_loss else .15)
+    print(f"[sweep] Recovery from original Base, updates 1–{steps[-1]}, recipe={config}. "
           "Checking saved Base results and training data.", flush=True)
     reports = [p.resolve() for p in reports]
     if not reports or len(set(reports)) != len(reports):
@@ -51,10 +57,12 @@ def fresh_recovery(dataset, source, reports, *, stronger_comb=False, four_patch=
     standard = source / ('lora-base-recovery-0100' + suffix)
     run = source / ('lora-base-recovery-comb050-0100' + suffix) if stronger_comb else standard
     if four_patch:
+        if resonant:
+            suffix += '-resonant-w030' if stronger_recovery_loss else '-resonant-w015'
         run = source / ('lora-base-recovery-4patch-0500' + suffix)
         voice = vox_recovery_probe.select_voice(splits)
         plan['prefix_test'] = dict(voice=voice, texts=vox_recovery_probe.TEXTS, seeds=list(vox_recovery_probe.SEEDS),
-                                   damage=vox_recovery_probe.DAMAGE)
+                                   damage=vox_recovery_probe.probe_damage(recipe))
         return run_slices(dataset, source, run, plan, recipe, {step: reports for step in steps},
                           reuse_base=True, probe_voice=voice)
     return run_slices(dataset, source, run, plan, recipe, {step: reports for step in steps},
@@ -180,11 +188,19 @@ if __name__ == '__main__':
                       help='Fresh four-patch recovery LoRA from Base. Save and test at 100 and 500.')
     parser.add_argument('--stronger-comb', action='store_true',
                         help='With --recovery-from-base, raise only the delayed signal coefficient from 0.35 to 0.50.')
+    parser.add_argument('--resonant-history', action='store_true',
+                        help='Use longer rising narrow-band resonances in the four-patch recovery prefix.')
+    parser.add_argument('--stronger-recovery-loss', action='store_true',
+                        help='With --resonant-history, double only the auxiliary weight from 0.15 to 0.30.')
     parser.add_argument('--rise-limit-percent', type=float, metavar='PERCENT',
                         help='Reject proposed LoRA updates exceeding Base tail/head RMS ratio by this percentage.')
     parser.add_argument('--rise-case', action='append', metavar='ID',
                         help='Check this saved Base case every update. Repeat for multiple cases. Default: cities_seed1237.')
     args = parser.parse_args()
+    if args.resonant_history and not args.multistep_from_base:
+        parser.error('--resonant-history requires --multistep-from-base')
+    if args.stronger_recovery_loss and not args.resonant_history:
+        parser.error('--stronger-recovery-loss requires --resonant-history')
     if args.stronger_comb and not args.recovery_from_base:
         parser.error('--stronger-comb requires --recovery-from-base')
     if args.rise_case and args.rise_limit_percent is None:
@@ -195,6 +211,7 @@ if __name__ == '__main__':
         if args.until not in (None, 500):
             parser.error('--multistep-from-base saves at 100 and 500')
         print(fresh_recovery(args.dataset, args.source, args.reports, four_patch=True,
+                             resonant=args.resonant_history, stronger_recovery_loss=args.stronger_recovery_loss,
                              rise_limit_percent=args.rise_limit_percent, rise_cases=args.rise_case))
     elif args.recovery_from_base:
         if args.until not in (None, 100):

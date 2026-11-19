@@ -158,6 +158,29 @@ class MultistepTests(unittest.TestCase):
                 self.assertEqual(stages, ['base','step-0100','base','step-0100','step-0500'])
                 self.assertEqual(json.loads((run/'replay.json').read_text())['steps'], [100,500])
 
+    def test_resonant_experiments_keep_checkpoints_separate_and_reuse_identical_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root/sweep.vox_recipe_levels.REPORT).write_text('{}')
+            report = root/'baseline.json'
+            report.write_text('{}')
+            with (patch.object(sweep, 'load_saved_base'),
+                  patch.object(sweep, 'paired_data', return_value=({}, [], {'selection_sha256': 'data'})),
+                  patch.object(probe, 'select_voice', return_value={}), patch.object(sweep, 'run_slices') as run):
+                plans = []
+                for resonant, stronger in ((False, False), (True, False), (True, True)):
+                    sweep.fresh_recovery(root, root, [report], four_patch=True, resonant=resonant,
+                                         stronger_recovery_loss=stronger)
+                    plans.append(run.call_args.args)
+            self.assertEqual(len({args[2] for args in plans}), 3)
+            standard, mild, strong = [args[3] for args in plans]
+            self.assertEqual(standard['prefix_test']['damage'], probe.DAMAGE)
+            self.assertEqual(mild['prefix_test']['damage'], strong['prefix_test']['damage'])
+            self.assertEqual(mild['prefix_test']['damage']['profile']['resonance_probability'], 1.)
+            self.assertEqual(mild['steps'], [100, 500])
+            self.assertEqual(mild['recipe']['acoustic_recovery'], recovery.RESONANT)
+            self.assertEqual(strong['recipe']['acoustic_recovery'], dict(recovery.RESONANT, weight=.30))
+
     def test_probe_writes_matched_wavs_scores_suffix_and_reuses_completed_pairs(self):
         rate = 16000
         ref_word = SimpleNamespace(word='Да', start=.01, end=.10)
