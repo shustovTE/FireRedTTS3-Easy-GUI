@@ -1,4 +1,4 @@
-"""Train FireRed backbone Q/K/V/O LoRA and render the listening set at the final step."""
+"""Train FireRed attention LoRA and render the listening set with backbone LoRA active."""
 import argparse
 import json
 from importlib.metadata import version
@@ -21,19 +21,20 @@ PILOTS = ('comparison-0030-yrslvj2s', 'comparison-0030-ql21g14n')
 RUN = 'lora-backbone-only-recovery-4patch-0250'
 CONTINUATION = 'lora-backbone-only-recovery-4patch-0500'
 STRONG_RUN = 'lora-backbone-only-recovery-4patch-0500-resonant-w030'
+JOINT_RUN = 'lora-joint-recovery-4patch-0500-backbone-audio'
 
 
 def check_step(checkpoint, step, recipe):
     record = json.loads((checkpoint / 'checkpoint.json').read_text())
     if record['step'] != step or record['recipe'] != recipe:
-        raise ValueError(f'Unexpected backbone-only checkpoint at step {step}: {checkpoint}')
+        raise ValueError(f'Unexpected training checkpoint at step {step}: {checkpoint}')
 
 
-def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_500=False, stronger_recovery_loss=False):
-    if continue_to_500 and stronger_recovery_loss:
-        raise ValueError('The stronger resonant recipe starts from Base and has its own checkpoints')
+def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_500=False,
+        stronger_recovery_loss=False, joint_to_500=False):
+    if sum((continue_to_500, stronger_recovery_loss, joint_to_500)) > 1:
+        raise ValueError('Select one training mode')
     source, dataset = Path(source).resolve(), Path(dataset).resolve()
-    final_step = 500 if continue_to_500 or stronger_recovery_loss else 250
     run_name = CONTINUATION if continue_to_500 else RUN
     recovery = vox_recovery.FOUR_PATCH
     checkpoint_steps = [100, 250]
@@ -41,6 +42,9 @@ def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_5
         run_name = STRONG_RUN
         recovery = vox_recovery.STRONGER_RESONANT
         checkpoint_steps = [100, 250, 500]
+    if joint_to_500:
+        run_name = JOINT_RUN
+        checkpoint_steps = [250, 500]
     output = source / run_name
     output.mkdir(parents=True, exist_ok=True)
     with FileLock(str(output / '.run.lock'), timeout=0):
@@ -55,12 +59,15 @@ def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_5
             raise ValueError('Both pilot series must use the same normalized training set')
         runtime = {pkg: version(pkg) for pkg in ('torch', 'torchaudio', 'peft', 'transformers')}
         plan = listening.backbone_listening_pack({}, *controls, runtime)
-        plan['adapter_profile'] = BACKBONE_ATTENTION
+        plan['adapter_profile'] = 'vox_attention' if joint_to_500 else BACKBONE_ATTENTION
         dataset_sha = datasets.pop()
-        recipe = dict(vox_recipe_transfer.transfer_recipe('lora', dataset_sha), adapter_profile=BACKBONE_ATTENTION,
+        recipe = dict(vox_recipe_transfer.transfer_recipe('lora', dataset_sha),
                       acoustic_recovery=recovery, recovery_start_step=0)
-        replay = dict(recipe=recipe, checkpoint_steps=checkpoint_steps, audio_steps=[checkpoint_steps[-1]],
-                      listening_plan=plan)
+        # The original joint transfer recipe uses vox_attention by default in its checkpoint metadata.
+        if not joint_to_500:
+            recipe['adapter_profile'] = BACKBONE_ATTENTION
+        audio_steps = checkpoint_steps if joint_to_500 else [checkpoint_steps[-1]]
+        replay = dict(recipe=recipe, checkpoint_steps=checkpoint_steps, audio_steps=audio_steps, listening_plan=plan)
         parent = None
         if continue_to_500:
             parent = source / RUN / 'lora' / 'step-0250'
@@ -80,21 +87,23 @@ def run(source=SOURCE, dataset=ROOT / vox_recipe_levels.OUTPUT, *, continue_to_5
                 raise ValueError(f'Existing outputs have no matching replay metadata: {output}')
             write_json(manifest, replay)
 
-        local_resume = any((output / 'lora').glob('step-*/checkpoint.json'))
-        print(f'[backbone] {recovery["schema"]}, recovery weight {recovery["weight"]:.2f}. '
-              f'Target step {final_step}, weights at {replay["checkpoint_steps"]}, '
-              f'{len(plan["cases"])} WAVs at {final_step}.', flush=True)
-        vox_recipe_transfer.train(dataset, output, 'lora', final_step, resume=local_resume or parent is not None,
-                                  fork_from=None if local_resume else parent, shared_features=source / 'features',
-                                  recovery=recovery, backbone_only=True,
-                                  checkpoint_steps=tuple(replay['checkpoint_steps'][:-1]),
-                                  expected_dataset_sha256=dataset_sha)
-        checkpoint = output / 'lora' / f'step-{final_step:04d}'
-        check_step(checkpoint, final_step, recipe)
-        plan['checkpoints'] = listening.checkpoint_files(checkpoint)
-        pack = output / 'audio' / checkpoint.name / 'backbone-complete'
-        listening.render(pack, plan, audio_only=False)
-        print(f'[backbone] Finished. Audio: {pack}', flush=True)
+        print(f'[backbone] Train {plan["adapter_profile"]}, {recovery["schema"]}, recovery weight {recovery["weight"]:.2f}. '
+              f'Weights at {replay["checkpoint_steps"]}; {len(plan["cases"])} backbone WAVs at each of '
+              f'{replay["audio_steps"]}.', flush=True)
+        for step in replay['audio_steps']:
+            checkpoint = output / 'lora' / f'step-{step:04d}'
+            if not joint_to_500 or not (checkpoint / 'checkpoint.json').is_file():
+                local_resume = any((output / 'lora').glob('step-*/checkpoint.json'))
+                weights_only = tuple(s for s in replay['checkpoint_steps'] if s < step and s not in replay['audio_steps'])
+                vox_recipe_transfer.train(dataset, output, 'lora', step, resume=local_resume or parent is not None,
+                                          fork_from=None if local_resume else parent, shared_features=source / 'features',
+                                          recovery=recovery, backbone_only=not joint_to_500, checkpoint_steps=weights_only,
+                                          expected_dataset_sha256=dataset_sha)
+            check_step(checkpoint, step, recipe)
+            render_plan = dict(plan, checkpoints=listening.checkpoint_files(checkpoint))
+            pack = output / 'audio' / checkpoint.name / 'backbone-complete'
+            listening.render(pack, render_plan, audio_only=False)
+            print(f'[backbone] Finished step {step}. Audio: {pack}', flush=True)
 
 
 if __name__ == '__main__':
@@ -105,4 +114,7 @@ if __name__ == '__main__':
     mode.add_argument('--stronger-recovery-loss', action='store_true',
                       help='Start from Base, train 500 steps with resonant history and recovery weight 0.30, '
                            'and render the listening WAVs only at step 500.')
+    mode.add_argument('--joint-to-500', action='store_true',
+                      help='Start from Base with backbone + DiT LoRA and standard four-patch recovery. '
+                           'Render only the backbone part at steps 250 and 500.')
     run(**vars(parser.parse_args()))

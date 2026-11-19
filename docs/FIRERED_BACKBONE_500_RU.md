@@ -26,7 +26,39 @@
 
 Модель получает до четырёх последовательных целей после границы, суммарно до 640 мс. Со второго патча в историю подаётся собственное предсказание модели с предыдущей позиции. Для него используются 10 шагов интегрирования, CFG 2 и порог STOP 0,5. Предыдущие сэмплы отделены от графа градиентов. Ошибка усредняется по доступным позициям одного окна. Код этого режима задаёт константа `FOUR_PATCH`. [Реализация восстановления](../fireredtts3_local/vox_recovery.py) · [обучающий цикл](../fireredtts3_local/vox_recipe_transfer.py)
 
-## Как повторить на Gauss
+## Повтор совместного обучения с прослушиванием backbone на шагах 250 и 500
+
+Команда запускает свежие LoRA rank 32 на Q/K/V/O backbone и DiT от оригинальной Base. Используется обычный четырёхпатчевый режим `FOUR_PATCH` с весом 0,15. В конце префикса нарастает усиление на 3–6 дБ. В половине окон к нему добавляется задержанная на 2–5 мс копия с коэффициентом 0,50. Все 500 обновлений применяются. Seed обучения 1234 и выборка совпадают с обычным backbone-only прогоном.
+
+```bash
+cd /opt/firered-tuning
+git pull --ff-only origin feat/russian-tts-adaptation
+mkdir -p training/logs
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 nohup .venv/bin/python -u \
+  -m fireredtts3_local.train_backbone_attention_250 --joint-to-500 \
+  >> training/logs/firered-joint-backbone-250-500.log 2>&1 < /dev/null &
+```
+
+```bash
+tail -n 25 -f training/logs/firered-joint-backbone-250-500.log
+```
+
+На шаге 250 сохраняется совместный чекпойнт. Рендерер загружает его в отдельный экземпляр модели, включает адаптер backbone и синтезирует с исходным DiT. После 58 WAV и расшифровки обучение продолжится с того же совместного чекпойнта, включая состояние AdamW, расписание LR и RNG. На шаге 500 записывается второй комплект. При обрыве SSH фоновый процесс продолжает работать. После остановки процесса повторите команду запуска для продолжения с дискового среза и проверки готовых WAV.
+
+```bash
+run=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-joint-recovery-4patch-0500-backbone-audio
+for step in 0250 0500; do
+  pack="$run/audio/step-$step/backbone-complete"
+  if [ -f "$pack/report.json" ]; then
+    jq '{audio_complete, asr_complete, wavs: (.results | length),
+         active_layers: ([.results[].active_layers] | unique)}' "$pack/report.json"
+  fi
+done
+```
+
+В каждом готовом комплекте 58 WAV, а `active_layers` показывает 112 проекций backbone и 0 проекций DiT с включённой LoRA. Для парного сравнения используйте одноимённые WAV из обычного backbone-only прогона (`lora-backbone-only-recovery-4patch-0250` и `lora-backbone-only-recovery-4patch-0500`). Тексты, референсы, настройки и seed генерации совпадают. В `controls/` есть «Города» на шести seed и «Тимофей» на двух. В `summary.csv` сопоставьте изменение RMS к концу, спектральный контраст и пропущенные слова у того же примера. Повтор с фиксированным seed проверяет воспроизводимость результата в этих условиях.
+
+## Как повторить исходный прогон на Gauss
 
 Версия кода с полным обучением, прослушиванием и селективным экспортом сохранена в коммите [47e275c](https://github.com/shustovTE/FireRedTTS3-Easy-GUI/tree/47e275cfaf21797ead3a4cdb45f08e2526d9a4c4). Команды ниже рассчитаны на рабочий каталог и сохранённые материалы этого опыта. Для восстановления подготовки с исходных корпусов см. [отбор и VAD](VOXCPM2_FULL_DIALOGS_SPONTANEOUS.md) и [выравнивание уровня и создание контрольных серий](FIRERED_VOX_RECIPE.md).
 

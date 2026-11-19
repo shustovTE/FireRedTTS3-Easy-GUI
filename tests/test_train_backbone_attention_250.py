@@ -32,6 +32,61 @@ def prepare_pilots(source):
 
 
 class BackboneRunTests(unittest.TestCase):
+    def test_joint_run_resumes_after_listening_and_uses_only_backbone_for_both_packs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            prepare_pilots(source)
+            output = source/job.JOINT_RUN
+            calls = []
+            saved_plans = []
+
+            def train(dataset, out, mode, until, *, resume, **kwargs):
+                self.assertEqual((out, mode), (output, 'lora'))
+                self.assertEqual(kwargs, dict(fork_from=None, shared_features=source/'features',
+                    backbone_only=False, recovery=job.vox_recovery.FOUR_PATCH,
+                    checkpoint_steps=(), expected_dataset_sha256='data'))
+                self.assertEqual(resume, until == 500)
+                if until == 500:
+                    report = json.loads((out/'audio/step-0250/backbone-complete/report.json').read_text())
+                    self.assertTrue(report['audio_complete'])
+                    self.assertEqual(len(report['results']), 58)
+                calls.append(until)
+                checkpoint = out/'lora'/f'step-{until:04d}'
+                checkpoint.mkdir(parents=True)
+                recipe = dict(job.vox_recipe_transfer.transfer_recipe('lora', 'data'),
+                              acoustic_recovery=job.vox_recovery.FOUR_PATCH, recovery_start_step=0)
+                job.write_json(checkpoint/'checkpoint.json', dict(step=until, recipe=recipe))
+                (checkpoint/'adapter_config.json').write_text('{}')
+                (checkpoint/'adapter_model.safetensors').write_bytes(str(until).encode())
+
+            generated = (np.ones(2400, dtype=np.float32)*.1, 24000, {'finish_reason': 'stop'})
+            with (patch.object(job.vox_recipe_transfer, 'train', side_effect=train),
+                  patch.object(job.listening, 'ModelManager') as manager,
+                  patch.object(job.listening, 'recognize'),
+                  patch.object(job.listening, 'generate_case', side_effect=[generated, InterruptedError]) as gen):
+                manager.return_value.load_base.return_value.tts_core = job.vox_recipe_transfer.configure(tiny_core(), 'lora')
+                with self.assertRaises(InterruptedError):
+                    job.run(source, source/'data', joint_to_500=True)
+                self.assertEqual(calls, [250])
+                gen.side_effect = None
+                gen.return_value = generated
+                job.run(source, source/'data', joint_to_500=True)
+                job.run(source, source/'data', joint_to_500=True)
+                self.assertEqual(calls, [250, 500])
+                self.assertEqual(gen.call_count, 117)  # 116 WAVs and one interrupted generation
+            replay = json.loads((output/'replay.json').read_text())
+            self.assertEqual(replay['checkpoint_steps'], [250, 500])
+            self.assertEqual(replay['audio_steps'], [250, 500])
+            for step in calls:
+                info = json.loads((output/'audio'/f'step-{step:04d}/backbone-complete/report.json').read_text())
+                plan = info['plan']
+                self.assertEqual(list(plan['checkpoints']), [f'step-{step:04d}'])
+                self.assertEqual(plan['variants'], ['backbone'])
+                self.assertFalse(plan['include_base'])
+                self.assertTrue(all(r['active_layers'] == {'backbone': 8, 'dit': 0} for r in info['results'].values()))
+                saved_plans.append(plan['cases'])
+            self.assertEqual(saved_plans[0], saved_plans[1])
+
     def test_stronger_resonant_starts_from_base_and_renders_only_after_500(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp)
