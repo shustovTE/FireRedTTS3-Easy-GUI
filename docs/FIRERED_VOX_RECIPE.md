@@ -428,3 +428,12 @@ run=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-base-recovery-4pat
 ```
 
 Для прослушивания по парам откройте одноимённые файлы `case-000.wav`, `case-001.wav` и следующие в соседних папках `series-2/lora/` и `series-2/dit/`.
+
+Чтобы сгенерировать ещё два варианта для той же серии, укажите компоненты LoRA.
+
+```bash
+.venv/bin/python -u -m fireredtts3_local.vox_attention_ablation \
+  --series "$run/audio/step-0500/series-2/lora" --variants backbone both --audio-only
+```
+
+В `series-2/backbone/` появятся записи с LoRA только в backbone. В `series-2/both/` обе части адаптера включены, как и в исходных записях `series-2/lora/`. В каждой папке номера WAV соответствуют тем же примерам в `series-2/dit/`.

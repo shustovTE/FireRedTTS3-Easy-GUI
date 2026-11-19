@@ -57,6 +57,22 @@ class AblationTests(unittest.TestCase):
                 self.assertTrue(all(c.kwargs['settings'] == ablate.SETTINGS for c in gen.call_args_list))
                 self.assertEqual(sorted(p.name for p in output.glob('*.wav')), sorted(p.name for p in originals.iterdir()))
                 self.assertTrue(all(p.read_bytes() == b'original' for p in originals.iterdir()))
+                route.reset_mock()
+                gen.reset_mock()
+                with patch('sys.argv', ['ablation', '--series', str(originals), '--variants', 'backbone', 'both', '--audio-only']):
+                    ablate.main()
+                    ablate.main()
+                self.assertEqual([call.args[1] for call in route.call_args_list], ['backbone', 'both'])
+                self.assertEqual([{k:c.args[1][k] for k in rows[0]} for c in gen.call_args_list], rows*2)
+                for variant in ('backbone', 'both'):
+                    report = json.loads((series/variant/'report.json').read_text())
+                    self.assertEqual(report['plan']['variants'], [variant])
+                    self.assertEqual(set(report['results']), {p.name for p in originals.iterdir()})
+                    self.assertTrue(all(row['group'] == f'step-0500/{variant}' for row in report['results'].values()))
+                # The old single-DiT command still resumes the already rendered files.
+                with patch('sys.argv', ['ablation', '--dit-series', str(originals), '--audio-only']):
+                    ablate.main()
+                self.assertEqual(gen.call_count, 4)
                 sf.write(rows[0]['reference_audio'], np.ones(1000), 24000)
                 with self.assertRaisesRegex(ValueError, 'benchmark or reference'):
                     ablate.series_plan(series)

@@ -235,18 +235,33 @@ def render(root, plan, audio_only):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path)
+    parser.add_argument('--output', type=Path, help='Output directory (parent of the variant folders for multiple variants)')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--dit-cities-timofey', action='store_true',
                         help='Compare only the two DiT adapters on the original cities and timofey texts')
-    mode.add_argument('--dit-series', type=Path, help='Replay an existing series-N/lora folder using only DiT LoRA')
+    mode.add_argument('--series', '--dit-series', type=Path,
+                      help='Replay an existing series-N or series-N/lora folder (default variant: dit)')
+    parser.add_argument('--variants', nargs='+', choices=VARIANTS,
+                        help='LoRA components to enable in separate renders of --series')
     parser.add_argument('--audio-only', action='store_true', help='Save WAVs and spectral results; skip Whisper')
     args = parser.parse_args()
-    if args.dit_series:
-        series = args.dit_series.resolve()
+    if args.variants and not args.series:
+        parser.error('--variants requires --series')
+    if args.series:
+        series = args.series.resolve()
         if series.name == 'lora':
             series = series.parent
-        render((args.output or series/'dit').resolve(), series_plan(series), args.audio_only)
+        plan = series_plan(series)
+        variants = list(dict.fromkeys(args.variants or ['dit']))
+        for variant in variants:
+            output = series/variant
+            if args.output:
+                output = args.output/variant if len(variants) > 1 else args.output
+            variant_plan = dict(plan, variants=[variant])
+            if variant != 'dit':
+                variant_plan['schema'] = 'attention-series-v1'
+            print(f'[ablation] {variant} -> {output.resolve()}', flush=True)
+            render(output.resolve(), variant_plan, args.audio_only)
         return
     previous = vox_listen.RUN
     output = args.output or (DIT_OUTPUT if args.dit_cities_timofey else OUTPUT)
