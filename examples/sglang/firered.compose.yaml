@@ -1,0 +1,73 @@
+services:
+  firered-tts3:
+    image: hongccc/sglang-omni:dev@sha256:d2fbd80ec42c8a6d9dff4b8a4fdbee35d50c5a1b41aa8dc872925da6e0c82f6a
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    ipc: host
+    stop_grace_period: 60s
+
+    environment:
+      HF_TOKEN: "${HF_TOKEN:?Set a Hugging Face read token for the private model}"
+      FIRERED_MAX_RUNNING_REQUESTS: "${FIRERED_MAX_RUNNING_REQUESTS:-16}"
+      MAX_TEXT_CHARS: "${MAX_TEXT_CHARS:-2000}"
+      HF_HOME: /root/.cache/huggingface
+      SPEAKER_SAMPLES_DIR: /speakers
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch/inductor
+      CUDA_MPS_PIPE_DIRECTORY: /run/nvidia-mps
+
+    command:
+      - bash
+      - -euc
+      - |
+        [[ $$FIRERED_MAX_RUNNING_REQUESTS =~ ^([1-9]|1[0-6])$$ ]] || { echo 'FIRERED_MAX_RUNNING_REQUESTS must be 1..16' >&2; exit 1; }
+        [[ $$MAX_TEXT_CHARS =~ ^[1-9][0-9]*$$ ]] || { echo 'MAX_TEXT_CHARS must be a positive integer' >&2; exit 1; }
+        pipeline="$$PWD/examples/configs/firered_tts3_base.yaml"
+        # Keep the checkout clean for the image's next pull of main.
+        cp -as "$$PWD/sglang_omni" /run/firered-src/
+        cd /run/firered-src
+        cfg=sglang_omni/models/firered_tts3/config.py
+        sed -Ei "s/^MAX_TEXT_CHARS = [0-9]+$$/MAX_TEXT_CHARS = $$MAX_TEXT_CHARS/" "$$cfg"
+        rm -f "$${cfg%/*}"/__pycache__/config.*.pyc
+        grep -Fxq "MAX_TEXT_CHARS = $$MAX_TEXT_CHARS" "$$cfg" || { echo 'Check the upstream FireRed text limit' >&2; exit 1; }
+        export PYTHONPATH="$$PWD$${PYTHONPATH:+:$$PYTHONPATH}"
+        exec sgl-omni serve --config "$$pipeline" \
+          --model-path shustov-te/FireRedTTS3-Base-Russian \
+          --model-name FireRedTTS3-Base \
+          --host 0.0.0.0 --port 8092 --allowed-local-media-path /speakers \
+          --talker.engine.max_running_requests "$$FIRERED_MAX_RUNNING_REQUESTS"
+
+    tmpfs:
+      - /run/firered-src
+    volumes:
+      - ${HF_CACHE_DIR:-/opt/hf-cache}:/root/.cache/huggingface
+      - ./speakers-firered:/speakers
+      - firered-torch-cache:/root/.cache/torch
+      - /run/nvidia-mps:/run/nvidia-mps
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${FIRERED_GPU_ID:-0}"]
+              capabilities: [gpu]
+    networks:
+      - ai_bridge
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://127.0.0.1:8092/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 3600s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  ai_bridge:
+    external: true
+
+volumes:
+  firered-torch-cache:
