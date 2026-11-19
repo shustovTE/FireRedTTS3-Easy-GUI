@@ -89,7 +89,7 @@ def make_plan(current_run, previous_run, *, dit_cities_timofey=False):
     return plan
 
 
-def series_plan(series):
+def series_plan(series, *, base_fingerprint=None):
     """Read the same rows and load the sibling training checkpoint used by vox_recipe_sweep."""
     step_dir = series.parent
     if not series.name.startswith('series-') or step_dir.parent.name != 'audio':
@@ -101,8 +101,10 @@ def series_plan(series):
     checkpoint = step_dir.parent.parent/'lora'/step_dir.name
     record = json.loads((checkpoint/'checkpoint.json').read_text(encoding='utf-8'))
     recipe = record['recipe']
+    if base_fingerprint is None:
+        base_fingerprint = model_identity(MODEL_DIR)
     if (record['step'] != step or recipe != source['recipes']['lora'] or recipe['mode'] != 'lora'
-            or recipe['base_sha256'] != BASE_SHA or model_identity(MODEL_DIR) != BASE_SHA):
+            or recipe['base_sha256'] != BASE_SHA or base_fingerprint != BASE_SHA):
         raise ValueError(f'Checkpoint or Base differs from the saved series: {checkpoint}')
     cases, digest = load_benchmark(series/'benchmark.jsonl')
     originals = source['results']['lora']
@@ -122,6 +124,17 @@ def series_plan(series):
                 runtime={p:version(p) for p in ('torch','torchaudio','peft','transformers')})
 
 
+def phrase_cases(path, seeds):
+    phrases = json.loads(path.read_text(encoding='utf-8'))
+    cases = []
+    for length in ('short', 'long'):
+        for name, text in phrases[length].items():
+            for seed in seeds:
+                stem = f'{name}-seed{seed}'
+                cases.append(dict(id=f'{length}-{stem}', text=text, seed=seed, filename=f'{length}/{stem}.wav'))
+    return cases
+
+
 def listening_plan(folder):
     """Use the checkpoint, active variant and first case's voice from a saved listening series."""
     if folder.name not in VARIANTS:
@@ -133,15 +146,37 @@ def listening_plan(folder):
         raise ValueError(f'Saved variant, checkpoint or benchmark differs from {folder}')
     first = plan['cases'][0]
     reference = {key: first[key] for key in ('reference_audio', 'reference_sha256', 'reference_text', 'language')}
-    phrases = json.loads((ROOT/'examples/diagnostics/listening-ru-calls.json').read_text(encoding='utf-8'))
-    cases = []
-    for length in ('short', 'long'):
-        for name, text in phrases[length].items():
-            for seed in (1236, 1237):
-                stem = f'{name}-seed{seed}'
-                cases.append(dict(id=f'{length}-{stem}', text=text, seed=seed, filename=f'{length}/{stem}.wav'))
+    cases = phrase_cases(ROOT/'examples/diagnostics/listening-ru-calls.json', (1236, 1237))
     return dict(plan, schema='series-listening-calls-v1', variants=[folder.name], reference=reference,
                 reference_case=first['id'], cases=cases)
+
+
+def full_backbone_plan(step_dir):
+    base_fingerprint = model_identity(MODEL_DIR)
+    first = series_plan(step_dir/'series-1', base_fingerprint=base_fingerprint)
+    second = series_plan(step_dir/'series-2', base_fingerprint=base_fingerprint)
+    if first['checkpoints'] != second['checkpoints']:
+        raise ValueError('Listening series use different checkpoints')
+    controls = first['cases'] + second['cases']
+    standard = {(f'{name}_seed{seed}', seed) for name in ('cities', 'timofey', 'question') for seed in (1234, 1235)}
+    extra_cities = {(f'cities_seed{seed}', seed) for seed in range(1236, 1240)}
+    for plan, expected in ((first, standard), (second, extra_cities)):
+        if {(c['id'], c['seed']) for c in plan['cases']} != expected:
+            raise ValueError(f"Unexpected listening cases in {plan['series']}; expected {sorted(expected)}")
+    cases = [dict(c, filename=f"controls/{c['id']}.wav") for c in controls]
+    # Match the original helpers: vox_listen used the gate control, listening_plan used series-2's first voice.
+    gate_control = next(c for c in controls if c['id'] == vox_listen.DEFAULT_CASE)
+    calls = ROOT/'examples/diagnostics/listening-ru-calls.json'
+    for path, seeds, control in ((vox_listen.PHRASES, (1234, 1235), gate_control),
+                                 (calls, (1236, 1237), second['cases'][0])):
+        reference = {key: control[key] for key in ('reference_audio', 'reference_sha256', 'reference_text', 'language')}
+        for item in phrase_cases(path, seeds):
+            cases.append(dict(item, **reference, id=f"{path.stem}/{item['id']}",
+                              filename=f"{path.stem}/{item['filename']}"))
+    series = [{'path': plan['series'], 'benchmark_sha256': plan['benchmark_sha256']} for plan in (first, second)]
+    return dict(schema='backbone-full-listening-v1', series=series, checkpoints=first['checkpoints'],
+                base_sha256=first['base_sha256'], cases=cases, settings=first['settings'],
+                variants=['backbone'], include_base=False, attention='sdpa', runtime=first['runtime'])
 
 
 def generate(root, plan, report):
@@ -265,12 +300,18 @@ def main():
                       help='Replay an existing series-N or series-N/lora folder (default variant: dit)')
     mode.add_argument('--listen-from', type=Path, metavar='VARIANT_DIR',
                       help='Generate new short and long calls using the voice and adapter of a saved series variant')
+    mode.add_argument('--full-backbone', type=Path, metavar='AUDIO_STEP_DIR',
+                      help='Render both original benchmark series and both complete listening sets with only backbone LoRA.')
     parser.add_argument('--variants', nargs='+', choices=VARIANTS,
                         help='LoRA components to enable in separate renders of --series')
     parser.add_argument('--audio-only', action='store_true', help='Save WAVs and spectral results; skip Whisper')
     args = parser.parse_args()
     if args.variants and not args.series:
         parser.error('--variants requires --series')
+    if args.full_backbone:
+        step_dir = args.full_backbone.resolve()
+        render((args.output or step_dir/'backbone-complete').resolve(), full_backbone_plan(step_dir), args.audio_only)
+        return
     if args.listen_from:
         folder = args.listen_from.resolve()
         render((args.output or folder/'listening').resolve(), listening_plan(folder), args.audio_only)

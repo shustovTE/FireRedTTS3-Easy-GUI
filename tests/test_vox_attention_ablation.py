@@ -16,6 +16,53 @@ from test_training_batch import tiny_core
 
 
 class AblationTests(unittest.TestCase):
+    def test_complete_backbone_suite_uses_historical_voices_seeds_and_recovers_missing_wav(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            step = Path(tmp)/'step-0250'
+            common = dict(checkpoints={'step-0250': {'path': 'checkpoint'}}, base_sha256=ablate.BASE_SHA,
+                          settings=ablate.SETTINGS, runtime={})
+            def series(folder, *, base_fingerprint):
+                self.assertEqual(base_fingerprint, ablate.BASE_SHA)
+                groups = [('question', (1234, 1235)), ('cities', (1234, 1235)), ('timofey', (1234, 1235))]
+                if folder.name == 'series-2':
+                    groups = [('cities', (1236, 1237, 1238, 1239))]
+                cases = [dict(id=f'{name}_seed{seed}', text=name, seed=seed, language='Russian',
+                              reference_text=f'Референс {seed}', reference_audio=f'{seed}.wav',
+                              reference_sha256=str(seed)) for name, seeds in groups for seed in seeds]
+                return dict(common, cases=cases, series=str(folder), benchmark_sha256=folder.name)
+            pack = step/'backbone-complete'
+            generated = (np.ones(2400, dtype=np.float32)*1.1, 24000, {'finish_reason':'stop'})
+            with (patch.object(ablate, 'model_identity', return_value=ablate.BASE_SHA),
+                  patch.object(ablate, 'series_plan', side_effect=series),
+                  patch.object(ablate, 'ModelManager'), patch.object(ablate, 'route', return_value={'dit': 0}) as route,
+                  patch.object(ablate, 'generate_case', return_value=generated) as gen,
+                  patch('sys.argv', ['ablation', '--full-backbone', str(step), '--audio-only'])):
+                ablate.main()
+                report = json.loads((pack/'report.json').read_text())
+                self.assertTrue(report['audio_complete'])
+                self.assertEqual(report['plan']['variants'], ['backbone'])
+                self.assertFalse(report['plan']['settings']['do_split'])
+                self.assertEqual(len(report['results']), 58)
+                self.assertEqual(route.call_args.args[1], 'backbone')
+                for seed in range(1234, 1240):
+                    self.assertIn(f'controls/cities_seed{seed}.wav', report['results'])
+                for asset, seeds, ref in [('listening-ru-500', (1234, 1235), '1237.wav'),
+                                          ('listening-ru-calls', (1236, 1237), '1236.wav')]:
+                    texts = json.loads((ablate.ROOT/'examples/diagnostics'/f'{asset}.json').read_text())
+                    expected = {(text, seed, ref) for group in texts.values() for text in group.values() for seed in seeds}
+                    actual = {(c['text'], c['seed'], c['reference_audio']) for c in report['plan']['cases']
+                              if c['filename'].startswith(asset+'/')}
+                    self.assertEqual(actual, expected)
+                wav = pack/'controls/timofey_seed1234.wav'
+                self.assertEqual(sf.info(wav).subtype, 'FLOAT')
+                self.assertGreater(sf.read(wav)[0].max(), 1.)
+                ablate.main()
+                self.assertEqual(gen.call_count, 58)
+                wav.write_bytes(b'incomplete')
+                ablate.main()
+                self.assertEqual(gen.call_count, 59)
+                self.assertEqual(ablate.file_digest(wav), report['results']['controls/timofey_seed1234.wav']['wav_sha256'])
+
     def test_dit_series_uses_original_cases_and_ungated_weights(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)/'lora-base-recovery-4patch-0500'

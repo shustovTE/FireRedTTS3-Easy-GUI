@@ -17,11 +17,13 @@ from .vox_recipe_transfer import BASE_SHA, OUTPUT, paired_data, train, transfer_
 STEPS = (100, 200, 300, 400)
 
 
-def fresh_recovery(dataset, source, reports, *, stronger_comb=False, four_patch=False,
+def fresh_recovery(dataset, source, reports, *, stronger_comb=False, four_patch=False, four_patch_until=500,
                    rise_limit_percent=None, rise_cases=None, resonant=False, stronger_recovery_loss=False):
     dataset, source = dataset.resolve(), source.resolve()
     config = vox_recovery.STRONGER_COMB if stronger_comb else vox_recovery.CONFIG
-    steps = [100, 500] if four_patch else [50, 100]
+    if four_patch and four_patch_until not in (250, 500):
+        raise ValueError('Four-patch recovery ends at step 250 or 500')
+    steps = [100, four_patch_until] if four_patch else [50, 100]
     if four_patch:
         config = vox_recovery.FOUR_PATCH
     if stronger_recovery_loss and not resonant:
@@ -59,7 +61,7 @@ def fresh_recovery(dataset, source, reports, *, stronger_comb=False, four_patch=
     if four_patch:
         if resonant:
             suffix += '-resonant-w030' if stronger_recovery_loss else '-resonant-w015'
-        run = source / ('lora-base-recovery-4patch-0500' + suffix)
+        run = source / f'lora-base-recovery-4patch-{four_patch_until:04d}{suffix}'
         voice = vox_recovery_probe.select_voice(splits)
         plan['prefix_test'] = dict(voice=voice, texts=vox_recovery_probe.TEXTS, seeds=list(vox_recovery_probe.SEEDS),
                                    damage=vox_recovery_probe.probe_damage(recipe))
@@ -178,14 +180,14 @@ if __name__ == '__main__':
     parser.add_argument('--source', type=Path, default=Path(OUTPUT + '-levels'))
     parser.add_argument('--dataset', type=Path, default=Path(vox_recipe_levels.OUTPUT))
     parser.add_argument('--until', type=int,
-                        help='Absolute last update (31–400). Save and evaluate there and at earlier hundreds.')
+                        help='Absolute last update. Ordinary sweep: 31–400. Four-patch recovery: 250 or 500.')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--recovery', action='store_true',
                       help='Also train from the same pilot with damaged acoustic histories and compare to the clean run.')
     mode.add_argument('--recovery-from-base', action='store_true',
                       help='Train recovery LoRA from Base to 100. Save adapters and only adapted audio at 50 and 100.')
     mode.add_argument('--multistep-from-base', action='store_true',
-                      help='Fresh four-patch recovery LoRA from Base. Save and test at 100 and 500.')
+                      help='Fresh four-patch recovery LoRA from Base. Save and test at 100 and the final step (default 500).')
     parser.add_argument('--stronger-comb', action='store_true',
                         help='With --recovery-from-base, raise only the delayed signal coefficient from 0.35 to 0.50.')
     parser.add_argument('--resonant-history', action='store_true',
@@ -208,9 +210,10 @@ if __name__ == '__main__':
     if args.rise_limit_percent is not None and not (args.recovery_from_base or args.multistep_from_base):
         parser.error('--rise-limit-percent requires --recovery-from-base or --multistep-from-base')
     if args.multistep_from_base:
-        if args.until not in (None, 500):
-            parser.error('--multistep-from-base saves at 100 and 500')
+        if args.until not in (None, 250, 500):
+            parser.error('--multistep-from-base accepts --until 250 or 500')
         print(fresh_recovery(args.dataset, args.source, args.reports, four_patch=True,
+                             four_patch_until=args.until or 500,
                              resonant=args.resonant_history, stronger_recovery_loss=args.stronger_recovery_loss,
                              rise_limit_percent=args.rise_limit_percent, rise_cases=args.rise_case))
     elif args.recovery_from_base:

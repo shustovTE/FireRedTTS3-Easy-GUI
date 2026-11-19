@@ -172,6 +172,13 @@ class MultistepTests(unittest.TestCase):
                     sweep.fresh_recovery(root, root, [report], four_patch=True, resonant=resonant,
                                          stronger_recovery_loss=stronger)
                     plans.append(run.call_args.args)
+                sweep.fresh_recovery(root, root, [report], four_patch=True, four_patch_until=250)
+                short_run = run.call_args.args
+                self.assertEqual(short_run[2].name, 'lora-base-recovery-4patch-0250')
+                self.assertNotEqual(short_run[2], plans[0][2])
+                self.assertEqual(short_run[3]['steps'], [100, 250])
+                self.assertEqual(short_run[3]['recipe'], plans[0][3]['recipe'])
+                self.assertEqual(list(short_run[5]), [100, 250])
             self.assertEqual(len({args[2] for args in plans}), 3)
             standard, mild, strong = [args[3] for args in plans]
             self.assertEqual(standard['prefix_test']['damage'], probe.DAMAGE)
