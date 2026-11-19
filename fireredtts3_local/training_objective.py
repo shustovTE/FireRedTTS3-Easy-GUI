@@ -31,12 +31,17 @@ def dense_targets(profile):
     return ("dit", "dit_head", "stop_head") if profile == "hybrid" else ()
 
 
-def _attention_targets(core):
+def vox_attention_names(core):
     targets = []
     for layer in range(len(core.backbone_llm.layers)):
         targets.extend(f'backbone_llm.layers.{layer}.self_attn.{p}_proj' for p in ('q','k','v','o'))
     for layer in range(len(core.dit.blocks)):
         targets.extend(f'dit.blocks.{layer}.attn.{p}' for p in ('to_q','to_k','to_v','to_out.0'))
+    return targets
+
+
+def _attention_targets(core):
+    targets = vox_attention_names(core)
     if not core.backbone_llm.layers or not core.dit.blocks or any(
             not isinstance(core.get_submodule(n), torch.nn.Linear) for n in targets):
         raise ValueError('Cannot identify native FireRed attention projections')

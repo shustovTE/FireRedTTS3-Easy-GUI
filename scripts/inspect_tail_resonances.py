@@ -1,6 +1,7 @@
 """Measure long native FLOAT WAVs and make RMS-matched listening controls (NumPy/SciPy/Matplotlib)."""
 import argparse
 import csv
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -11,8 +12,10 @@ from scipy import signal
 from scipy.io import wavfile
 
 
-# Center, half-width in Hz. The middle two flanks together have the same width as the center.
-BANDS = [(2220, 85), (2965, 80), (5190, 160)]
+# Also support the documented standalone command in an isolated plotting environment.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fireredtts3_local.tail_contrast import BANDS, frame_contrast
 
 
 def db(power):
@@ -44,16 +47,13 @@ def measure(path):
     trough = (3400 <= f) & (f <= 4600)
     band_power = [np.mean(10**(shape[trough]/10)) for shape in shapes]
     row['relative_3400_4600_delta_db'] = db(band_power[1])-db(band_power[0])
-    contrasts = []
     for fc, w in BANDS:
         distance = np.abs(f-fc)
         inside = distance <= w
-        flank = (1.5*w <= distance) & (distance <= 2.5*w)
-        contrasts.append(db(power[inside].mean(axis=0))-db(power[flank].mean(axis=0)))
         peak = np.flatnonzero(inside)[np.argmax(shapes[1][inside])]
         row[f'peak_{fc}_hz'] = f[peak]
         row[f'at_peak_{fc}_normalized_delta_db'] = shapes[1][peak]-shapes[0][peak]
-    contrast = np.median(contrasts, axis=0)
+    contrast = frame_contrast(f, power)
     row['head_contrast_db'] = np.median(contrast[head])
     row['tail_contrast_db'] = np.median(contrast[tail])
     bins = []

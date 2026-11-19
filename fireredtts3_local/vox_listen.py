@@ -20,13 +20,8 @@ PHRASES = ROOT / 'examples/diagnostics/listening-ru-500.json'
 OUTPUT = ROOT / 'training/eval/listening-rise20-step0500'
 
 
-def listen(output, seeds, *, run=None, step=500):
-    if len(set(seeds)) != len(seeds) or not seeds or any(not 0 <= n < 2**32 for n in seeds):
-        raise ValueError('Supply distinct seeds between 0 and 4294967295')
-    if output.exists():
-        raise FileExistsError(f'{output} already exists. Choose a fresh folder with --output.')
-
-    checkpoint = (run or RUN) / 'lora' / f'step-{step:04d}'
+def checkpoint_inputs(run, step):
+    checkpoint = run / 'lora' / f'step-{step:04d}'
     record = json.loads((checkpoint / 'checkpoint.json').read_text(encoding='utf-8'))
     recipe = record['recipe']
     gate = recipe['rise_gate']
@@ -38,6 +33,18 @@ def listen(output, seeds, *, run=None, step=500):
     ref = local_path(control['reference_audio']).resolve(strict=True)
     if file_digest(ref) != control['reference_sha256'] or not control['reference_text'].strip():
         raise ValueError(f'The original listening reference has changed: {ref}')
+    return checkpoint, record, control, ref
+
+
+def listen(output, seeds, *, run=None, step=500):
+    if len(set(seeds)) != len(seeds) or not seeds or any(not 0 <= n < 2**32 for n in seeds):
+        raise ValueError('Supply distinct seeds between 0 and 4294967295')
+    if output.exists():
+        raise FileExistsError(f'{output} already exists. Choose a fresh folder with --output.')
+
+    checkpoint, record, control, ref = checkpoint_inputs(run or RUN, step)
+    recipe = record['recipe']
+    gate = recipe['rise_gate']
     if model_identity(MODEL_DIR) != recipe['base_sha256']:
         raise ValueError(f'Base weights differ from the checkpoint: {MODEL_DIR}')
 
