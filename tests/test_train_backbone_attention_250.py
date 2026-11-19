@@ -36,13 +36,18 @@ class BackboneRunTests(unittest.TestCase):
                     benchmark_sha256=digest, results={'base': baseline}))
 
             def train(data, out, mode, until, *, resume, **kwargs):
-                self.assertEqual((data, out, mode, until), (dataset, run, 'lora', 250))
+                self.assertIn(until, (250, 500))
+                self.assertEqual((data, out, mode), (dataset, run if until == 250 else source/job.CONTINUATION, 'lora'))
+                parent = run/'lora/step-0250' if until == 500 and not (out/'lora/step-0500').exists() else None
                 self.assertEqual(kwargs, dict(shared_features=source/'features', backbone_only=True,
-                    recovery=job.vox_recovery.FOUR_PATCH, checkpoint_steps=(100,), expected_dataset_sha256='data'))
-                replay = json.loads((run/'replay.json').read_text())
-                self.assertEqual(replay['audio_steps'], [250])
-                step = 250 if resume else 100
-                checkpoint = run/'lora'/f'step-{step:04d}'
+                    recovery=job.vox_recovery.FOUR_PATCH, checkpoint_steps=(100,) if until == 250 else (),
+                    expected_dataset_sha256='data', fork_from=parent))
+                if until == 500:
+                    self.assertTrue(resume)
+                replay = json.loads((out/'replay.json').read_text())
+                self.assertEqual(replay['audio_steps'], [until])
+                step = until if resume else 100
+                checkpoint = out/'lora'/f'step-{step:04d}'
                 if checkpoint.exists():
                     return
                 checkpoint.mkdir(parents=True)
@@ -51,6 +56,8 @@ class BackboneRunTests(unittest.TestCase):
                     raise InterruptedError
                 (checkpoint/'adapter_config.json').write_text('{}')
                 (checkpoint/'adapter_model.safetensors').write_bytes(b'weights')
+                (checkpoint/'training_state.pt').write_bytes(b'optimizer, scheduler, RNG')
+                (checkpoint/'firered_lora_metadata.json').write_text('{}')
 
             generated = (np.ones(2400, dtype=np.float32)*.1, 24000, {'finish_reason': 'stop'})
             with (patch.object(job.vox_recipe_transfer, 'train', side_effect=train),
@@ -62,6 +69,9 @@ class BackboneRunTests(unittest.TestCase):
                 with self.assertRaises(InterruptedError):
                     job.run(source, dataset)
                 self.assertFalse((run/'audio').exists())
+                with self.assertRaises(FileNotFoundError):
+                    job.run(source, dataset, continue_to_500=True)
+                self.assertFalse((source/job.CONTINUATION/'replay.json').exists())
                 job.run(source, dataset)
                 job.run(source, dataset)
                 self.assertEqual(gen.call_count, 58)
@@ -72,3 +82,15 @@ class BackboneRunTests(unittest.TestCase):
                 self.assertTrue(report['audio_complete'])
                 self.assertTrue(all(row['active_layers'] == {'backbone': 8, 'dit': 0}
                                     for row in report['results'].values()))
+                job.run(source, dataset, continue_to_500=True)
+                job.run(source, dataset, continue_to_500=True)
+                self.assertEqual(gen.call_count, 116)
+                new = source/job.CONTINUATION
+                self.assertEqual([p.name for p in (new/'audio').iterdir()], ['step-0500'])
+                final = json.loads((new/'audio/step-0500/backbone-complete/report.json').read_text())
+                self.assertEqual(final['plan']['cases'], report['plan']['cases'])
+                self.assertEqual(final['plan']['variants'], ['backbone'])
+                self.assertEqual(json.loads((pack/'report.json').read_text()), report)
+                (run/'lora/step-0250/training_state.pt').write_bytes(b'different state')
+                with self.assertRaisesRegex(ValueError, 'different training or listening inputs'):
+                    job.run(source, dataset, continue_to_500=True)

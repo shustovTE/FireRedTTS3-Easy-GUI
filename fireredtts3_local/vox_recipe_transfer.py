@@ -256,8 +256,9 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
         recipe['recovery_start_step'] = 0
     start = 0
     if prior:
-        expected = parent_recipe if fork_from is not None else recipe
-        if not resume or saved['recipe'] != expected:
+        # A separate output may continue the exact recipe, or add recovery to its clean parent.
+        allowed_recipes = (recipe, parent_recipe) if fork_from is not None else (recipe,)
+        if not resume or saved['recipe'] not in allowed_recipes:
             raise ValueError(f'Existing checkpoint {prior}: use --resume with the same recipe and data')
         start = saved['step']
     elif resume:

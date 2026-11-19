@@ -73,3 +73,30 @@ pack="$run/audio/step-0250/backbone-complete"
 ls "$run/lora/step-0250/adapter_model.safetensors"
 jq '{audio_complete, asr_complete, wavs: (.results | length)}' "$pack/report.json"
 ```
+
+### Продолжить backbone-only с 250 до 500
+
+Ключ `--continue-to-500` берёт `lora/step-0250` из `lora-backbone-only-recovery-4patch-0250`. С шага 251 восстанавливаются веса LoRA, состояние AdamW, расписание LR и генераторы случайных чисел. Обучение использует следующие 4 000 предъявлений из того же порядка примеров. На шаге 500 сохраняется чекпойнт, генерируются те же 58 WAV и запускается Whisper.
+
+```bash
+cd /opt/firered-tuning
+git pull --ff-only origin feat/russian-tts-adaptation
+mkdir -p training/logs
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 nohup .venv/bin/python -u \
+  -m fireredtts3_local.train_backbone_attention_250 --continue-to-500 \
+  >> training/logs/firered-backbone-only-500.log 2>&1 < /dev/null &
+```
+
+```bash
+tail -n 30 -f /opt/firered-tuning/training/logs/firered-backbone-only-500.log
+```
+
+После загрузки чекпойнта в логе появится `updates 251..500`. Новый каталог содержит адаптер, отчёт и аудио шага 500. Относительные имена WAV совпадают с комплектом шага 250.
+
+```bash
+cd /opt/firered-tuning
+run=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-backbone-only-recovery-4patch-0500
+pack="$run/audio/step-0500/backbone-complete"
+ls "$run/lora/step-0500/adapter_model.safetensors"
+jq '{audio_complete, asr_complete, wavs: (.results | length)}' "$pack/report.json"
+```

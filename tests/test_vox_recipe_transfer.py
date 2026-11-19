@@ -232,9 +232,16 @@ class TransferTests(unittest.TestCase):
                     final = tensors('backbone-only')
                     self.assertTrue(any(not torch.equal(first[k], final[k]) for k in final))
                     resumed = tensors('backbone-resumed')
+                    transfer.train(root, root/'backbone-continued', mode, 2, True,
+                                   fork_from=root/'backbone-only'/mode/'step-0001', **pure)
+                    continued = tensors('backbone-continued')
                     for key in final:
                         self.assertIn('.self_attn.', key)
                         torch.testing.assert_close(final[key], resumed[key], rtol=0, atol=0)
+                        torch.testing.assert_close(final[key], continued[key], rtol=0, atol=0)
+                    states = [torch.load(root/run/mode/'step-0002/training_state.pt', weights_only=True)
+                              for run in ('backbone-only', 'backbone-continued')]
+                    torch.testing.assert_close(*states, rtol=0, atol=0)
                     self.assertFalse((root/'backbone-only'/'audio').exists())
                     with self.assertRaisesRegex(ValueError, 'same recipe'):
                         transfer.train(root, root/'backbone-only', mode, 3, True, recovery=transfer.vox_recovery.FOUR_PATCH)
