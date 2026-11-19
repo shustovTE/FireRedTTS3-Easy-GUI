@@ -46,9 +46,9 @@ def default_benchmark(validation):
             for name, text in texts.items() for seed in (1234, 1235)]
 
 
-def load_saved_base(path):
+def load_saved_base(path, *, benchmark=None):
     report = json.loads(path.read_text(encoding='utf-8'))
-    cases, fingerprint = load_benchmark(path.parent / 'benchmark.jsonl')
+    cases, fingerprint = benchmark if benchmark is not None else load_benchmark(path.parent / 'benchmark.jsonl')
     recipes = report.get('recipes', {})
     if (not report['complete'] or report['benchmark_sha256'] != fingerprint or report['settings'] != SETTINGS
             or not recipes or any(recipe['base_sha256'] != BASE_SHA for recipe in recipes.values())):

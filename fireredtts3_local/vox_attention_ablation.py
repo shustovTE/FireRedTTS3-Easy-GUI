@@ -20,7 +20,7 @@ from .tail_contrast import contrast_windows
 from .training_data import model_identity, file_digest
 from .training_job import write_json
 from .training_monitor import generate_case, load_benchmark, SETTINGS
-from .training_objective import vox_attention_names
+from .training_objective import BACKBONE_ATTENTION, vox_attention_names
 from .vox_recipe_transfer import BASE_SHA
 
 OUTPUT = ROOT / 'training/eval/attention-resonant100-previous500'
@@ -29,7 +29,7 @@ VARIANTS = ('backbone', 'dit', 'both')
 STAGES = ('resonant-0100', 'previous-0500')
 
 
-def route(core, variant):
+def route(core, variant, *, backbone_only=False):
     if variant not in VARIANTS or not isinstance(core, PeftModel) or set(core.peft_config) != {'default'}:
         raise ValueError('Expected one unmerged attention adapter')
     config = core.peft_config['default']
@@ -37,8 +37,11 @@ def route(core, variant):
         raise ValueError('Extra trained parameters would invalidate this comparison')
     base = core.get_base_model()
     layers = {name: layer for name, layer in base.named_modules() if isinstance(layer, LoraLayer)}
-    if set(layers) != set(vox_attention_names(base)) or any(isinstance(m, ModulesToSaveWrapper) for m in base.modules()):
-        raise ValueError('Adapter targets do not match the Vox recipe backbone and DiT attention projections')
+    if backbone_only and variant != 'backbone':
+        raise ValueError('This checkpoint contains only backbone attention LoRA')
+    if set(layers) != set(vox_attention_names(base, backbone_only=backbone_only)) or any(
+            isinstance(m, ModulesToSaveWrapper) for m in base.modules()):
+        raise ValueError('Adapter targets do not match the declared attention projections')
     if any(m.merged or m.active_adapters != ['default'] or set(m.lora_A) != {'default'}
            or set(m.lora_B) != {'default'} for m in layers.values()):
         raise ValueError('Expected exactly one unmerged default LoRA on every target')
@@ -89,6 +92,11 @@ def make_plan(current_run, previous_run, *, dit_cities_timofey=False):
     return plan
 
 
+def checkpoint_files(checkpoint):
+    files = ('adapter_config.json', 'adapter_model.safetensors', 'checkpoint.json')
+    return {checkpoint.name: dict(path=str(checkpoint), hashes={name: file_digest(checkpoint/name) for name in files})}
+
+
 def series_plan(series, *, base_fingerprint=None):
     """Read the same rows and load the sibling training checkpoint used by vox_recipe_sweep."""
     step_dir = series.parent
@@ -116,9 +124,7 @@ def series_plan(series, *, base_fingerprint=None):
                 any(original[key] != case[key] for key in ('id', 'text', 'seed'))):
             raise ValueError(f'Case differs from the saved LoRA result: {filename}')
         case['filename'] = filename
-    files = ('adapter_config.json', 'adapter_model.safetensors', 'checkpoint.json')
-    weights = dict(path=str(checkpoint), hashes={name: file_digest(checkpoint/name) for name in files})
-    return dict(schema='dit-series-v1', series=str(series), checkpoints={step_dir.name: weights},
+    return dict(schema='dit-series-v1', series=str(series), checkpoints=checkpoint_files(checkpoint),
                 base_sha256=BASE_SHA, benchmark_sha256=digest, cases=cases, settings=source['settings'],
                 variants=['dit'], include_base=False, attention='sdpa',
                 runtime={p:version(p) for p in ('torch','torchaudio','peft','transformers')})
@@ -157,6 +163,10 @@ def full_backbone_plan(step_dir):
     second = series_plan(step_dir/'series-2', base_fingerprint=base_fingerprint)
     if first['checkpoints'] != second['checkpoints']:
         raise ValueError('Listening series use different checkpoints')
+    return backbone_listening_pack(first['checkpoints'], first, second, first['runtime'])
+
+
+def backbone_listening_pack(checkpoints, first, second, runtime):
     controls = first['cases'] + second['cases']
     standard = {(f'{name}_seed{seed}', seed) for name in ('cities', 'timofey', 'question') for seed in (1234, 1235)}
     extra_cities = {(f'cities_seed{seed}', seed) for seed in range(1236, 1240)}
@@ -174,9 +184,9 @@ def full_backbone_plan(step_dir):
             cases.append(dict(item, **reference, id=f"{path.stem}/{item['id']}",
                               filename=f"{path.stem}/{item['filename']}"))
     series = [{'path': plan['series'], 'benchmark_sha256': plan['benchmark_sha256']} for plan in (first, second)]
-    return dict(schema='backbone-full-listening-v1', series=series, checkpoints=first['checkpoints'],
-                base_sha256=first['base_sha256'], cases=cases, settings=first['settings'],
-                variants=['backbone'], include_base=False, attention='sdpa', runtime=first['runtime'])
+    return dict(schema='backbone-full-listening-v1', series=series, checkpoints=checkpoints,
+                base_sha256=BASE_SHA, cases=cases, settings=SETTINGS,
+                variants=['backbone'], include_base=False, attention='sdpa', runtime=runtime)
 
 
 def generate(root, plan, report):
@@ -204,7 +214,8 @@ def generate(root, plan, report):
                 if tts is None:
                     tts = manager.load_base(attention_backend='sdpa', adapter_path=checkpoint)
                     tts.tts_core.eval()
-                counts = route(tts.tts_core, variant) if checkpoint else {'backbone':0, 'dit':0}
+                counts = (route(tts.tts_core, variant, backbone_only=plan.get('adapter_profile') == BACKBONE_ATTENTION)
+                          if checkpoint else {'backbone':0, 'dit':0})
                 for case, name in pending:
                     row = {**plan.get('reference', {}), **case}
                     samples, rate, run = generate_case(tts, row, settings=plan['settings'])

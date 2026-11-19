@@ -18,6 +18,7 @@ from fireredtts3_local.vox_recipe_transfer import configure, objective, save_che
 from fireredtts3_local.vox_recipe_compare import content_flags
 from fireredtts3_local import vox_recipe_transfer as transfer
 from fireredtts3_local import voxcpm_data
+from fireredtts3_local import vox_attention_ablation as ablation
 
 
 def speaker_rows(root, speaker, lengths, corpus='dialogs'):
@@ -105,12 +106,12 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(stats['a']['train_seconds'], 0)
 
     def test_modes_update_and_reload(self):
-        for mode in ('lora','full'):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+        for mode, backbone_only in (('lora', False), ('full', False), ('lora', True)):
+            with self.subTest(mode=mode, backbone_only=backbone_only), tempfile.TemporaryDirectory() as tmp:
                 torch.manual_seed(5)
                 base = tiny_core()
                 original = {k: v.clone() for k,v in base.state_dict().items()}
-                core = configure(base, mode)
+                core = configure(base, mode, backbone_only=backbone_only)
                 tts = SimpleNamespace(tts_core=core, device='cpu', _tokenize_text=lambda text: torch.tensor([1,2,3]))
                 def payload(n):
                     z = torch.randn(1,n*2,4)
@@ -136,15 +137,30 @@ class TransferTests(unittest.TestCase):
                 if mode == 'lora':
                     names = [n for n,p in core.named_parameters() if p.requires_grad]
                     self.assertTrue(all('lora_' in n and ('.self_attn.' in n or '.attn.' in n) for n in names))
-                    self.assertTrue(any('.dit.' in n for n in names))
+                    self.assertEqual(any('.dit.' in n for n in names), not backbone_only)
+                    if backbone_only:
+                        self.assertTrue(any(p.grad is not None and torch.any(p.grad != 0) for p in params))
+                        self.assertTrue(all(p.grad is None for p in core.dit.parameters()))
                 opt.step()
                 schedule.step()
                 core.eval()
                 expected, _ = objective(tts, batch, mode, 7, False)
-                path = save_checkpoint(Path(tmp), core, opt, schedule, dict(mode=mode, base_sha256='toy'), 1, {})
+                recipe = dict(mode=mode, base_sha256='toy')
+                if backbone_only:
+                    recipe['adapter_profile'] = transfer.BACKBONE_ATTENTION
+                path = save_checkpoint(Path(tmp), core, opt, schedule, recipe, 1, {})
                 fresh = tiny_core()
                 fresh.load_state_dict(original)
-                tts.tts_core = configure(fresh, mode, path)
+                tts.tts_core = configure(fresh, mode, path, backbone_only=backbone_only)
+                if backbone_only:
+                    from safetensors.torch import load_file
+                    weights = load_file(path/'adapter_model.safetensors')
+                    self.assertTrue(all('.backbone_llm.' in k and '.self_attn.' in k for k in weights))
+                    self.assertEqual(len(weights), 2 * 4 * len(core.backbone_llm.layers))
+                    metadata = json.loads((path/'firered_lora_metadata.json').read_text())
+                    self.assertEqual(metadata['recipe']['options']['profile'], transfer.BACKBONE_ATTENTION)
+                    self.assertEqual(ablation.route(tts.tts_core, 'backbone', backbone_only=True),
+                                     {'backbone': 4 * len(core.backbone_llm.layers), 'dit': 0})
                 tts.tts_core.eval()
                 actual, _ = objective(tts, batch, mode, 7, False)
                 torch.testing.assert_close(actual, expected)
@@ -207,6 +223,21 @@ class TransferTests(unittest.TestCase):
                     for key in wanted:
                         torch.testing.assert_close(wanted[key], replayed[key], rtol=0, atol=0, msg=key)
                     self.assertFalse((root/'fork'/mode/'step-0001').exists())
+                    pure = dict(recovery=transfer.vox_recovery.FOUR_PATCH, backbone_only=True,
+                                expected_dataset_sha256='toy', checkpoint_steps=(1,))
+                    transfer.train(root, root/'backbone-only', mode, 2, False, **pure)
+                    transfer.train(root, root/'backbone-resumed', mode, 1, False, **pure)
+                    transfer.train(root, root/'backbone-resumed', mode, 2, True, **pure)
+                    first = load_file(root/'backbone-only'/mode/'step-0001'/name)
+                    final = tensors('backbone-only')
+                    self.assertTrue(any(not torch.equal(first[k], final[k]) for k in final))
+                    resumed = tensors('backbone-resumed')
+                    for key in final:
+                        self.assertIn('.self_attn.', key)
+                        torch.testing.assert_close(final[key], resumed[key], rtol=0, atol=0)
+                    self.assertFalse((root/'backbone-only'/'audio').exists())
+                    with self.assertRaisesRegex(ValueError, 'same recipe'):
+                        transfer.train(root, root/'backbone-only', mode, 3, True, recovery=transfer.vox_recovery.FOUR_PATCH)
                     transfer.train(root, root/'recover', mode, 2, True, fork_from=earlier, recovery=True)
                     recovered = tensors('recover')
                     self.assertTrue(any(not torch.equal(got[k], recovered[k]) for k in got))

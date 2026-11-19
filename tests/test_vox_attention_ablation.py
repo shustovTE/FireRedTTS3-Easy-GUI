@@ -61,6 +61,9 @@ class AblationTests(unittest.TestCase):
                 wav.write_bytes(b'incomplete')
                 ablate.main()
                 self.assertEqual(gen.call_count, 59)
+                # The FLOAT WAV header can contain a new PEAK chunk timestamp.
+                np.testing.assert_array_equal(sf.read(wav, dtype='float32')[0], generated[0])
+                report = json.loads((pack/'report.json').read_text())
                 self.assertEqual(ablate.file_digest(wav), report['results']['controls/timofey_seed1234.wav']['wav_sha256'])
 
     def test_dit_series_uses_original_cases_and_ungated_weights(self):
@@ -99,7 +102,7 @@ class AblationTests(unittest.TestCase):
                 ablate.render(output, plan, audio_only=True)
                 ablate.render(output, plan, audio_only=True)
                 manager.return_value.load_base.assert_called_once_with(attention_backend='sdpa', adapter_path=str(ckpt))
-                route.assert_called_once_with(manager.return_value.load_base.return_value.tts_core, 'dit')
+                route.assert_called_once_with(manager.return_value.load_base.return_value.tts_core, 'dit', backbone_only=False)
                 self.assertEqual([{k:c.args[1][k] for k in rows[0]} for c in gen.call_args_list], rows)
                 self.assertTrue(all(c.kwargs['settings'] == ablate.SETTINGS for c in gen.call_args_list))
                 self.assertEqual(sorted(p.name for p in output.glob('*.wav')), sorted(p.name for p in originals.iterdir()))
@@ -127,7 +130,7 @@ class AblationTests(unittest.TestCase):
                 with patch('sys.argv', ['ablation', '--listen-from', str(backbone), '--audio-only']):
                     ablate.main()
                     ablate.main()
-                route.assert_called_once_with(manager.return_value.load_base.return_value.tts_core, 'backbone')
+                route.assert_called_once_with(manager.return_value.load_base.return_value.tts_core, 'backbone', backbone_only=False)
                 pack = backbone/'listening'
                 self.assertEqual(len(list((pack/'short').glob('*.wav'))), 16)
                 self.assertEqual(len(list((pack/'long').glob('*.wav'))), 8)

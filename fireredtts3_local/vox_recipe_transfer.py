@@ -21,7 +21,7 @@ from .training_batch import batch_flow_loss, set_training
 from .training_data import file_digest, model_identity, plain_text
 from .training_features import BatchFeatures, BatchRequest, FeatureCache, precompute_features
 from .training_job import write_json
-from .training_objective import adapter_targets
+from .training_objective import BACKBONE_ATTENTION, adapter_targets, vox_attention_names
 from .training_run import isolated_rng, require_training_hardware, to_examples
 from .workspace_paths import local_path
 
@@ -136,18 +136,31 @@ def paired_data(dataset):
     return splits, list(unique.values()), selection
 
 
-def configure(core, mode, checkpoint=None):
+def configure(core, mode, checkpoint=None, *, backbone_only=False):
+    if backbone_only and mode != 'lora':
+        raise ValueError('Backbone attention training requires LoRA')
     if mode == 'full':
         if checkpoint:
             from safetensors.torch import load_model
             load_model(core, checkpoint / 'fireredtts3_base' / 'model.safetensors', strict=True)
         return core.float().requires_grad_(True)
     from peft import LoraConfig
-    from .hybrid import create_adapter, load_adapter
+    from .hybrid import check_trainable, create_adapter, load_adapter
+    profile = BACKBONE_ATTENTION if backbone_only else 'vox_attention'
     if checkpoint:
-        return load_adapter(core, checkpoint, is_trainable=True)
-    return create_adapter(core, LoraConfig(r=32, lora_alpha=32, lora_dropout=0.,
-                                          target_modules=adapter_targets(core, 'vox_attention'), bias='none'))
+        wrapped = load_adapter(core, checkpoint, is_trainable=True)
+    else:
+        wrapped = create_adapter(core, LoraConfig(r=32, lora_alpha=32, lora_dropout=0.,
+                                                  target_modules=adapter_targets(core, profile), bias='none'))
+    if backbone_only:
+        from peft.tuners.lora.layer import LoraLayer
+        base = wrapped.get_base_model()
+        layers = {name for name, layer in base.named_modules() if isinstance(layer, LoraLayer)}
+        if layers != set(vox_attention_names(base, backbone_only=True)):
+            raise ValueError('Expected only backbone Q/K/V/O LoRA in every transformer block')
+        check_trainable(wrapped, profile)
+        print(f'[transfer] Trainable LoRA on {len(layers)} backbone Q/K/V/O projections; DiT frozen.', flush=True)
+    return wrapped
 
 
 def batches(pairs):
@@ -189,7 +202,7 @@ def save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics):
             core.save_pretrained(folder)
             (folder / 'firered_lora_metadata.json').write_text(json.dumps(dict(
                 base_fingerprint=recipe['base_sha256'], step=step,
-                recipe={**recipe, 'options': {'profile': 'vox_attention'}})))
+                recipe={**recipe, 'options': {'profile': recipe.get('adapter_profile', 'vox_attention')}})))
         torch.save({'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
                     'cpu_rng': torch.get_rng_state(), 'cuda_rng': torch.cuda.get_rng_state_all()},
                    folder / 'training_state.pt')
@@ -206,7 +219,8 @@ def transfer_recipe(mode, dataset_sha256):
                 warmup=100, weight_decay=.01, max_grad_norm=1., flow_weight=1., stop_weight=1.)
 
 
-def train(dataset, output, mode, until, resume, *, fork_from=None, shared_features=None, recovery=False, rise_gate=None):
+def train(dataset, output, mode, until, resume, *, fork_from=None, shared_features=None, recovery=False,
+          rise_gate=None, backbone_only=False, checkpoint_steps=(), expected_dataset_sha256=None):
     from transformers import get_cosine_schedule_with_warmup
     if not 1 <= until <= TOTAL:
         raise ValueError('--until must be between 1 and 1000')
@@ -219,11 +233,15 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
     require_training_hardware()
     print(f'[transfer] Auditing prepared audio and transcripts in {dataset}', flush=True)
     splits, rows, selection = paired_data(dataset)
+    if expected_dataset_sha256 is not None and selection['selection_sha256'] != expected_dataset_sha256:
+        raise ValueError('Training selection differs from the original listening experiment')
     print(f'[transfer] Verified {len(rows)} unique audio files; checking the original FireRed weights', flush=True)
     fingerprint = model_identity(MODEL_DIR)
     if fingerprint != BASE_SHA:
         raise ValueError('This comparison requires the original unmerged FireRedTTS3 Base')
     parent_recipe = transfer_recipe(mode, selection['selection_sha256'])
+    if backbone_only:
+        parent_recipe['adapter_profile'] = BACKBONE_ATTENTION
     recipe = dict(parent_recipe, acoustic_recovery=recovery) if recovery else parent_recipe
     if rise_gate:
         recipe['rise_gate'] = rise_gate
@@ -271,7 +289,7 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
             tts.spk_extractor.to('cpu')
         torch.cuda.empty_cache()
         loader = BatchFeatures(cache)
-        core = tts.tts_core = configure(tts.tts_core, mode, prior)
+        core = tts.tts_core = configure(tts.tts_core, mode, prior, backbone_only=backbone_only)
         core.backbone_llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
         params = [p for p in core.parameters() if p.requires_grad]
         if torch.device(tts.device).type == "cuda":
@@ -296,6 +314,7 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
             metrics = validate(tts, loader, splits['validation'], mode)
             print(f'[validation] base step=0 {metrics}', flush=True)
         set_training(core)
+        progress_total = until if backbone_only else TOTAL
         for step in range(start+1, until+1):
             optimizer.zero_grad(set_to_none=True)
             loss_sum = 0.
@@ -336,8 +355,8 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
                 optimizer.step()
                 scheduler.step()
             if step % 10 == 0 or step == until:
-                print(f'[transfer] {mode} {step}/{TOTAL} loss={loss_sum:.6f} grad_norm={norm:.4f}', flush=True)
-            if step % 500 == 0 or step == until:
+                print(f'[transfer] {mode} {step}/{progress_total} loss={loss_sum:.6f} grad_norm={norm:.4f}', flush=True)
+            if step % 500 == 0 or step == until or step in checkpoint_steps:
                 metrics = validate(tts, loader, splits['validation'], mode)
                 if rise_gate:
                     metrics.update(accepted_updates=scheduler.last_epoch, rejected_updates=step-scheduler.last_epoch)

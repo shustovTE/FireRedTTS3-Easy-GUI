@@ -46,3 +46,30 @@ jq '{audio_complete, asr_complete, variants: .plan.variants, wavs: (.results | l
 ```bash
 tar -C "$pack" -czf "$run/backbone-0250-audio.tar.gz" .
 ```
+
+## Обучение только Q/K/V/O backbone от Base, 250 шагов
+
+Этот отдельный запуск обучает LoRA в 112 проекциях внимания backbone (28 блоков × Q/K/V/O). DiT работает с исходными весами и передаёт градиент в backbone. Параметры адаптера — rank 32, alpha 32 и dropout 0. Программа берёт те же нормализованные Dialogs и Spontaneous, сверяет отбор с двумя исходными сериями и использует прежнюю задачу восстановления четырёх патчей с весом 0,15.
+
+```bash
+cd /opt/firered-tuning
+git pull --ff-only origin feat/russian-tts-adaptation
+mkdir -p training/logs
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 nohup .venv/bin/python -u \
+  -m fireredtts3_local.train_backbone_attention_250 \
+  >> training/logs/firered-backbone-only-250.log 2>&1 < /dev/null &
+```
+
+```bash
+tail -n 30 -f /opt/firered-tuning/training/logs/firered-backbone-only-250.log
+```
+
+На шаге 100 сохраняется промежуточный чекпойнт для продолжения. На шаге 250 сохраняется итоговый адаптер, затем записываются все 58 WAV из таблицы выше с теми же голосами и seed. После записи Whisper рассчитывает WER. При повторном запуске скрипт продолжает с последнего сохранённого чекпойнта этого эксперимента и сверяет хеши уже записанных WAV.
+
+```bash
+cd /opt/firered-tuning
+run=training/outputs/firered-vox-recipe-12-cap30m-levels/lora-backbone-only-recovery-4patch-0250
+pack="$run/audio/step-0250/backbone-complete"
+ls "$run/lora/step-0250/adapter_model.safetensors"
+jq '{audio_complete, asr_complete, wavs: (.results | length)}' "$pack/report.json"
+```
