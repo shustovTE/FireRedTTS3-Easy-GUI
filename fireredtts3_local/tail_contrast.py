@@ -14,7 +14,7 @@ def frame_contrast(f, power):
     return np.median(contrasts, axis=0)
 
 
-def contrast_windows(samples, rate):
+def contrast_trace(samples, rate):
     if rate != 24000:
         raise ValueError('Tail resonance measurements require native 24 kHz output')
     # Match scipy.signal.stft in inspect_tail_resonances, without requiring SciPy on Gauss.
@@ -31,6 +31,11 @@ def contrast_windows(samples, rate):
             power[1:-1] *= 2
             active = power.sum(axis=0)*f[1] > 1e-4
             contrast[i:i+len(x)] = np.where(active, frame_contrast(f, power), np.nan)
+    return t, contrast
+
+
+def contrast_windows(samples, rate):
+    t, contrast = contrast_trace(samples, rate)
     def median(start, end):
         v = contrast[(t >= start) & (t < end) & np.isfinite(contrast)]
         return float(np.median(v)) if len(v) else None
