@@ -129,12 +129,25 @@ class ModelManager:
                     torch.cuda.empty_cache()
             self.ensure_weights(log)
             self._ensure_upstream_namespace()
-            self._patch_shared_redae()
             from fireredtts3.core import FireRedTTS3
+            from . import redae_decoder_training
+            paired = redae_decoder_training.has_decoder(adapter_path) if adapter_path else False
+            original_codec = self._shared_redae
+            if paired:
+                # The adapted decoder belongs to this Base instance only (Instruct shares the original codec).
+                self._shared_redae = None
             log(f"[model] Loading FireRedTTS3 Base ({attention_backend}) ...")
-            self.base = FireRedTTS3(str(MODEL_DIR), use_fasttext=True, use_llm_tn=False, use_wetext=True)
-            self.base = self._attach_adapter(self.base, adapter_path, log)
-            self.base = self._compile_runtime(self.base, bool(torch_compile), compile_mode, log)
+            try:
+                self._patch_shared_redae()
+                model = FireRedTTS3(str(MODEL_DIR), use_fasttext=True, use_llm_tn=False, use_wetext=True)
+            finally:
+                if paired:
+                    self._shared_redae = original_codec
+            model = self._attach_adapter(model, adapter_path, log)
+            if paired:
+                redae_decoder_training.configure(model.redae, Path(adapter_path), training=False)
+                log(f"[adapter] Loaded paired RedAE decoder: {adapter_path}")
+            self.base = self._compile_runtime(model, bool(torch_compile), compile_mode, log)
             self._base_key = key
             log("[model] FireRedTTS3 Base ready.")
             return self.base

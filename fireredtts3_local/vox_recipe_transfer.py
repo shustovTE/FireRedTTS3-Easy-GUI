@@ -14,7 +14,7 @@ import soundfile as sf
 import torch
 
 from . import vox_recipe_levels, voxcpm_balance, voxcpm_data
-from . import vox_recovery, vox_rise_gate
+from . import redae_decoder_training, vox_recovery, vox_rise_gate
 from .model_manager import ModelManager
 from .paths import MODEL_DIR
 from .training_batch import batch_flow_loss, set_training
@@ -177,20 +177,27 @@ def objective(tts, loaded, mode, seed, train):
 
 
 @torch.no_grad()
-def validate(tts, loader, pairs, mode):
+def validate(tts, loader, pairs, mode, *, decoder=False):
     set_training(tts.tts_core, False)
+    if decoder:
+        tts.redae.decoder.eval()
     totals = {}
     with isolated_rng(SEED):
         for i, (_, loaded) in enumerate(loader.iterate(batches(pairs))):
             _, metrics = objective(tts, loaded, mode, SEED + i, False)
             for k, value in metrics.items():
                 totals[k] = totals.get(k, 0.) + float(value) * len(loaded)
+            if decoder:
+                for j, row in enumerate(loaded):
+                    for damaged, key in ((False, 'decoder_clean'), (True, 'decoder_damaged')):
+                        value = redae_decoder_training.waveform_loss(tts, row, damaged=damaged, seed=SEED + i*MICRO+j)
+                        totals[key] = totals.get(key, 0.) + float(value)
     if not torch.isfinite(torch.tensor(list(totals.values()))).all():
         raise FloatingPointError('Nonfinite validation loss')
     return {k: v / len(pairs) for k, v in totals.items()}
 
 
-def save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics):
+def save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics, *, decoder_adapter=None):
     path = out / f'step-{step:04d}'
     with tempfile.TemporaryDirectory(dir=out, prefix='.saving-') as tmp:
         folder = Path(tmp) / 'checkpoint'
@@ -206,8 +213,11 @@ def save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics):
         torch.save({'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
                     'cpu_rng': torch.get_rng_state(), 'cuda_rng': torch.cuda.get_rng_state_all()},
                    folder / 'training_state.pt')
-        (folder / 'checkpoint.json').write_text(json.dumps(dict(recipe=recipe, step=step, validation=metrics),
-                                                          indent=2, allow_nan=False))
+        record = dict(recipe=recipe, step=step, validation=metrics)
+        if decoder_adapter is not None:
+            decoder_adapter.save_pretrained(folder / redae_decoder_training.FOLDER, save_embedding_layers=False)
+            record['decoder_hashes'] = redae_decoder_training.saved_hashes(folder)
+        (folder / 'checkpoint.json').write_text(json.dumps(record, indent=2, allow_nan=False))
         folder.rename(path)
     return path
 
@@ -220,12 +230,14 @@ def transfer_recipe(mode, dataset_sha256):
 
 
 def train(dataset, output, mode, until, resume, *, fork_from=None, shared_features=None, recovery=False,
-          rise_gate=None, backbone_only=False, checkpoint_steps=(), expected_dataset_sha256=None):
+          rise_gate=None, backbone_only=False, checkpoint_steps=(), expected_dataset_sha256=None, redae_decoder=False):
     from transformers import get_cosine_schedule_with_warmup
     if not 1 <= until <= TOTAL:
         raise ValueError('--until must be between 1 and 1000')
     if recovery and mode != 'lora':
         raise ValueError('Acoustic recovery requires LoRA')
+    if redae_decoder and (mode != 'lora' or not backbone_only or recovery != vox_recovery.FOUR_PATCH or rise_gate or fork_from):
+        raise ValueError('Decoder training requires the from-Base backbone four-patch recipe')
     if rise_gate and (mode != 'lora' or fork_from is not None):
         raise ValueError('Per-update RMS acceptance requires a fresh or matching resumed LoRA run')
     if recovery is True:
@@ -242,6 +254,8 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
     parent_recipe = transfer_recipe(mode, selection['selection_sha256'])
     if backbone_only:
         parent_recipe['adapter_profile'] = BACKBONE_ATTENTION
+    if redae_decoder:
+        parent_recipe['redae_decoder'] = redae_decoder_training.CONFIG
     recipe = dict(parent_recipe, acoustic_recovery=recovery) if recovery else parent_recipe
     if rise_gate:
         recipe['rise_gate'] = rise_gate
@@ -283,9 +297,9 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
             precompute_features(tts, rows, cache_dir, fingerprint, precision_policy='native')
             cache = FeatureCache(tts, cache_dir, fingerprint, True, 'native')
         if not rise_gate:
-            if recovery:
+            if recovery and not redae_decoder:
                 tts.redae.decoder.to('cpu')  # Keep only the frozen waveform encoder on the training device.
-            else:
+            elif not recovery:
                 tts.redae.to('cpu')
             tts.spk_extractor.to('cpu')
         torch.cuda.empty_cache()
@@ -295,7 +309,16 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
         params = [p for p in core.parameters() if p.requires_grad]
         if torch.device(tts.device).type == "cuda":
             torch.cuda.reset_peak_memory_stats(tts.device)
-        optimizer = torch.optim.AdamW(params, lr=LR[mode], weight_decay=.01)
+        decoder_adapter = None
+        groups = [dict(params=params)]
+        if redae_decoder:
+            with isolated_rng(SEED):
+                decoder_adapter = redae_decoder_training.configure(tts.redae, prior, training=True)
+            decoder_params = [p for p in decoder_adapter.parameters() if p.requires_grad]
+            groups.append(dict(params=decoder_params, lr=redae_decoder_training.CONFIG['lr']))
+            print(f'[redae-decoder] Trainable decoder LoRA parameters: {sum(p.numel() for p in decoder_params):,}; '
+                  f'peak LR={redae_decoder_training.CONFIG["lr"]:g}', flush=True)
+        optimizer = torch.optim.AdamW(groups, lr=LR[mode], weight_decay=.01)
         scheduler = get_cosine_schedule_with_warmup(optimizer, 100, TOTAL)
         if prior:
             state = torch.load(prior / 'training_state.pt', map_location='cpu', weights_only=True)
@@ -312,13 +335,16 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
                   f"cases={[c['id'] for c in rise_gate['cases']]}", flush=True)
         stream = loader.iterate(batches(splits['train'][start*MICRO*ACCUM:until*MICRO*ACCUM]))
         if not prior:
-            metrics = validate(tts, loader, splits['validation'], mode)
+            metrics = validate(tts, loader, splits['validation'], mode, decoder=redae_decoder)
             print(f'[validation] base step=0 {metrics}', flush=True)
         set_training(core)
+        if redae_decoder:
+            tts.redae.decoder.train()
         progress_total = until if backbone_only else TOTAL
         for step in range(start+1, until+1):
             optimizer.zero_grad(set_to_none=True)
             loss_sum = 0.
+            decoder_total = 0.
             recovery_sum, windows = 0., 0
             patch_counts = [0] * recovery['prediction_patches'] if recovery and 'prediction_patches' in recovery else None
             for micro in range(ACCUM):
@@ -341,12 +367,24 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
                             (recovery['weight'] * extra / ACCUM).backward()
                     recovery_sum += float(extra.detach()) / ACCUM
                     windows += count
+                if redae_decoder:
+                    # Exactly one corrupted example per microbatch of two, selected independently of the backbone RNG.
+                    damaged_index = random.Random(seed).randrange(len(loaded))
+                    for j, row in enumerate(loaded):
+                        wav_loss = redae_decoder_training.waveform_loss(tts, row, damaged=j == damaged_index,
+                                                                        seed=seed*MICRO+j)
+                        (wav_loss / (ACCUM * len(loaded))).backward()
+                        decoder_total += float(wav_loss.detach()) / (ACCUM * len(loaded))
             if recovery:
                 counts = f' targets_by_hop={patch_counts}' if patch_counts is not None else ''
                 print(f'[recovery] step={step} windows={windows} clean_loss={loss_sum:.6f} '
                       f'recovery_flow={recovery_sum:.6f}{counts}', flush=True)
                 loss_sum += recovery['weight'] * recovery_sum
             norm = torch.nn.utils.clip_grad_norm_(params, 1., error_if_nonfinite=True)
+            if redae_decoder:
+                decoder_norm = torch.nn.utils.clip_grad_norm_(decoder_params, 1., error_if_nonfinite=True)
+                if step % 10 == 0 or step == until:
+                    print(f'[redae-decoder] step={step} waveform_loss={decoder_total:.6f} grad_norm={decoder_norm:.4f}', flush=True)
             if rise_gate:
                 decision = vox_rise_gate.try_update(optimizer, params, tts, rise_gate)
                 if decision['accepted']:
@@ -358,16 +396,18 @@ def train(dataset, output, mode, until, resume, *, fork_from=None, shared_featur
             if step % 10 == 0 or step == until:
                 print(f'[transfer] {mode} {step}/{progress_total} loss={loss_sum:.6f} grad_norm={norm:.4f}', flush=True)
             if step % 500 == 0 or step == until or step in checkpoint_steps:
-                metrics = validate(tts, loader, splits['validation'], mode)
+                metrics = validate(tts, loader, splits['validation'], mode, decoder=redae_decoder)
                 if rise_gate:
                     metrics.update(accepted_updates=scheduler.last_epoch, rejected_updates=step-scheduler.last_epoch)
                 if torch.device(tts.device).type == 'cuda':
                     print(f'[transfer] Peak allocated GPU memory: {torch.cuda.max_memory_allocated(tts.device)/2**30:.2f} GiB',
                           flush=True)
                 print(f'[transfer] Saving {mode} at step {step}', flush=True)
-                path = save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics)
+                path = save_checkpoint(out, core, optimizer, scheduler, recipe, step, metrics, decoder_adapter=decoder_adapter)
                 print(f'[validation] {metrics}; checkpoint={path}', flush=True)
                 set_training(core)
+                if redae_decoder:
+                    tts.redae.decoder.train()
     finally:
         if loader:
             loader.close()

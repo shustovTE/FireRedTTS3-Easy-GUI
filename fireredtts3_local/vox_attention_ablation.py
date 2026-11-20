@@ -216,6 +216,13 @@ def generate(root, plan, report):
                     tts.tts_core.eval()
                 counts = (route(tts.tts_core, variant, backbone_only=plan.get('adapter_profile') == BACKBONE_ATTENTION)
                           if checkpoint else {'backbone':0, 'dit':0})
+                if plan.get('redae_decoder'):
+                    decoder = tts.redae.decoder.qwen3
+                    active = sum(isinstance(m, LoraLayer) and not m.disable_adapters and m.active_adapters == ['default']
+                                 for m in decoder.modules())
+                    if not isinstance(decoder, PeftModel) or active != 4 * len(decoder.get_base_model().layers):
+                        raise RuntimeError('Listening requires the trained RedAE decoder Q/K/V/O adapter')
+                    counts['redae_decoder'] = active
                 for case, name in pending:
                     row = {**plan.get('reference', {}), **case}
                     samples, rate, run = generate_case(tts, row, settings=plan['settings'])
